@@ -1,0 +1,82 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// ManagerConfig is the top-level manager config file: manager settings plus a
+// raw borgmatic section used as the base for per-group deep merges.
+type ManagerConfig struct {
+	Manager   ManagerSettings        `yaml:"manager"`
+	Borgmatic map[string]interface{} `yaml:"borgmatic"`
+}
+
+// ManagerSettings holds manager-specific runtime configuration.
+type ManagerSettings struct {
+	Period         string `yaml:"period"`
+	BorgmaticImage string `yaml:"borgmatic_image"`
+}
+
+// LoadConfig reads the manager configuration from managerPath and loads any
+// per-group override files from groupsDir. Each .yaml file in groupsDir
+// provides a borgmatic section that will be deep-merged with the base config.
+//
+// The returned overrides map is keyed by group name (filename without .yaml).
+// If groupsDir does not exist, no overrides are returned (not an error).
+func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[string]map[string]interface{}, error) {
+	data, err := os.ReadFile(managerPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading manager config: %w", err)
+	}
+
+	var cfg ManagerConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, nil, fmt.Errorf("parsing manager config: %w", err)
+	}
+
+	overrides := make(map[string]map[string]interface{})
+
+	entries, err := os.ReadDir(groupsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &cfg, overrides, nil
+		}
+		return nil, nil, fmt.Errorf("reading groups directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+
+		groupName := strings.TrimSuffix(name, ".yaml")
+		groupPath := filepath.Join(groupsDir, name)
+
+		groupData, err := os.ReadFile(groupPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("reading group override %s: %w", groupPath, err)
+		}
+
+		var raw map[string]interface{}
+		if err := yaml.Unmarshal(groupData, &raw); err != nil {
+			return nil, nil, fmt.Errorf("parsing group override %s: %w", groupPath, err)
+		}
+
+		if borgmatic, ok := raw["borgmatic"]; ok {
+			if borgmaticMap, ok := borgmatic.(map[string]interface{}); ok {
+				overrides[groupName] = borgmaticMap
+			}
+		}
+	}
+
+	return &cfg, overrides, nil
+}
