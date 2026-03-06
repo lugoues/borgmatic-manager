@@ -1,0 +1,28 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - gocritic
+    - gosec
+    - unconvert
+    - goconst
+    - testifylint
+  settings:
+    govet:
+      enable-all: true
+    gocritic:
+      enabled-checks:
+        - appendAssign
+        - dupCase
+        - dupBranchBody
+        - equalFold
+        - sloppyLen
+
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/lugoues/borgmatic-manager
