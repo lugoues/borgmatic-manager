@@ -4,7 +4,12 @@
 // and (in future phases) backup container orchestration.
 package runtime
 
-import "context"
+import (
+	"context"
+	"io"
+
+	"github.com/docker/docker/api/types/mount"
+)
 
 // ContainerRuntime defines the interface for interacting with a container runtime
 // (Docker or Podman). Discovery operations (ListVolumes, ListContainers) are used
@@ -20,20 +25,22 @@ type ContainerRuntime interface {
 	EventStream(ctx context.Context) (<-chan Event, <-chan error)
 
 	// CreateContainer creates a new container and returns its ID.
-	// TODO(phase-3): implement runner methods
 	CreateContainer(ctx context.Context, config ContainerConfig) (string, error)
 
 	// StartContainer starts a previously created container.
-	// TODO(phase-3): implement runner methods
 	StartContainer(ctx context.Context, id string) error
 
 	// WaitContainer blocks until a container exits and returns its exit code.
-	// TODO(phase-3): implement runner methods
 	WaitContainer(ctx context.Context, id string) (int64, error)
 
 	// RemoveContainer removes a container by ID.
-	// TODO(phase-3): implement runner methods
 	RemoveContainer(ctx context.Context, id string) error
+
+	// ContainerNetworkConnect connects a container to a network.
+	ContainerNetworkConnect(ctx context.Context, networkID, containerID string) error
+
+	// ContainerLogs returns a reader for the container's stdout/stderr log stream.
+	ContainerLogs(ctx context.Context, id string) (io.ReadCloser, error)
 }
 
 // VolumeInfo describes a container volume discovered by the runtime.
@@ -58,5 +65,17 @@ type Event struct {
 }
 
 // ContainerConfig holds configuration for creating a backup container.
-// Populated in Phase 3
-type ContainerConfig struct{}
+type ContainerConfig struct {
+	// Image is the borgmatic container image (e.g., "ghcr.io/borgmatic-collective/borgmatic:latest").
+	Image string
+	// GroupName is the backup group name, used for container naming and log prefixes.
+	GroupName string
+	// ConfigPath is the host path to the generated borgmatic config YAML.
+	ConfigPath string
+	// Mounts defines all volume mounts for the container.
+	Mounts []mount.Mount
+	// Networks lists network names to attach (from DB labels).
+	Networks []string
+	// Cmd is the borgmatic command and arguments.
+	Cmd []string
+}
