@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
@@ -95,13 +96,48 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 	return infos, nil
 }
 
-// EventStream returns channels for container runtime events.
-// TODO(phase-3): implement event-driven discovery
-func (d *DockerRuntime) EventStream(_ context.Context) (<-chan Event, <-chan error) {
+// EventStream returns channels for container runtime events filtered to
+// container/volume create/remove actions. The returned channels close when
+// the context is cancelled or the underlying Docker event stream ends.
+// EventStream cancels a child context on every exit path: the Docker SDK never
+// closes its Events channel, so the SDK goroutine would otherwise leak per reconnect.
+func (d *DockerRuntime) EventStream(ctx context.Context) (<-chan Event, <-chan error) {
+	opts := events.ListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("type", string(events.ContainerEventType)),
+			filters.Arg("type", string(events.VolumeEventType)),
+			filters.Arg("event", string(events.ActionCreate)),
+			filters.Arg("event", string(events.ActionRemove)),
+		),
+	}
+
+	dockerMsgCh, dockerErrCh := d.client.Events(ctx, opts)
+
+	eventCh := make(chan Event)
 	errCh := make(chan error, 1)
-	errCh <- fmt.Errorf("not implemented: available in Phase 3")
-	close(errCh)
-	return nil, errCh
+
+	// Forward Docker SDK messages as runtime Events.
+	go func() {
+		defer close(eventCh)
+		for msg := range dockerMsgCh {
+			eventCh <- Event{
+				Type:   string(msg.Type),
+				Action: string(msg.Action),
+				Actor:  msg.Actor.ID,
+			}
+		}
+	}()
+
+	// Forward errors from the Docker SDK.
+	go func() {
+		defer close(errCh)
+		for err := range dockerErrCh {
+			errCh <- err
+			return // only forward the first error
+		}
+	}()
+
+	return eventCh, errCh
 }
 
 // CreateContainer creates a new container from the given configuration.
