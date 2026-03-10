@@ -1,0 +1,4 @@
+# Podman Quadlet volume unit for borg cache persistence
+
+[Volume]
+VolumeName=borgmatic-cache
