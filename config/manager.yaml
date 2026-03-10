@@ -1,0 +1,20 @@
+# Borgmatic Manager configuration
+# See: https://github.com/lugoues/borgmatic-manager
+manager:
+  # How often to run backups (Go duration format)
+  period: "1h"
+  # borgmatic_image: ghcr.io/borgmatic-collective/borgmatic:latest
+
+# Default borgmatic settings applied to all groups
+# Per-group overrides go in groups/{group-name}.yaml
+borgmatic:
+  repositories:
+    - path: /mnt/borg-repository
+  keep_daily: 7
+  keep_weekly: 4
+  keep_monthly: 6
+  checks:
+    - name: repository
+      frequency: "1 week"
+    - name: archives
+      frequency: "1 month"
