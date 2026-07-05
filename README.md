@@ -51,7 +51,7 @@ reimplements.
 **1. Install** (binary + unit from a [release](https://github.com/lugoues/borgmatic-manager/releases), or from source):
 
 ```bash
-sudo make install     # builds and installs binary, unit, default config
+mise run install      # builds and installs binary, unit, default config (sudo inside)
 sudo uv tool install borgmatic   # if you don't have borgmatic >= 2.1
 ```
 
@@ -376,12 +376,14 @@ doesn't instantly fail a cycle.
 
 ## Development
 
+Tools and tasks are managed with [mise](https://mise.jdx.dev) (`mise install` once):
+
 ```bash
-make test      # vet + unit tests
-make race      # race-detector run
-make e2e       # end-to-end test (needs docker, borgmatic, borg, sudo)
-make e2e-dind  # hermetic e2e inside a docker-in-docker host (needs only docker)
-make build     # bin/borgmatic-manager
+mise run test      # vet + unit tests
+mise run race      # race-detector run
+mise run e2e       # end-to-end test (needs docker, borgmatic, borg, sudo)
+mise run e2e-dind  # hermetic e2e inside a docker-in-docker host (needs only docker)
+mise run build     # bin/borgmatic-manager
 ```
 
 Architecture: `internal/{runtime,discovery,config,runner,scheduler,events,orchestrator}` —

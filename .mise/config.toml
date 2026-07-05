@@ -1,3 +1,66 @@
 [tools]
 go = "1.25"
-"go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint" = "latest"
+"aqua:golangci/golangci-lint" = "latest"
+
+[env]
+VERSION = "{{ exec(command='git describe --tags --always --dirty 2>/dev/null || echo dev') }}"
+
+[tasks.build]
+description = "Build bin/borgmatic-manager (static, version-stamped)"
+run = 'CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$VERSION" -o bin/borgmatic-manager ./cmd/borgmatic-manager'
+
+[tasks.test]
+description = "go vet + unit tests"
+run = ["go vet ./...", "go test ./..."]
+
+[tasks.race]
+description = "Race-detector test run"
+run = "go test -race -count=1 ./..."
+
+[tasks.lint]
+description = "golangci-lint"
+run = "golangci-lint run ./..."
+
+[tasks.fmt]
+description = "Format all Go sources"
+run = "gofmt -w cmd internal"
+
+[tasks.fmt-check]
+description = "Fail if any Go source is unformatted"
+run = '''
+out=$(gofmt -l cmd internal)
+if [ -n "$out" ]; then echo "gofmt needed on:"; echo "$out"; exit 1; fi
+'''
+
+[tasks.e2e]
+description = "End-to-end test against the local daemon (needs docker, borgmatic, borg, sudo)"
+depends = ["build"]
+run = "bash tests/integration/e2e_test.sh"
+
+[tasks.e2e-dind]
+description = "Hermetic end-to-end inside a docker-in-docker host (needs only docker)"
+run = "bash tests/integration/dind_test.sh"
+
+[tasks.install]
+description = "Install binary, systemd unit, and default config (uses sudo)"
+depends = ["build"]
+run = '''
+sudo install -D -m 0755 bin/borgmatic-manager /usr/local/bin/borgmatic-manager
+sudo install -D -m 0644 deploy/systemd/borgmatic-manager.service /etc/systemd/system/borgmatic-manager.service
+if [ ! -f /etc/borgmatic-manager/manager.yaml ]; then
+  sudo install -D -m 0644 config/manager.yaml /etc/borgmatic-manager/manager.yaml
+else
+  echo "keeping existing /etc/borgmatic-manager/manager.yaml"
+fi
+echo "installed. next: edit /etc/borgmatic-manager/manager.yaml, then 'sudo systemctl daemon-reload && sudo systemctl enable --now borgmatic-manager'"
+'''
+
+[tasks.uninstall]
+description = "Remove installed binary and unit (config is kept)"
+run = '''
+sudo rm -f /usr/local/bin/borgmatic-manager /etc/systemd/system/borgmatic-manager.service
+'''
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = "rm -rf bin dist"
