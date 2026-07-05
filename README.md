@@ -111,6 +111,7 @@ immutable after creation, which made them a trap).
 | `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Default: all named volumes (anonymous volumes excluded). |
 | `borgmatic-manager.db.{n}.*` | Database dump definitions (below). |
 | `borgmatic-manager.config.<option>` | Any borgmatic option for this group (below). |
+| `borgmatic-manager.spec` | The whole configuration as one JSON blob (below) — alternative to all of the above. |
 
 Only `local`-driver volumes are supported; volumes with mount options
 (NFS/CIFS) are backed up only while mounted; other drivers are skipped with a
@@ -170,6 +171,34 @@ labels:
 Precedence: `manager.yaml` defaults → `groups/<group>.yaml` → **config
 labels** → discovered data (source dirs, database hooks). Typo'd option
 names fail the per-run `borgmatic config validate` gate with a precise error.
+
+### One-label JSON spec
+
+Prefer a single document over many labels? `borgmatic-manager.spec` carries
+everything at once:
+
+```yaml
+labels:
+  borgmatic-manager.spec: >-
+    {
+      "group": "myapp",
+      "backup": true,
+      "volumes": ["app-data"],
+      "databases": [
+        {"type": "postgresql", "name": "appdb", "username": "postgres", "password": "secret"}
+      ],
+      "config": {"keep_daily": 14}
+    }
+```
+
+Fields mirror the flat labels exactly: `group` (required), `backup`,
+`volumes` (filter; omit for all named volumes), `databases` (same fields as
+`db.{n}.*`), `config` (same as `config.*`, arbitrarily nested). Parsing is
+strict — an unknown or misspelled field rejects the whole spec with a
+warning rather than silently dropping it, and database entries get the same
+per-type validation as flat labels. If `spec` is present, any other
+`borgmatic-manager.*` labels on that container are ignored (with a warning
+listing them): pick one style per container.
 
 ## Filesystem snapshots (btrfs / zfs / LVM)
 

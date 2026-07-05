@@ -54,34 +54,27 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	seenVolumes := make(map[string]map[string]bool)
 
 	for _, c := range containers {
-		group := GetGroup(c.Labels)
-		if group == "" {
-			if HasManagerLabels(c.Labels) {
-				logger.Warn("container has borgmatic-manager labels but no group label", "container", c.Name)
-			}
+		intent, ok := containerIntentFor(c, logger)
+		if !ok {
 			continue
 		}
 
-		if IsBackupEnabled(c.Labels) {
-			discoverContainerVolumes(state, c, group, volumesByName, seenVolumes, logger)
-		} else if c.Labels[labelBackup] != "" {
-			logger.Warn("container backup label is not \"true\"; its volumes will not be backed up",
-				"container", c.Name, "backup_label", c.Labels[labelBackup])
+		if intent.backup {
+			discoverContainerVolumes(state, c, intent, volumesByName, seenVolumes, logger)
 		}
 
-		dbs := ParseDatabaseLabels(c.Labels, logger)
-		dbs = finalizeDatabases(dbs, c, volumesByName, logger)
+		dbs := finalizeDatabases(intent.databases, c, volumesByName, logger)
 		if len(dbs) > 0 {
-			state.AddDatabases(group, dbs)
+			state.AddDatabases(intent.group, dbs)
 		}
 
-		if labelCfg := ParseConfigLabels(c.Labels, logger); labelCfg != nil {
-			state.AddLabelConfig(group, labelCfg)
+		if intent.config != nil {
+			state.AddLabelConfig(intent.group, intent.config)
 		}
 
-		if !IsBackupEnabled(c.Labels) && len(dbs) == 0 && ParseConfigLabels(c.Labels, discardLogger()) == nil {
-			logger.Warn("container has a group label but no backup=true, db.*, or config.* labels; it contributes nothing",
-				"container", c.Name, "group", group)
+		if !intent.backup && len(dbs) == 0 && intent.config == nil {
+			logger.Warn("container has a group but no volume backup, databases, or config; it contributes nothing",
+				"container", c.Name, "group", intent.group)
 		}
 	}
 
@@ -101,17 +94,69 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	return state, nil
 }
 
-// discardLogger avoids double-warning when probing labels a second time.
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+// containerIntent is a container's normalized contribution, from flat labels or a spec blob.
+type containerIntent struct {
+	group            string
+	backup           bool
+	volumesFilter    []string
+	hasVolumesFilter bool
+	databases        []models.DatabaseConfig
+	config           map[string]interface{}
+}
+
+// containerIntentFor builds the container's intent. A spec label, when
+// present, is authoritative and shadows all flat labels; otherwise the flat
+// labels are parsed. ok is false when the container contributes nothing
+// parseable (warnings already emitted).
+func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (containerIntent, bool) {
+	if spec, present := ParseSpecLabel(c.Labels, c.Name, logger); present {
+		if spec == nil {
+			return containerIntent{}, false
+		}
+		warnIgnoredFlatLabels(c.Labels, c.Name, logger)
+		intent := containerIntent{
+			group:     spec.Group,
+			backup:    spec.Backup,
+			databases: spec.databases(c.Name, logger),
+			config:    spec.Config,
+		}
+		if spec.Volumes != nil {
+			intent.volumesFilter = *spec.Volumes
+			intent.hasVolumesFilter = true
+		}
+		return intent, true
+	}
+
+	group := GetGroup(c.Labels)
+	if group == "" {
+		if HasManagerLabels(c.Labels) {
+			logger.Warn("container has borgmatic-manager labels but no group label", "container", c.Name)
+		}
+		return containerIntent{}, false
+	}
+
+	if !IsBackupEnabled(c.Labels) && c.Labels[labelBackup] != "" {
+		logger.Warn("container backup label is not \"true\"; its volumes will not be backed up",
+			"container", c.Name, "backup_label", c.Labels[labelBackup])
+	}
+
+	intent := containerIntent{
+		group:     group,
+		backup:    IsBackupEnabled(c.Labels),
+		databases: ParseDatabaseLabels(c.Labels, logger),
+		config:    ParseConfigLabels(c.Labels, logger),
+	}
+	intent.volumesFilter, intent.hasVolumesFilter = VolumesFilter(c.Labels)
+	return intent, true
 }
 
 var anonymousVolumeName = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // discoverContainerVolumes adds the container's named volumes to its group.
 // Anonymous volumes are excluded unless the filter names them (usually caches, not data).
-func discoverContainerVolumes(state *models.BackupState, c runtime.ContainerInfo, group string, volumesByName map[string]runtime.VolumeInfo, seenVolumes map[string]map[string]bool, logger *slog.Logger) {
-	filter, hasFilter := VolumesFilter(c.Labels)
+func discoverContainerVolumes(state *models.BackupState, c runtime.ContainerInfo, intent containerIntent, volumesByName map[string]runtime.VolumeInfo, seenVolumes map[string]map[string]bool, logger *slog.Logger) {
+	group := intent.group
+	filter, hasFilter := intent.volumesFilter, intent.hasVolumesFilter
 	matched := make(map[string]bool, len(filter))
 
 	if seenVolumes[group] == nil {

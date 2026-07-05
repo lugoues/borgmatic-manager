@@ -473,3 +473,160 @@ malformed line
 	assert.True(t, points["/mnt/with space"], "octal escapes must be decoded")
 	assert.False(t, points["/nonexistent"])
 }
+
+func TestDiscoverSpecLabel(t *testing.T) {
+	stubProbes(t)
+	spec := `{
+	  "group": "myapp",
+	  "backup": true,
+	  "volumes": ["app-data"],
+	  "databases": [
+	    {"type": "postgresql", "name": "appdb", "username": "postgres", "password": "pw"},
+	    {"type": "sqlite", "name": "cache", "volume": "app-data", "path": "cache.db"}
+	  ],
+	  "config": {"keep_daily": 14, "healthchecks": {"ping_url": "https://hc-ping.com/x"}}
+	}`
+
+	c := runtime.ContainerInfo{
+		ID:    "id-web",
+		Name:  "web",
+		Image: "example/web:1",
+		Labels: map[string]string{
+			"borgmatic-manager.spec": spec,
+		},
+		Mounts: []runtime.VolumeMount{
+			mountFixture("app-data", "/data"),
+			mountFixture("app-cache", "/cache"),
+		},
+	}
+
+	rt := mockLists(
+		[]runtime.VolumeInfo{volumeFixture("app-data"), volumeFixture("app-cache")},
+		[]runtime.ContainerInfo{c},
+	)
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+
+	require.Contains(t, state.Groups, "myapp")
+	g := state.Groups["myapp"]
+
+	require.Len(t, g.Volumes, 1, "spec volumes filter applies")
+	assert.Equal(t, "app-data", g.Volumes[0].Name)
+
+	require.Len(t, g.Databases, 2)
+	assert.Equal(t, "postgresql", g.Databases[0].Type)
+	assert.Equal(t, "web", g.Databases[0].Container, "spec databases get the container attached like flat labels")
+	assert.Equal(t, "/var/lib/docker/volumes/app-data/_data/cache.db", g.Databases[1].Path,
+		"spec sqlite paths resolve like flat labels")
+
+	require.Len(t, g.LabelConfigs, 1)
+	assert.Equal(t, 14, g.LabelConfigs[0]["keep_daily"], "spec config values come through typed")
+}
+
+func TestDiscoverSpecShadowsFlatLabels(t *testing.T) {
+	stubProbes(t)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	c := runtime.ContainerInfo{
+		ID:   "id-web",
+		Name: "web",
+		Labels: map[string]string{
+			"borgmatic-manager.spec":   `{"group": "from-spec", "backup": true}`,
+			"borgmatic-manager.group":  "from-flat-labels",
+			"borgmatic-manager.backup": "true",
+		},
+		Mounts: []runtime.VolumeMount{mountFixture("app-data", "/data")},
+	}
+
+	rt := mockLists([]runtime.VolumeInfo{volumeFixture("app-data")}, []runtime.ContainerInfo{c})
+
+	state, err := discovery.Discover(context.Background(), rt, logger)
+	require.NoError(t, err)
+
+	assert.Contains(t, state.Groups, "from-spec", "the spec is authoritative")
+	assert.NotContains(t, state.Groups, "from-flat-labels")
+	assert.Contains(t, buf.String(), "are ignored")
+	assert.Contains(t, buf.String(), "borgmatic-manager.group")
+}
+
+func TestDiscoverSpecInvalidJSONSkipsContainer(t *testing.T) {
+	stubProbes(t)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
+		{
+			ID:     "c1",
+			Name:   "web",
+			Labels: map[string]string{"borgmatic-manager.spec": `{"group": "myapp", "backup": tru`},
+		},
+	})
+
+	state, err := discovery.Discover(context.Background(), rt, logger)
+	require.NoError(t, err)
+
+	assert.Empty(t, state.Groups, "an invalid spec must not half-apply")
+	assert.Contains(t, buf.String(), "invalid borgmatic-manager.spec")
+}
+
+func TestDiscoverSpecUnknownFieldRejected(t *testing.T) {
+	stubProbes(t)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
+		{
+			ID:     "c1",
+			Name:   "web",
+			Labels: map[string]string{"borgmatic-manager.spec": `{"group": "myapp", "databses": []}`},
+		},
+	})
+
+	state, err := discovery.Discover(context.Background(), rt, logger)
+	require.NoError(t, err)
+
+	assert.Empty(t, state.Groups)
+	assert.Contains(t, buf.String(), "invalid borgmatic-manager.spec", "typo'd field names must be rejected, not dropped")
+}
+
+func TestDiscoverSpecMissingGroupSkips(t *testing.T) {
+	stubProbes(t)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
+		{
+			ID:     "c1",
+			Name:   "web",
+			Labels: map[string]string{"borgmatic-manager.spec": `{"backup": true}`},
+		},
+	})
+
+	state, err := discovery.Discover(context.Background(), rt, logger)
+	require.NoError(t, err)
+
+	assert.Empty(t, state.Groups)
+	assert.Contains(t, buf.String(), "missing the required")
+}
+
+func TestDiscoverSpecDatabaseValidationShared(t *testing.T) {
+	stubProbes(t)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// mariadb with mode=exec must fall back to helper, same as flat labels.
+	spec := `{"group": "g", "databases": [{"type": "mariadb", "name": "db", "username": "u", "mode": "exec"}]}`
+	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
+		{ID: "c1", Name: "maria", Image: "mariadb:11", Labels: map[string]string{"borgmatic-manager.spec": spec}},
+	})
+
+	state, err := discovery.Discover(context.Background(), rt, logger)
+	require.NoError(t, err)
+
+	dbs := state.Groups["g"].Databases
+	require.Len(t, dbs, 1)
+	assert.Empty(t, dbs[0].Mode, "exec falls back to helper for mariadb")
+	assert.Contains(t, buf.String(), "exec mode is only supported for postgresql")
+}

@@ -126,42 +126,9 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 	var result []models.DatabaseConfig
 	for _, idx := range indices {
 		cfg := configs[idx]
-
-		if cfg.Type == "" {
-			logger.Warn(fmt.Sprintf("db.%d missing required field 'type', skipping", idx))
+		if !validateDatabase(cfg, fmt.Sprintf("db.%d", idx), logger) {
 			continue
 		}
-		if !validDBTypes[cfg.Type] {
-			logger.Warn(fmt.Sprintf("db.%d has unknown type %q, skipping", idx, cfg.Type))
-			continue
-		}
-		if cfg.Name == "" {
-			logger.Warn(fmt.Sprintf("db.%d missing required field 'name', skipping", idx))
-			continue
-		}
-
-		if cfg.Type == dbTypeSQLite {
-			if !validateSQLite(cfg, idx, logger) {
-				continue
-			}
-		} else if cfg.Username == "" {
-			logger.Warn(fmt.Sprintf("db.%d missing required field 'username', skipping", idx))
-			continue
-		}
-
-		switch cfg.Mode {
-		case "", "helper":
-			cfg.Mode = ""
-		case "exec":
-			if cfg.Type != "postgresql" {
-				logger.Warn(fmt.Sprintf("db.%d: exec mode is only supported for postgresql (mysql/mariadb dumps write through a FIFO the exec'd client cannot reach); falling back to the helper container", idx))
-				cfg.Mode = ""
-			}
-		default:
-			logger.Warn(fmt.Sprintf("db.%d: unknown mode %q, using the default helper container", idx, cfg.Mode))
-			cfg.Mode = ""
-		}
-
 		result = append(result, *cfg)
 	}
 
@@ -172,19 +139,61 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 	return result
 }
 
+// validateDatabase enforces per-type field rules for a database definition,
+// regardless of whether it came from flat db.{n}.* labels or a spec blob.
+// ref names the source in warnings (e.g. "db.0", "web spec databases[1]").
+func validateDatabase(cfg *models.DatabaseConfig, ref string, logger *slog.Logger) bool {
+	if cfg.Type == "" {
+		logger.Warn(fmt.Sprintf("%s missing required field 'type', skipping", ref))
+		return false
+	}
+	if !validDBTypes[cfg.Type] {
+		logger.Warn(fmt.Sprintf("%s has unknown type %q, skipping", ref, cfg.Type))
+		return false
+	}
+	if cfg.Name == "" {
+		logger.Warn(fmt.Sprintf("%s missing required field 'name', skipping", ref))
+		return false
+	}
+
+	if cfg.Type == dbTypeSQLite {
+		if !validateSQLite(cfg, ref, logger) {
+			return false
+		}
+	} else if cfg.Username == "" {
+		logger.Warn(fmt.Sprintf("%s missing required field 'username', skipping", ref))
+		return false
+	}
+
+	switch cfg.Mode {
+	case "", "helper":
+		cfg.Mode = ""
+	case "exec":
+		if cfg.Type != "postgresql" {
+			logger.Warn(fmt.Sprintf("%s: exec mode is only supported for postgresql (mysql/mariadb dumps write through a FIFO the exec'd client cannot reach); falling back to the helper container", ref))
+			cfg.Mode = ""
+		}
+	default:
+		logger.Warn(fmt.Sprintf("%s: unknown mode %q, using the default helper container", ref, cfg.Mode))
+		cfg.Mode = ""
+	}
+
+	return true
+}
+
 // validateSQLite requires volume and path; credentials and addresses are
 // meaningless for sqlite and cleared with a warning.
-func validateSQLite(cfg *models.DatabaseConfig, idx int, logger *slog.Logger) bool {
+func validateSQLite(cfg *models.DatabaseConfig, ref string, logger *slog.Logger) bool {
 	if cfg.Volume == "" {
-		logger.Warn(fmt.Sprintf("db.%d (sqlite) missing required field 'volume', skipping", idx))
+		logger.Warn(fmt.Sprintf("%s (sqlite) missing required field 'volume', skipping", ref))
 		return false
 	}
 	if cfg.Path == "" {
-		logger.Warn(fmt.Sprintf("db.%d (sqlite) missing required field 'path', skipping", idx))
+		logger.Warn(fmt.Sprintf("%s (sqlite) missing required field 'path', skipping", ref))
 		return false
 	}
 	if cfg.Username != "" || cfg.Password != "" || cfg.Hostname != "" || cfg.Port != 0 {
-		logger.Warn(fmt.Sprintf("db.%d (sqlite) ignoring username/password/hostname/port: sqlite has no authentication", idx))
+		logger.Warn(fmt.Sprintf("%s (sqlite) ignoring username/password/hostname/port: sqlite has no authentication", ref))
 		cfg.Username = ""
 		cfg.Password = ""
 		cfg.Hostname = ""

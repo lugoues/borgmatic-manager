@@ -139,12 +139,11 @@ sudo env "PATH=$PATH" "${BORG_ENV[@]}" \
   CONFIG_DIR="$CONFIG_DIR" RUNTIME_DIR="$RUNTIME_DIR" STATE_DIR="$STATE_DIR" \
   "$WORK/borgmatic-manager" borgmatic "$GROUP" repo-create --encryption none
 
-log "starting second labeled container (event-driven re-discovery)"
+log "starting second labeled container via JSON spec label (event-driven re-discovery)"
 $CLI volume create "$VOL_B" >/dev/null
 $CLI run -d --name "$APP_B" \
   -v "$VOL_B:/data" \
-  -l borgmatic-manager.backup=true \
-  -l borgmatic-manager.group=$GROUP \
+  -l borgmatic-manager.spec="{\"group\": \"$GROUP\", \"backup\": true}" \
   alpine sh -c 'echo e2e-data-b > /data/file-b.txt && sleep 600' >/dev/null
 
 log "waiting for a successful backup"
