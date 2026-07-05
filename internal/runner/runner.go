@@ -1,246 +1,329 @@
-// Package runner implements the borgmatic backup runner, which creates ephemeral
-// borgmatic containers per backup group, streams their logs, waits for exit,
-// and removes them.
 package runner
 
 import (
-	"bytes"
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
-	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/lugoues/borgmatic-manager/internal/config"
-	"github.com/lugoues/borgmatic-manager/internal/models"
-	"github.com/lugoues/borgmatic-manager/internal/runtime"
 )
 
-const defaultBorgmaticImage = "ghcr.io/borgmatic-collective/borgmatic:latest"
+var defaultActions = []string{"create", "prune", "compact", "check"}
 
-// Runner creates and manages ephemeral borgmatic containers for backup groups.
+// defaultKillGrace is the SIGTERM-to-SIGKILL grace after a run timeout fires.
+const defaultKillGrace = 60 * time.Second
+
+// snapshotLockKey serializes groups with snapshot hooks: borgmatic's snapshot
+// cleanup is name-prefix-matched, so concurrent runs destroy each other's snapshots.
+const snapshotLockKey = "snapshots"
+
+// Runner executes borgmatic on the host for backup groups.
 type Runner struct {
-	rt        runtime.ContainerRuntime
-	logger    *slog.Logger
-	configDir string
-	mutexes   map[string]*sync.Mutex
-	mutexesMu sync.Mutex
+	logger        *slog.Logger
+	configDir     string
+	borgmaticPath string
+	actions       []string
+	runTimeout    time.Duration
+	killGrace     time.Duration
+
+	// locks holds named binary semaphores: "group:<name>" (try), "repo:<key>" and "snapshots" (blocking, ordered).
+	locks   map[string]chan struct{}
+	locksMu sync.Mutex
+
+	// bootstrapHinted dedupes the guided repo-create hint to once per group.
+	bootstrapHinted sync.Map
+
+	// execCommand is an exec.Command seam for testing.
+	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
 }
 
-// NewRunner creates a new Runner with the given container runtime, logger,
-// and directory where generated borgmatic config files are stored.
-func NewRunner(rt runtime.ContainerRuntime, logger *slog.Logger, configDir string) *Runner {
+// NewRunner creates a Runner. borgmaticPath must be a resolved binary path;
+// actions defaults to create/prune/compact/check when empty; runTimeout of 0
+// means no per-run timeout.
+func NewRunner(logger *slog.Logger, configDir, borgmaticPath string, actions []string, runTimeout time.Duration) *Runner {
+	if len(actions) == 0 {
+		actions = defaultActions
+	}
 	return &Runner{
-		rt:        rt,
-		logger:    logger,
-		configDir: configDir,
-		mutexes:   make(map[string]*sync.Mutex),
+		logger:        logger,
+		configDir:     configDir,
+		borgmaticPath: borgmaticPath,
+		actions:       actions,
+		runTimeout:    runTimeout,
+		killGrace:     defaultKillGrace,
+		locks:         make(map[string]chan struct{}),
+		execCommand: func(_ context.Context, name string, args ...string) *exec.Cmd {
+			// Not CommandContext: cancellation must SIGTERM the process group
+			// (borg releases repo locks), never SIGKILL outright.
+			return exec.Command(name, args...)
+		},
 	}
 }
 
-// getMutex returns the per-group mutex, creating it lazily if needed.
-func (r *Runner) getMutex(groupName string) *sync.Mutex {
-	r.mutexesMu.Lock()
-	defer r.mutexesMu.Unlock()
-
-	mu, ok := r.mutexes[groupName]
+// sem returns the named binary semaphore, creating it lazily.
+func (r *Runner) sem(key string) chan struct{} {
+	r.locksMu.Lock()
+	defer r.locksMu.Unlock()
+	s, ok := r.locks[key]
 	if !ok {
-		mu = &sync.Mutex{}
-		r.mutexes[groupName] = mu
+		s = make(chan struct{}, 1)
+		r.locks[key] = s
 	}
-	return mu
+	return s
 }
 
-// TryRunGroup attempts to run a backup for the given group. If the group's
-// mutex is already held (another backup is running), it returns (false, nil)
-// without blocking. Otherwise it runs the backup and returns (true, err).
-// The run metadata drives repo/snapshot serialization in the host-exec runner
-// (v2 phase 3); this container runner ignores it.
-func (r *Runner) TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig, _ config.GroupRunMeta) (bool, error) {
-	mu := r.getMutex(groupName)
-	if !mu.TryLock() {
-		r.logger.Debug("skipping group: backup already running", "group", groupName)
+// TryRunGroup runs a backup for the group, returning (false, nil) if an
+// overlapping cycle already holds it. Snapshot and repo locks are then taken
+// blocking in one global order: groups sharing a repo serialize, not skip.
+func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, error) {
+	groupSem := r.sem("group:" + groupName)
+	select {
+	case groupSem <- struct{}{}:
+	default:
 		return false, nil
 	}
-	defer mu.Unlock()
+	defer func() { <-groupSem }()
 
-	err := r.RunGroup(ctx, groupName, group, cfg)
-	return true, err
+	// A single global lock order (snapshots, then sorted repos) prevents deadlock.
+	var keys []string
+	if meta.SnapshotHooks {
+		keys = append(keys, snapshotLockKey)
+	}
+	repos := append([]string(nil), meta.Repos...)
+	sort.Strings(repos)
+	for _, repo := range repos {
+		keys = append(keys, "repo:"+repo)
+	}
+
+	var held []chan struct{}
+	release := func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			<-held[i]
+		}
+	}
+	for _, key := range keys {
+		s := r.sem(key)
+		select {
+		case s <- struct{}{}:
+			held = append(held, s)
+		case <-ctx.Done():
+			release()
+			return true, ctx.Err()
+		}
+	}
+	defer release()
+
+	return true, r.runGroup(ctx, groupName)
 }
 
-// RunGroup creates an ephemeral borgmatic container for the given backup group,
-// streams its logs, waits for it to exit, and removes it. This is the core
-// execution lifecycle for a single backup group.
-func (r *Runner) RunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig) error {
-	image := resolveImage(cfg)
-	mounts := r.buildMounts(groupName, group)
-	// Network attachment was label-driven in v1; the label is deprecated and
-	// this runner is replaced by host execution in the v2 pivot.
-	var networks []string
+// runGroup validates the group's generated config, then executes borgmatic.
+func (r *Runner) runGroup(ctx context.Context, groupName string) error {
+	configPath := filepath.Join(r.configDir, groupName+".yaml")
 
-	containerCfg := runtime.ContainerConfig{
-		Image:      image,
-		GroupName:  groupName,
-		ConfigPath: filepath.Join(r.configDir, groupName+".yaml"),
-		Mounts:     mounts,
-		Networks:   networks,
-		Cmd:        []string{"borgmatic", "--config", "/etc/borgmatic/config.yaml", "create", "--verbosity", "1"},
+	if err := r.validateConfig(ctx, groupName, configPath); err != nil {
+		return err
 	}
 
-	r.logger.Info("creating borgmatic container", "group", groupName, "image", image)
+	args := append([]string{"--config", configPath, "--verbosity", "1", "--log-json"}, r.actions...)
+	cmd := r.execCommand(ctx, r.borgmaticPath, args...)
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	// Own process group: borgmatic's shutdown signal fan-out must not hit the manager.
+	cmd.SysProcAttr.Setpgid = true
 
-	// Use context.Background() for container operations so borgmatic containers
-	// complete independently of manager shutdown.
-	containerID, err := r.rt.CreateContainer(context.Background(), containerCfg)
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("creating container for group %s: %w", groupName, err)
+		return fmt.Errorf("creating stdout pipe for group %s: %w", groupName, err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("creating stderr pipe for group %s: %w", groupName, err)
 	}
 
-	// Connect additional networks (beyond the first, which is set at create time).
-	for i, net := range networks {
-		if i == 0 {
-			continue
+	r.logger.Info("starting borgmatic", "group", groupName, "actions", strings.Join(r.actions, ","))
+	start := time.Now()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting borgmatic for group %s: %w", groupName, err)
+	}
+
+	run := &runState{logger: r.logger, group: groupName}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); run.consume(stdout, "stdout") }()
+	go func() { defer wg.Done(); run.consume(stderr, "stderr") }()
+
+	// Shutdown forwards SIGTERM and waits (systemd's TimeoutStopSec backstops);
+	// a run timeout escalates to SIGKILL so a wedged child can't hold locks forever.
+	done := make(chan struct{})
+	var timedOut atomic.Bool
+	go func() {
+		var timeoutCh <-chan time.Time
+		if r.runTimeout > 0 {
+			t := time.NewTimer(r.runTimeout)
+			defer t.Stop()
+			timeoutCh = t.C
 		}
-		if err := r.rt.ContainerNetworkConnect(context.Background(), net, containerID); err != nil {
-			r.logger.Warn("failed to connect network", "group", groupName, "network", net, "error", err)
+		select {
+		case <-done:
+		case <-ctx.Done():
+			r.logger.Info("shutdown: signalling borgmatic", "group", groupName)
+			signalGroup(cmd, syscall.SIGTERM)
+		case <-timeoutCh:
+			timedOut.Store(true)
+			r.logger.Error("run timeout exceeded: signalling borgmatic", "group", groupName, "timeout", r.runTimeout)
+			signalGroup(cmd, syscall.SIGTERM)
+			select {
+			case <-done:
+			case <-time.After(r.killGrace):
+				r.logger.Error("borgmatic ignored SIGTERM: killing process group", "group", groupName)
+				signalGroup(cmd, syscall.SIGKILL)
+			}
 		}
-	}
+	}()
 
-	// Start container; clean up on failure.
-	if err := r.rt.StartContainer(context.Background(), containerID); err != nil {
-		r.rt.RemoveContainer(context.Background(), containerID)
-		return fmt.Errorf("starting container for group %s: %w", groupName, err)
-	}
+	wg.Wait()
+	err = cmd.Wait()
+	close(done)
 
-	// Stream logs. ContainerLogs with Follow blocks until container exits.
-	r.streamLogs(groupName, containerID)
+	return r.interpretResult(groupName, configPath, err, run, time.Since(start), timedOut.Load())
+}
 
-	// Wait for exit code.
-	exitCode, err := r.rt.WaitContainer(context.Background(), containerID)
+// validateConfig runs 'borgmatic config validate' as a per-cycle gate,
+// converting schema drift between the manager and borgmatic into a precise
+// failure instead of a broken backup run.
+func (r *Runner) validateConfig(ctx context.Context, groupName, configPath string) error {
+	cmd := r.execCommand(ctx, r.borgmaticPath, "--config", configPath, "config", "validate")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		r.logger.Error("error waiting for container", "group", groupName, "error", err)
-	} else {
-		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode)
+		r.logger.Error("generated config failed borgmatic validation; skipping group this cycle",
+			"group", groupName, "config", configPath, "output", strings.TrimSpace(string(out)))
+		return fmt.Errorf("config validation failed for group %s", groupName)
 	}
-
-	// Always remove container, even on error.
-	if rmErr := r.rt.RemoveContainer(context.Background(), containerID); rmErr != nil {
-		r.logger.Warn("failed to remove container", "group", groupName, "error", rmErr)
-	}
-
-	if err != nil {
-		return fmt.Errorf("waiting for container for group %s: %w", groupName, err)
-	}
-
 	return nil
 }
 
-// streamLogs reads the container's multiplexed log stream and emits each line
-// via slog with group and stream attributes.
-func (r *Runner) streamLogs(groupName, containerID string) {
-	logReader, err := r.rt.ContainerLogs(context.Background(), containerID)
-	if err != nil {
-		r.logger.Warn("failed to attach logs", "group", groupName, "error", err)
+// interpretResult turns exit state into logs and an error. borgmatic exits 0
+// even with warnings (output-only), 1 on error, 143 on SIGTERM.
+func (r *Runner) interpretResult(groupName, configPath string, waitErr error, run *runState, duration time.Duration, timedOut bool) error {
+	warnings := run.warnings.Load()
+	exitCode := 0
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return fmt.Errorf("waiting for borgmatic for group %s: %w", groupName, waitErr)
+		}
+	}
+
+	switch {
+	case exitCode == 0:
+		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode,
+			"warnings", warnings, "duration", duration.Round(time.Second).String())
+		return nil
+
+	case exitCode == 143 || exitCode == 130:
+		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
+			"timed_out", timedOut, "duration", duration.Round(time.Second).String())
+		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)
+
+	default:
+		if run.repoMissing.Load() {
+			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
+				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
+					"group", groupName,
+					"hint", fmt.Sprintf("borgmatic --config %s repo-create --encryption repokey-blake2", configPath))
+			}
+		}
+		r.logger.Error("borgmatic failed", "group", groupName, "exit_code", exitCode,
+			"warnings", warnings, "duration", duration.Round(time.Second).String())
+		return fmt.Errorf("borgmatic for group %s failed (exit %d)", groupName, exitCode)
+	}
+}
+
+// runState accumulates per-run output facts across both stream consumers.
+type runState struct {
+	logger      *slog.Logger
+	group       string
+	warnings    atomic.Int64
+	repoMissing atomic.Bool
+}
+
+// borgmaticLogRecord is one --log-json line (borgmatic's own records and
+// Borg passthrough share this shape).
+type borgmaticLogRecord struct {
+	Type      string `json:"type"`
+	Message   string `json:"message"`
+	Levelname string `json:"levelname"`
+	Name      string `json:"name"`
+}
+
+// consume re-emits JSON log records at their level, forwarding raw lines
+// otherwise. Non-JSON stderr counts as a warning (borgmatic routes WARNING+ there).
+func (rs *runState) consume(stream io.Reader, name string) {
+	scanner := bufio.NewScanner(stream)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		rs.emit(line, name)
+	}
+}
+
+func (rs *runState) emit(line, stream string) {
+	var rec borgmaticLogRecord
+	if err := json.Unmarshal([]byte(line), &rec); err == nil && rec.Levelname != "" {
+		rs.checkMessage(rec.Message)
+		switch rec.Levelname {
+		case "CRITICAL", "ERROR":
+			rs.logger.Error(rec.Message, "group", rs.group, "source", rec.Name)
+		case "WARNING":
+			rs.warnings.Add(1)
+			rs.logger.Warn(rec.Message, "group", rs.group, "source", rec.Name)
+		case "DEBUG":
+			rs.logger.Debug(rec.Message, "group", rs.group, "source", rec.Name)
+		default:
+			rs.logger.Info(rec.Message, "group", rs.group, "source", rec.Name)
+		}
 		return
 	}
-	defer logReader.Close()
 
-	stdoutW := &slogWriter{logger: r.logger, group: groupName, stream: "stdout"}
-	stderrW := &slogWriter{logger: r.logger, group: groupName, stream: "stderr"}
-
-	// stdcopy.StdCopy demuxes the multiplexed Docker log stream into
-	// separate stdout/stderr writers. It blocks until EOF (container exit).
-	stdcopy.StdCopy(stdoutW, stderrW, logReader)
-
-	// Flush any remaining buffered content without a trailing newline.
-	stdoutW.flush()
-	stderrW.flush()
+	rs.checkMessage(line)
+	if stream == "stderr" {
+		rs.warnings.Add(1)
+		rs.logger.Warn(line, "group", rs.group, "stream", stream)
+		return
+	}
+	rs.logger.Info(line, "group", rs.group, "stream", stream)
 }
 
-// resolveImage determines the borgmatic container image to use.
-// Priority: BORGMATIC_IMAGE env var > default. (The config option was removed
-// in the v2 pivot; this container runner is replaced entirely in phase 3.)
-func resolveImage(_ *config.ManagerConfig) string {
-	if img := os.Getenv("BORGMATIC_IMAGE"); img != "" {
-		return img
+// checkMessage watches for borg's "repository does not exist" error to drive the bootstrap hint.
+func (rs *runState) checkMessage(msg string) {
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "repository") && strings.Contains(lower, "does not exist") {
+		rs.repoMissing.Store(true)
 	}
-	return defaultBorgmaticImage
 }
 
-// buildMounts constructs the Docker mount slice for a borgmatic container.
-func (r *Runner) buildMounts(groupName string, group *models.VolumeGroup) []mount.Mount {
-	mounts := []mount.Mount{
-		// Borgmatic config file (generated, read-only bind mount)
-		{
-			Type:     mount.TypeBind,
-			Source:   filepath.Join(r.configDir, groupName+".yaml"),
-			Target:   "/etc/borgmatic/config.yaml",
-			ReadOnly: true,
-		},
-		// Borg cache volume (read-write for cache data)
-		{
-			Type:     mount.TypeVolume,
-			Source:   "borgmatic-cache",
-			Target:   "/root/.cache/borg",
-			ReadOnly: false,
-		},
-		// SSH keys (read-only bind mount for borg remote access)
-		{
-			Type:     mount.TypeBind,
-			Source:   "/root/.ssh",
-			Target:   "/root/.ssh",
-			ReadOnly: true,
-		},
+// signalGroup delivers a signal to the child's process group. Negative pid
+// addresses the group; Setpgid guarantees pgid == child pid.
+func signalGroup(cmd *exec.Cmd, sig syscall.Signal) {
+	if cmd.Process == nil {
+		return
 	}
-
-	// Source volumes to back up (read-only)
-	for _, vol := range group.Volumes {
-		mounts = append(mounts, mount.Mount{
-			Type:     mount.TypeVolume,
-			Source:   vol.Name,
-			Target:   vol.HostPath,
-			ReadOnly: true,
-		})
-	}
-
-	return mounts
-}
-
-// slogWriter implements io.Writer, emitting each complete line as a structured
-// slog entry with "group" and "stream" attributes.
-type slogWriter struct {
-	logger *slog.Logger
-	group  string
-	stream string
-	buf    []byte
-}
-
-func (w *slogWriter) Write(p []byte) (n int, err error) {
-	w.buf = append(w.buf, p...)
-	for {
-		idx := bytes.IndexByte(w.buf, '\n')
-		if idx < 0 {
-			break
-		}
-		line := string(w.buf[:idx])
-		w.buf = w.buf[idx+1:]
-		if line != "" {
-			w.logger.Info(line, "group", w.group, "stream", w.stream)
-		}
-	}
-	return len(p), nil
-}
-
-// flush emits any remaining buffered content as a final log line.
-func (w *slogWriter) flush() {
-	if len(w.buf) > 0 {
-		line := string(w.buf)
-		w.buf = nil
-		if line != "" {
-			w.logger.Info(line, "group", w.group, "stream", w.stream)
-		}
-	}
+	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }

@@ -30,7 +30,7 @@ func newMockGroupRunner() *mockGroupRunner {
 	}
 }
 
-func (m *mockGroupRunner) TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig, meta config.GroupRunMeta) (bool, error) {
+func (m *mockGroupRunner) TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, groupName)
@@ -247,7 +247,6 @@ func TestStart_ContextCancellation(t *testing.T) {
 		done <- s.Start(ctx)
 	}()
 
-	// Cancel immediately after initial run.
 	cancel()
 
 	err := <-done
@@ -255,9 +254,10 @@ func TestStart_ContextCancellation(t *testing.T) {
 		t.Fatalf("expected nil error on context cancellation, got: %v", err)
 	}
 
-	// Initial run should have called the runner.
+	// Start must NOT run an initial cycle, the orchestrator owns startup;
+	// v1 ran the first backup twice because both did.
 	calls := runner.getCalls()
-	if len(calls) != 1 || calls[0] != "test-group" {
-		t.Errorf("expected initial run to call test-group, got %v", calls)
+	if len(calls) != 0 {
+		t.Errorf("expected no runs before the first tick, got %v", calls)
 	}
 }

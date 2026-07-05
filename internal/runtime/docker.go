@@ -3,16 +3,12 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
-
-	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 )
@@ -182,93 +178,6 @@ func (d *DockerRuntime) EventStream(ctx context.Context) (<-chan Event, <-chan e
 	}()
 
 	return eventCh, errCh
-}
-
-// CreateContainer creates a new container from the given configuration.
-// It translates ContainerConfig into Docker SDK types, attaching the first
-// network at create time. Use ContainerNetworkConnect for additional networks.
-func (d *DockerRuntime) CreateContainer(ctx context.Context, cfg ContainerConfig) (string, error) {
-	containerName := fmt.Sprintf("borgmatic-%s-%d", cfg.GroupName, time.Now().Unix())
-
-	// Build network config with first network if available.
-	var networkConfig *network.NetworkingConfig
-	if len(cfg.Networks) > 0 {
-		networkConfig = &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
-				cfg.Networks[0]: {},
-			},
-		}
-	}
-
-	resp, err := d.client.ContainerCreate(ctx,
-		&container.Config{
-			Image: cfg.Image,
-			Cmd:   cfg.Cmd,
-		},
-		&container.HostConfig{
-			Mounts: cfg.Mounts,
-		},
-		networkConfig,
-		nil,
-		containerName,
-	)
-	if err != nil {
-		return "", fmt.Errorf("creating container: %w", err)
-	}
-
-	return resp.ID, nil
-}
-
-// ContainerNetworkConnect connects a container to a network.
-func (d *DockerRuntime) ContainerNetworkConnect(ctx context.Context, networkID, containerID string) error {
-	if err := d.client.NetworkConnect(ctx, networkID, containerID, nil); err != nil {
-		return fmt.Errorf("connecting container %s to network %s: %w", containerID, networkID, err)
-	}
-	return nil
-}
-
-// StartContainer starts a previously created container.
-func (d *DockerRuntime) StartContainer(ctx context.Context, id string) error {
-	if err := d.client.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
-		return fmt.Errorf("starting container %s: %w", id, err)
-	}
-	return nil
-}
-
-// WaitContainer blocks until the container exits and returns its exit code.
-func (d *DockerRuntime) WaitContainer(ctx context.Context, id string) (int64, error) {
-	waitCh, errCh := d.client.ContainerWait(ctx, id, container.WaitConditionNotRunning)
-	select {
-	case result := <-waitCh:
-		if result.Error != nil {
-			return result.StatusCode, fmt.Errorf("container wait error: %s", result.Error.Message)
-		}
-		return result.StatusCode, nil
-	case err := <-errCh:
-		return -1, fmt.Errorf("waiting for container %s: %w", id, err)
-	}
-}
-
-// RemoveContainer removes a container by ID with force.
-func (d *DockerRuntime) RemoveContainer(ctx context.Context, id string) error {
-	if err := d.client.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil {
-		return fmt.Errorf("removing container %s: %w", id, err)
-	}
-	return nil
-}
-
-// ContainerLogs returns a reader for the container's stdout/stderr log stream.
-// The stream follows the container output until the container exits.
-func (d *DockerRuntime) ContainerLogs(ctx context.Context, id string) (io.ReadCloser, error) {
-	reader, err := d.client.ContainerLogs(ctx, id, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Follow:     true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("getting container logs for %s: %w", id, err)
-	}
-	return reader, nil
 }
 
 var _ ContainerRuntime = (*DockerRuntime)(nil)

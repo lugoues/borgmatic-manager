@@ -15,7 +15,7 @@ import (
 
 // GroupRunner abstracts runner.Runner for testability.
 type GroupRunner interface {
-	TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig, meta config.GroupRunMeta) (bool, error)
+	TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, error)
 }
 
 // Scheduler runs a periodic ticker, invoking borgmatic for all discovered
@@ -82,10 +82,10 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, state *models.BackupState,
 		}
 
 		wg.Add(1)
-		go func(groupName string, g *models.VolumeGroup, m config.GroupRunMeta) {
+		go func(groupName string, m config.GroupRunMeta) {
 			defer wg.Done()
 
-			acquired, err := s.runner.TryRunGroup(ctx, groupName, g, s.cfg, m)
+			acquired, err := s.runner.TryRunGroup(ctx, groupName, m)
 			if err != nil {
 				s.logger.Warn("group backup error", "group", groupName, "error", err)
 				return
@@ -93,7 +93,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, state *models.BackupState,
 			if !acquired {
 				s.logger.Debug("skipping group, already running", "group", groupName)
 			}
-		}(name, group, meta[name])
+		}(name, meta[name])
 	}
 
 	wg.Wait()
@@ -118,8 +118,8 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 }
 
 // Start blocks, running a ticker loop until the context is cancelled.
-// It runs an initial cycle immediately on startup, then fires at the
-// configured period interval.
+// The first tick fires after one period: the orchestrator owns the startup
+// cycle, so running another here would back up everything twice on boot.
 func (s *Scheduler) Start(ctx context.Context) error {
 	period, err := time.ParseDuration(s.cfg.Manager.Period)
 	if err != nil {
@@ -127,11 +127,6 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	}
 
 	s.logger.Info("scheduler starting", "period", period)
-
-	// Run initial cycle immediately on startup.
-	if err := s.RunCycle(ctx); err != nil {
-		s.logger.Error("initial cycle failed", "error", err)
-	}
 
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
