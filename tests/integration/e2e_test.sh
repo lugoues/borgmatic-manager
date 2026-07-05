@@ -26,6 +26,9 @@ log() { echo "--- $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+CLI="${E2E_CLI:-docker}"
+PG_IMAGE="${E2E_PG_IMAGE:-postgres:17-alpine}"
+CONTAINER_SOCKET="${CONTAINER_SOCKET:-/var/run/docker.sock}"
 BORGMATIC_PATH="${BORGMATIC_PATH:-$(command -v borgmatic)}"
 [ -n "$BORGMATIC_PATH" ] || fail "borgmatic not found; install it or set BORGMATIC_PATH"
 command -v borg >/dev/null || fail "borg not found on PATH"
@@ -49,8 +52,8 @@ BORG_ENV=(BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes BORG_RELOCATED_REPO_ACC
 
 cleanup() {
   [ -n "$MANAGER_PID" ] && sudo kill -TERM "$MANAGER_PID" 2>/dev/null || true
-  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
-  docker volume rm -f "$VOL_A" "$VOL_B" >/dev/null 2>&1 || true
+  $CLI rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  $CLI volume rm -f "$VOL_A" "$VOL_B" >/dev/null 2>&1 || true
   sudo rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -70,31 +73,31 @@ borgmatic:
 EOF
 
 log "creating labeled volume with data"
-docker volume create --label borgmatic-manager.backup=true --label borgmatic-manager.group=$GROUP "$VOL_A" >/dev/null
-docker run --rm -v "$VOL_A:/data" alpine sh -c 'echo e2e-data-a > /data/file-a.txt' >/dev/null
+$CLI volume create --label borgmatic-manager.backup=true --label borgmatic-manager.group=$GROUP "$VOL_A" >/dev/null
+$CLI run --rm -v "$VOL_A:/data" alpine sh -c 'echo e2e-data-a > /data/file-a.txt' >/dev/null
 
 WITH_PG=0
 if [ "${E2E_POSTGRES:-0}" = "1" ]; then
   command -v pg_dump >/dev/null || fail "E2E_POSTGRES=1 but pg_dump not on the host"
   WITH_PG=1
   log "starting labeled postgres container"
-  docker run -d --name "$PG_NAME" \
+  $CLI run -d --name "$PG_NAME" \
     -e POSTGRES_PASSWORD=e2esecret \
     -l borgmatic-manager.group=$GROUP \
     -l borgmatic-manager.db.0.type=postgresql \
     -l borgmatic-manager.db.0.name=postgres \
     -l borgmatic-manager.db.0.username=postgres \
     -l borgmatic-manager.db.0.password=e2esecret \
-    postgres:17-alpine >/dev/null
+    "$PG_IMAGE" >/dev/null
   for _ in $(seq 1 30); do
-    docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break
+    $CLI exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break
     sleep 1
   done
 fi
 
 log "starting manager"
 sudo env "PATH=$PATH" "${BORG_ENV[@]}" \
-  BORGMATIC_PATH="$BORGMATIC_PATH" \
+  BORGMATIC_PATH="$BORGMATIC_PATH" CONTAINER_SOCKET="$CONTAINER_SOCKET" \
   CONFIG_DIR="$CONFIG_DIR" RUNTIME_DIR="$RUNTIME_DIR" STATE_DIR="$STATE_DIR" \
   "$WORK/borgmatic-manager" run > "$LOG" 2>&1 &
 MANAGER_PID=$!
@@ -123,8 +126,8 @@ sudo env "PATH=$PATH" "${BORG_ENV[@]}" \
   "$BORGMATIC_PATH" --config "$GEN_CONFIG" repo-create --encryption none
 
 log "creating second labeled volume (event-driven re-discovery)"
-docker volume create --label borgmatic-manager.backup=true --label borgmatic-manager.group=$GROUP "$VOL_B" >/dev/null
-docker run --rm -v "$VOL_B:/data" alpine sh -c 'echo e2e-data-b > /data/file-b.txt' >/dev/null
+$CLI volume create --label borgmatic-manager.backup=true --label borgmatic-manager.group=$GROUP "$VOL_B" >/dev/null
+$CLI run --rm -v "$VOL_B:/data" alpine sh -c 'echo e2e-data-b > /data/file-b.txt' >/dev/null
 
 log "waiting for a successful backup"
 wait_for_log '"msg":"borgmatic finished"' 120
@@ -152,14 +155,14 @@ if [ "$WITH_PG" = "1" ]; then
 fi
 
 log "testing discover one-shot"
-DISCOVER_OUT=$(sudo env "PATH=$PATH" CONFIG_DIR="$CONFIG_DIR" RUNTIME_DIR="$RUNTIME_DIR" STATE_DIR="$STATE_DIR" \
+DISCOVER_OUT=$(sudo env "PATH=$PATH" CONTAINER_SOCKET="$CONTAINER_SOCKET" CONFIG_DIR="$CONFIG_DIR" RUNTIME_DIR="$RUNTIME_DIR" STATE_DIR="$STATE_DIR" \
   "$WORK/borgmatic-manager" discover)
 echo "$DISCOVER_OUT" | grep -q "group $GROUP" || fail "discover did not list group $GROUP: $DISCOVER_OUT"
 echo "$DISCOVER_OUT" | grep -q "$VOL_A" || fail "discover did not list $VOL_A"
 
 log "testing generate one-shot"
 GEN_OUT_DIR="$WORK/generate-out"
-sudo env "PATH=$PATH" CONFIG_DIR="$CONFIG_DIR" RUNTIME_DIR="$RUNTIME_DIR" STATE_DIR="$STATE_DIR" \
+sudo env "PATH=$PATH" CONTAINER_SOCKET="$CONTAINER_SOCKET" CONFIG_DIR="$CONFIG_DIR" RUNTIME_DIR="$RUNTIME_DIR" STATE_DIR="$STATE_DIR" \
   "$WORK/borgmatic-manager" generate -output "$GEN_OUT_DIR" >/dev/null
 sudo test -f "$GEN_OUT_DIR/$GROUP.yaml" || fail "generate -output did not write $GROUP.yaml"
 

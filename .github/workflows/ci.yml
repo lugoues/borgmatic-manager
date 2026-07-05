@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l cmd internal)
+          if [ -n "$out" ]; then echo "gofmt needed on:"; echo "$out"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - uses: golangci/golangci-lint-action@v8
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: unit tests (race)
+        run: go test -race -count=1 ./...
+
+  e2e-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install borg + borgmatic
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libssl-dev libacl1-dev python3-dev postgresql-client
+          pipx install borgbackup
+          pipx install borgmatic
+          borg --version
+          borgmatic --version
+      - name: end-to-end (docker + postgres)
+        run: E2E_POSTGRES=1 E2E_PG_IMAGE=postgres:16-alpine bash tests/integration/e2e_test.sh
+
+  e2e-podman:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install borg + borgmatic
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libssl-dev libacl1-dev python3-dev podman
+          pipx install borgbackup
+          pipx install borgmatic
+      - name: start rootful podman socket
+        run: sudo systemctl enable --now podman.socket
+      - name: end-to-end (podman compat API, incl. event path)
+        run: |
+          # Rootful podman: CLI calls need sudo; the socket path is podman's.
+          E2E_CLI="sudo podman" CONTAINER_SOCKET=/run/podman/podman.sock bash tests/integration/e2e_test.sh
+
+  release-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          args: release --snapshot --clean
