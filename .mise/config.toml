@@ -2,12 +2,15 @@
 go = "1.25"
 "aqua:golangci/golangci-lint" = "latest"
 
-[env]
-VERSION = "{{ exec(command='git describe --tags --always --dirty 2>/dev/null || echo dev') }}"
-
 [tasks.build]
 description = "Build bin/borgmatic-manager (static, version-stamped)"
-run = 'CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$VERSION" -o bin/borgmatic-manager ./cmd/borgmatic-manager'
+# Version is computed inside the task, at build time only, an [env]
+# template would run 'git describe' on every mise invocation, including
+# shell-activation hooks on every prompt.
+run = '''
+VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$VERSION" -o bin/borgmatic-manager ./cmd/borgmatic-manager
+'''
 
 [tasks.test]
 description = "go vet + unit tests"
