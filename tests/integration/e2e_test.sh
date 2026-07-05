@@ -8,8 +8,9 @@
 #     1. a labeled container (flat labels + config label) with a data volume
 #     2. later, a second container (JSON spec label) with another volume,
 #        started mid-run to exercise event-driven re-discovery
-#   group "db" (E2E_POSTGRES=1), database only, no volume backup:
-#     a labeled postgres container dumped via a helper container
+#   group "db" (E2E_POSTGRES=1 / E2E_MARIADB=1), databases only, no volume
+#     backup: labeled postgres and mariadb containers dumped via helper
+#     containers (mariadb exercises the FIFO-through-runtime-dir-mount path)
 #
 # Assertions:
 #   - the guided "repo-create" bootstrap error appears; the repository is
@@ -27,8 +28,12 @@
 #   - passwordless sudo, or run the whole script as root (DinD harness)
 #
 # Optional:
-#   E2E_POSTGRES=1   also run the database group (dumps run in a helper
-#                    container from the DB image, no host pg_dump)
+#   E2E_POSTGRES=1   include postgres in the database group (dumps run in a
+#                    helper container from the DB image, no host pg_dump)
+#   E2E_MARIADB=1    include mariadb (defaults to E2E_POSTGRES's value); its
+#                    helper writes the dump FIFO through the runtime-dir
+#                    mount, so borgmatic and the docker daemon must share
+#                    that filesystem (true on a real host and in DinD)
 #   MANAGER_BIN=...  use a prebuilt manager binary instead of 'go build'
 #   E2E_CLI=...      container CLI (default docker)
 #   E2E_PG_IMAGE=... postgres image (default postgres:17-alpine)
@@ -61,6 +66,7 @@ VOL_B="e2e-vol-b-$$"
 APP_A="e2e-app-a-$$"
 APP_B="e2e-app-b-$$"
 PG_NAME="e2e-pg-$$"
+MARIA_NAME="e2e-maria-$$"
 FILES_GROUP="files"
 DB_GROUP="db"
 MANAGER_PID=""
@@ -74,7 +80,7 @@ MGR_ENV=(BORGMATIC_PATH="$BORGMATIC_PATH" CONTAINER_SOCKET="$CONTAINER_SOCKET"
 
 cleanup() {
   [ -n "$MANAGER_PID" ] && $SUDO kill -TERM "$MANAGER_PID" 2>/dev/null || true
-  $CLI rm -f "$PG_NAME" "$APP_A" "$APP_B" >/dev/null 2>&1 || true
+  $CLI rm -f "$PG_NAME" "$MARIA_NAME" "$APP_A" "$APP_B" >/dev/null 2>&1 || true
   $CLI volume rm -f "$VOL_A" "$VOL_B" >/dev/null 2>&1 || true
   $SUDO rm -rf "$WORK" 2>/dev/null || true
 }
@@ -111,6 +117,7 @@ $CLI run -d --name "$APP_A" \
   alpine sh -c 'echo e2e-data-a > /data/file-a.txt && sleep 600' >/dev/null
 
 WITH_PG=0
+WITH_MARIA=0
 if [ "${E2E_POSTGRES:-0}" = "1" ]; then
   WITH_PG=1
   log "starting labeled postgres container (database-only group $DB_GROUP)"
@@ -130,6 +137,28 @@ if [ "${E2E_POSTGRES:-0}" = "1" ]; then
   log "writing marker row for the restore roundtrip"
   $CLI exec "$PG_NAME" psql -U postgres -q \
     -c "CREATE TABLE e2e_marker (v text); INSERT INTO e2e_marker VALUES ('roundtrip-ok');"
+fi
+
+if [ "${E2E_MARIADB:-${E2E_POSTGRES:-0}}" = "1" ]; then
+  WITH_MARIA=1
+  log "starting labeled mariadb container (group $DB_GROUP)"
+  $CLI run -d --name "$MARIA_NAME" \
+    -e MARIADB_ROOT_PASSWORD=e2esecret \
+    -e MARIADB_DATABASE=e2edb \
+    -l borgmatic-manager.group=$DB_GROUP \
+    -l borgmatic-manager.db.0.type=mariadb \
+    -l borgmatic-manager.db.0.name=e2edb \
+    -l borgmatic-manager.db.0.username=root \
+    -l borgmatic-manager.db.0.password=e2esecret \
+    "${E2E_MARIA_IMAGE:-mariadb:11}" >/dev/null
+  for _ in $(seq 1 60); do
+    $CLI exec "$MARIA_NAME" mariadb -uroot -pe2esecret -e 'select 1' >/dev/null 2>&1 && break
+    sleep 1
+  done
+
+  log "writing mariadb marker row for the restore roundtrip"
+  $CLI exec "$MARIA_NAME" mariadb -uroot -pe2esecret e2edb \
+    -e "CREATE TABLE e2e_marker (v VARCHAR(64)); INSERT INTO e2e_marker VALUES ('roundtrip-ok');"
 fi
 
 log "starting manager"
@@ -206,24 +235,45 @@ if echo "$FILES_LISTING" | grep -q "postgresql_databases"; then
   fail "'$FILES_GROUP' group must not contain database dumps"
 fi
 
-if [ "$WITH_PG" = "1" ]; then
-  log "waiting for a '$DB_GROUP' archive containing a postgres dump"
-  DB_ARCHIVE=$(wait_for_archive_with "$DB_GROUP" "postgresql_databases" 180)
+if [ "$WITH_PG" = "1" ] || [ "$WITH_MARIA" = "1" ]; then
+  # Both databases live in one group config, so one archive carries every
+  # dump. Wait on the engine whose dump lands last in the pipeline.
+  WAIT_PATTERN="postgresql_databases"
+  [ "$WITH_MARIA" = "1" ] && WAIT_PATTERN="mariadb_databases"
+  log "waiting for a '$DB_GROUP' archive containing database dumps"
+  DB_ARCHIVE=$(wait_for_archive_with "$DB_GROUP" "$WAIT_PATTERN" 180)
 
-  log "restore roundtrip: drop the marker table, restore, assert the row is back"
-  $CLI exec "$PG_NAME" psql -U postgres -q -c "DROP TABLE e2e_marker;"
+  DB_LISTING=$(borg_repo list --format '{path}{NL}' "$REPO_DIR::$DB_ARCHIVE")
+  if [ "$WITH_PG" = "1" ]; then
+    echo "$DB_LISTING" | grep -q "postgresql_databases" || fail "db archive $DB_ARCHIVE is missing the postgres dump"
+  fi
+  if [ "$WITH_MARIA" = "1" ]; then
+    echo "$DB_LISTING" | grep -q "mariadb_databases" || fail "db archive $DB_ARCHIVE is missing the mariadb dump"
+  fi
+
+  log "restore roundtrip: drop marker tables, restore, assert the rows are back"
+  [ "$WITH_PG" = "1" ] && $CLI exec "$PG_NAME" psql -U postgres -q -c "DROP TABLE e2e_marker;"
+  [ "$WITH_MARIA" = "1" ] && $CLI exec "$MARIA_NAME" mariadb -uroot -pe2esecret e2edb -e "DROP TABLE e2e_marker;"
+
   $SUDO env "PATH=$PATH" "${BORG_ENV[@]}" "${MGR_ENV[@]}" \
     "$WORK/borgmatic-manager" borgmatic "$DB_GROUP" restore --archive "$DB_ARCHIVE" \
     || fail "borgmatic restore failed"
-  MARKER=$($CLI exec "$PG_NAME" psql -U postgres -tA -c "SELECT v FROM e2e_marker;")
-  [ "$MARKER" = "roundtrip-ok" ] || fail "restored marker mismatch: got '$MARKER'"
+
+  if [ "$WITH_PG" = "1" ]; then
+    MARKER=$($CLI exec "$PG_NAME" psql -U postgres -tA -c "SELECT v FROM e2e_marker;")
+    [ "$MARKER" = "roundtrip-ok" ] || fail "restored postgres marker mismatch: got '$MARKER'"
+  fi
+  if [ "$WITH_MARIA" = "1" ]; then
+    MARKER=$($CLI exec "$MARIA_NAME" mariadb -uroot -pe2esecret e2edb -N -B -e "SELECT v FROM e2e_marker;")
+    [ "$MARKER" = "roundtrip-ok" ] || fail "restored mariadb marker mismatch: got '$MARKER'"
+  fi
 fi
 
 log "testing discover one-shot"
 DISCOVER_OUT=$($SUDO env "PATH=$PATH" "${MGR_ENV[@]}" "$WORK/borgmatic-manager" discover)
 echo "$DISCOVER_OUT" | grep -q "group $FILES_GROUP" || fail "discover did not list group $FILES_GROUP: $DISCOVER_OUT"
 echo "$DISCOVER_OUT" | grep -q "$VOL_A" || fail "discover did not list $VOL_A"
-if [ "$WITH_PG" = "1" ]; then
+if [ "$WITH_PG" = "1" ] || [ "$WITH_MARIA" = "1" ]; then
   echo "$DISCOVER_OUT" | grep -q "group $DB_GROUP" || fail "discover did not list group $DB_GROUP"
 fi
 

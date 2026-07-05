@@ -48,7 +48,9 @@ docker exec "$NAME" sh -c '
 log "running the e2e suite inside the DinD host"
 docker exec \
   -e E2E_POSTGRES="${E2E_POSTGRES:-1}" \
+  -e E2E_MARIADB="${E2E_MARIADB:-1}" \
   -e E2E_PG_IMAGE="${E2E_PG_IMAGE:-postgres:17-alpine}" \
+  -e E2E_MARIA_IMAGE="${E2E_MARIA_IMAGE:-mariadb:11}" \
   "$NAME" bash /opt/e2e/e2e_test.sh
 
 log "PASS: DinD end-to-end succeeded"
