@@ -11,6 +11,9 @@ linters:
   settings:
     govet:
       enable-all: true
+      disable:
+        # Struct layout micro-optimization noise; readability wins here.
+        - fieldalignment
     gocritic:
       enabled-checks:
         - appendAssign
@@ -18,6 +21,13 @@ linters:
         - dupBranchBody
         - equalFold
         - sloppyLen
+  exclusions:
+    rules:
+      # Test fixtures repeat literals and spawn shell scripts by design.
+      - path: _test\.go
+        linters:
+          - goconst
+          - gosec
 
 formatters:
   enable:

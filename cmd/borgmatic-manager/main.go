@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-systemd/v22/daemon"
+
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/events"

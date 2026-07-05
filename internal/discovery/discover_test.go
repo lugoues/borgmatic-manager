@@ -8,11 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lugoues/borgmatic-manager/internal/discovery"
-	"github.com/lugoues/borgmatic-manager/internal/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lugoues/borgmatic-manager/internal/discovery"
+	"github.com/lugoues/borgmatic-manager/internal/runtime"
 )
 
 // stubProbes makes every mountpoint look mounted and readable so tests can
@@ -439,7 +440,7 @@ func TestDiscoverVolumeListError(t *testing.T) {
 
 	state, err := discovery.Discover(context.Background(), rt, discardLogger())
 	assert.Nil(t, state)
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "listing volumes")
 	assert.Contains(t, err.Error(), "socket unreachable")
 
@@ -453,7 +454,7 @@ func TestDiscoverContainerListError(t *testing.T) {
 
 	state, err := discovery.Discover(context.Background(), rt, discardLogger())
 	assert.Nil(t, state)
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "listing containers")
 	assert.Contains(t, err.Error(), "permission denied")
 

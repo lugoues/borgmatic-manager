@@ -106,7 +106,7 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 		infos = append(infos, ContainerInfo{
 			ID:          c.ID,
 			Name:        name,
-			NetworkMode: string(c.HostConfig.NetworkMode),
+			NetworkMode: c.HostConfig.NetworkMode,
 			Labels:      c.Labels,
 		})
 	}

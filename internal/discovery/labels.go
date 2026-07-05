@@ -17,11 +17,14 @@ const (
 	dbPrefix    = "borgmatic-manager.db."
 )
 
+// dbTypeSQLite gets special validation: no credentials, volume+path required.
+const dbTypeSQLite = "sqlite"
+
 var validDBTypes = map[string]bool{
 	"postgresql": true,
 	"mysql":      true,
 	"mariadb":    true,
-	"sqlite":     true,
+	dbTypeSQLite: true,
 }
 
 // IsBackupEnabled checks whether the volume has opted into backup
@@ -115,7 +118,7 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 			continue
 		}
 
-		if cfg.Type == "sqlite" {
+		if cfg.Type == dbTypeSQLite {
 			if !validateSQLite(cfg, idx, logger) {
 				continue
 			}

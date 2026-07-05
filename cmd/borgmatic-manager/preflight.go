@@ -45,9 +45,9 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 		return nil, fmt.Errorf("invalid manager.period %q: %w", e.cfg.Manager.Period, err)
 	}
 
-	timeout, err := runTimeoutFromConfig(e.cfg)
-	if err != nil {
-		return nil, err
+	timeout, timeoutErr := runTimeoutFromConfig(e.cfg)
+	if timeoutErr != nil {
+		return nil, timeoutErr
 	}
 	res.runTimeout = timeout
 
@@ -145,7 +145,7 @@ func snapshotHooksConfigured(cfg *config.ManagerConfig, overrides map[string]map
 func commandOutput(ctx context.Context, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).Output()
+	out, err := exec.CommandContext(ctx, name, args...).Output() // #nosec G204 -- version preflight of operator-configured binaries
 	return string(out), err
 }
 

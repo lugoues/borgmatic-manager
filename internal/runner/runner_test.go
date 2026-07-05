@@ -13,9 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lugoues/borgmatic-manager/internal/config"
 )
 
 // fakeExecutor records every command the runner spawns and dispatches

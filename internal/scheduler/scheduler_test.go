@@ -49,17 +49,6 @@ func (m *mockGroupRunner) getCalls() []string {
 	return result
 }
 
-// mockDiscoverFunc and mockGenerateFunc for RunCycle tests.
-type mockDeps struct {
-	mu             sync.Mutex
-	discoverCalled bool
-	generateCalled bool
-	runAllCalled   bool
-	discoverState  *models.BackupState
-	discoverErr    error
-	generateErr    error
-}
-
 func TestRunAllGroups_Parallel(t *testing.T) {
 	runner := newMockGroupRunner()
 	cfg := &config.ManagerConfig{

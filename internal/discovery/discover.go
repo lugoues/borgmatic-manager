@@ -127,7 +127,7 @@ func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, vol
 		db.Container = c.Name
 		db.NetworkMode = c.NetworkMode
 
-		if db.Type == "sqlite" {
+		if db.Type == dbTypeSQLite {
 			vol, ok := volumesByName[db.Volume]
 			if !ok {
 				logger.Warn("sqlite database references unknown volume, skipping",
@@ -151,7 +151,7 @@ func defaultIsMountPoint(path string) bool {
 	if err != nil {
 		return false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return mountPoints(f)[filepath.Clean(path)]
 }
 
@@ -200,11 +200,11 @@ func parseOctal(s string) (byte, error) {
 }
 
 func defaultCanReadDir(path string) bool {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- readability probe of runtime-reported mountpoints
 	if err != nil {
 		return false
 	}
-	f.Close()
+	_ = f.Close()
 	return true
 }
 

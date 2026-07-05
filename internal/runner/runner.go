@@ -66,7 +66,7 @@ func NewRunner(logger *slog.Logger, configDir, borgmaticPath string, actions []s
 		execCommand: func(_ context.Context, name string, args ...string) *exec.Cmd {
 			// Not CommandContext: cancellation must SIGTERM the process group
 			// (borg releases repo locks), never SIGKILL outright.
-			return exec.Command(name, args...)
+			return exec.Command(name, args...) // #nosec G204 -- executing the resolved borgmatic binary is this program's purpose
 		},
 	}
 }
@@ -195,10 +195,10 @@ func (r *Runner) runGroup(ctx context.Context, groupName string) error {
 	}()
 
 	wg.Wait()
-	err = cmd.Wait()
+	waitErr := cmd.Wait()
 	close(done)
 
-	return r.interpretResult(groupName, configPath, err, run, time.Since(start), timedOut.Load())
+	return r.interpretResult(groupName, configPath, waitErr, run, time.Since(start), timedOut.Load())
 }
 
 // validateConfig runs 'borgmatic config validate' as a per-cycle gate,
@@ -228,13 +228,13 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 		}
 	}
 
-	switch {
-	case exitCode == 0:
+	switch exitCode {
+	case 0:
 		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode,
 			"warnings", warnings, "duration", duration.Round(time.Second).String())
 		return nil
 
-	case exitCode == 143 || exitCode == 130:
+	case 143, 130:
 		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
 			"timed_out", timedOut, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)

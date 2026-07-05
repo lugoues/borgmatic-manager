@@ -8,11 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lugoues/borgmatic-manager/internal/config"
-	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/models"
 )
 
 func discardLogger() *slog.Logger {
@@ -305,11 +306,11 @@ func TestGenerateReconcilesStaleConfigs(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = os.Stat(filepath.Join(outDir, "current.yaml"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	_, err = os.Stat(filepath.Join(outDir, "removed-group.yaml"))
 	assert.True(t, os.IsNotExist(err), "stale group config must be removed")
 	_, err = os.Stat(filepath.Join(outDir, "notes.txt"))
-	assert.NoError(t, err, "non-yaml files are left alone")
+	require.NoError(t, err, "non-yaml files are left alone")
 }
 
 func TestGenerateDeepMerge(t *testing.T) {
@@ -370,7 +371,7 @@ func TestGenerateMultipleGroups(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = os.Stat(filepath.Join(outDir, "alpha.yaml"))
-	assert.NoError(t, err, "alpha.yaml should exist")
+	require.NoError(t, err, "alpha.yaml should exist")
 
 	_, err = os.Stat(filepath.Join(outDir, "beta.yaml"))
 	assert.NoError(t, err, "beta.yaml should exist")

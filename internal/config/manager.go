@@ -38,14 +38,14 @@ type ManagerSettings struct {
 // The returned overrides map is keyed by group name (filename without .yaml).
 // If groupsDir does not exist, no overrides are returned (not an error).
 func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[string]map[string]interface{}, error) {
-	data, err := os.ReadFile(managerPath)
+	data, err := os.ReadFile(managerPath) // #nosec G304 -- operator-provided config path
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading manager config: %w", err)
 	}
 
 	var cfg ManagerConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, nil, fmt.Errorf("parsing manager config: %w", err)
+	if parseErr := yaml.Unmarshal(data, &cfg); parseErr != nil {
+		return nil, nil, fmt.Errorf("parsing manager config: %w", parseErr)
 	}
 
 	overrides := make(map[string]map[string]interface{})
@@ -70,7 +70,7 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 		groupName := strings.TrimSuffix(name, ".yaml")
 		groupPath := filepath.Join(groupsDir, name)
 
-		groupData, err := os.ReadFile(groupPath)
+		groupData, err := os.ReadFile(groupPath) // #nosec G304 -- files under the operator's groups directory
 		if err != nil {
 			return nil, nil, fmt.Errorf("reading group override %s: %w", groupPath, err)
 		}

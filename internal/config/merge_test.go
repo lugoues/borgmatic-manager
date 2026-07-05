@@ -3,8 +3,9 @@ package config_test
 import (
 	"testing"
 
-	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/lugoues/borgmatic-manager/internal/config"
 )
 
 func TestDeepMerge(t *testing.T) {

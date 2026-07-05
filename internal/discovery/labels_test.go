@@ -5,9 +5,10 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/models"
-	"github.com/stretchr/testify/assert"
 )
 
 func discardLogger() *slog.Logger {
