@@ -7,14 +7,18 @@ import (
 	"strconv"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/lugoues/borgmatic-manager/internal/models"
 )
 
 const (
-	labelPrefix = "borgmatic-manager."
-	labelBackup = "borgmatic-manager.backup"
-	labelGroup  = "borgmatic-manager.group"
-	dbPrefix    = "borgmatic-manager.db."
+	labelPrefix  = "borgmatic-manager."
+	labelBackup  = "borgmatic-manager.backup"
+	labelGroup   = "borgmatic-manager.group"
+	labelVolumes = "borgmatic-manager.volumes"
+	dbPrefix     = "borgmatic-manager.db."
+	configPrefix = "borgmatic-manager.config."
 )
 
 // dbTypeSQLite gets special validation: no credentials, volume+path required.
@@ -27,10 +31,28 @@ var validDBTypes = map[string]bool{
 	dbTypeSQLite: true,
 }
 
-// IsBackupEnabled checks whether the volume has opted into backup
-// via the borgmatic-manager.backup=true label.
+// IsBackupEnabled checks whether the container has opted its volumes into
+// backup via the borgmatic-manager.backup=true label. Containers with only
+// db.* labels contribute database dumps without raw volume backups.
 func IsBackupEnabled(labels map[string]string) bool {
 	return labels[labelBackup] == "true"
+}
+
+// VolumesFilter returns the parsed borgmatic-manager.volumes label (a
+// comma-separated list of volume names or in-container mount destinations)
+// and whether the label is present. Absent means "all named volumes".
+func VolumesFilter(labels map[string]string) ([]string, bool) {
+	raw, ok := labels[labelVolumes]
+	if !ok {
+		return nil, false
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out, true
 }
 
 // GetGroup returns the borgmatic-manager.group label value, or empty string if absent.
@@ -127,6 +149,19 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 			continue
 		}
 
+		switch cfg.Mode {
+		case "", "helper":
+			cfg.Mode = ""
+		case "exec":
+			if cfg.Type != "postgresql" {
+				logger.Warn(fmt.Sprintf("db.%d: exec mode is only supported for postgresql (mysql/mariadb dumps write through a FIFO the exec'd client cannot reach); falling back to the helper container", idx))
+				cfg.Mode = ""
+			}
+		default:
+			logger.Warn(fmt.Sprintf("db.%d: unknown mode %q, using the default helper container", idx, cfg.Mode))
+			cfg.Mode = ""
+		}
+
 		result = append(result, *cfg)
 	}
 
@@ -185,10 +220,55 @@ func setDBField(cfg *models.DatabaseConfig, field, value string, logger *slog.Lo
 		cfg.Path = value
 	case "options":
 		cfg.Options = value
+	case "mode":
+		cfg.Mode = value
 	case "network":
 		// v1 label; host-run borgmatic connects via container IP or 'hostname' instead.
 		logger.Warn("the 'network' db label is deprecated and ignored: host-run borgmatic connects via the container's IP (default) or the 'hostname' label")
 	default:
 		// Unknown fields ignored silently (forward-compatible).
 	}
+}
+
+// ParseConfigLabels builds a nested config fragment from config.* labels. Values
+// parse as YAML; option names are checked later by 'borgmatic config validate'.
+func ParseConfigLabels(labels map[string]string, logger *slog.Logger) map[string]interface{} {
+	var result map[string]interface{}
+
+	for key, value := range labels {
+		if !strings.HasPrefix(key, configPrefix) {
+			continue
+		}
+		path := strings.TrimPrefix(key, configPrefix)
+		if path == "" {
+			logger.Warn("malformed config label: empty option path", "label", key)
+			continue
+		}
+
+		var parsed interface{}
+		if err := yaml.Unmarshal([]byte(value), &parsed); err != nil {
+			logger.Warn("config label value is not valid YAML; using the raw string", "label", key, "error", err)
+			parsed = value
+		}
+
+		if result == nil {
+			result = make(map[string]interface{})
+		}
+		node := result
+		parts := strings.Split(path, ".")
+		for i, part := range parts {
+			if i == len(parts)-1 {
+				node[part] = parsed
+				break
+			}
+			child, ok := node[part].(map[string]interface{})
+			if !ok {
+				child = make(map[string]interface{})
+				node[part] = child
+			}
+			node = child
+		}
+	}
+
+	return result
 }

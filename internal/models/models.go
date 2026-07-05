@@ -33,10 +33,18 @@ func (bs *BackupState) AddDatabases(group string, dbs []DatabaseConfig) {
 	g.Databases = append(g.Databases, dbs...)
 }
 
+// AddLabelConfig appends a label-derived config fragment to the named group.
+func (bs *BackupState) AddLabelConfig(group string, cfg map[string]interface{}) {
+	g := bs.getOrCreateGroup(group)
+	g.LabelConfigs = append(g.LabelConfigs, cfg)
+}
+
 // VolumeGroup aggregates one backup group's volumes and databases.
 type VolumeGroup struct {
 	Volumes   []VolumeInfo
 	Databases []DatabaseConfig
+	// LabelConfigs are config.* fragments in container-name order; merged over groups/*.yaml.
+	LabelConfigs []map[string]interface{}
 }
 
 // VolumeInfo describes a container volume to be backed up.
@@ -61,10 +69,10 @@ type DatabaseConfig struct {
 	Port int
 	// Container is the labeled source container; set by discovery, not labels.
 	Container string
-	// NetworkMode is the source container's network mode (e.g. "bridge",
-	// "host"). Populated by discovery; host-network containers cannot use
-	// container-mode connection resolution.
-	NetworkMode string
+	// Image is the source image; helper dumps run it so client matches server.
+	Image string
+	// Mode: "" (default helper container) or "exec" (postgresql only).
+	Mode string
 	// Volume is the named volume holding a SQLite database file (sqlite only).
 	Volume string
 	// Path inside Volume; discovery resolves it to an absolute host path.

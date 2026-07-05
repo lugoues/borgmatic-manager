@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -60,6 +62,8 @@ func main() {
 		os.Exit(runDiscover())
 	case "generate":
 		os.Exit(runGenerate(args))
+	case "borgmatic":
+		os.Exit(runBorgmaticPassthrough(args))
 	case "version", "--version", "-v":
 		fmt.Println(version)
 	case "help", "--help", "-h":
@@ -76,6 +80,9 @@ commands:
   run        run the manager daemon (default)
   discover   discover labeled volumes/containers, print them, and exit
   generate   generate borgmatic configs once and exit (-output DIR)
+  borgmatic  run borgmatic against a group's generated config:
+               borgmatic-manager borgmatic <group> [borgmatic args...]
+             e.g. repo-create --encryption repokey-blake2 | list | extract
   version    print the version and exit
 
 environment:
@@ -109,11 +116,11 @@ func loadEnv() (*env, error) {
 	return e, nil
 }
 
-func (e *env) newGenerator(ctx context.Context, outputDir string, logger *slog.Logger) *config.Generator {
+func (e *env) newGenerator(outputDir string, logger *slog.Logger) *config.Generator {
 	return config.NewGenerator(e.cfg, e.groupOverrides, outputDir, config.GeneratorOptions{
-		RuntimeDir: e.runtimeDir,
-		StateDir:   e.stateDir,
-		Rootless:   e.rt.Rootless(ctx),
+		RuntimeDir:   e.runtimeDir,
+		StateDir:     e.stateDir,
+		ContainerCLI: detectContainerCLI(),
 	}, logger)
 }
 
@@ -137,7 +144,7 @@ func runDaemon() int {
 		return 1
 	}
 
-	gen := e.newGenerator(ctx, e.configsDir, slog.Default())
+	gen := e.newGenerator(e.configsDir, slog.Default())
 	r := runner.NewRunner(slog.Default(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen)
 	l := events.NewListener(e.rt, slog.Default())
@@ -227,7 +234,7 @@ func runGenerate(args []string) int {
 		return 1
 	}
 
-	gen := e.newGenerator(ctx, outDir, logger)
+	gen := e.newGenerator(outDir, logger)
 	meta, err := gen.Generate(state)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -268,4 +275,63 @@ func runTimeoutFromConfig(cfg *config.ManagerConfig) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid manager.run_timeout %q: %w", cfg.Manager.RunTimeout, err)
 	}
 	return d, nil
+}
+
+// runBorgmaticPassthrough regenerates the group's config from live labels and
+// execs borgmatic with it: the supported way to touch a group's repository.
+func runBorgmaticPassthrough(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: borgmatic-manager borgmatic <group> [borgmatic args...]")
+		return 2
+	}
+	group := args[0]
+
+	logger := textLogger()
+	ctx := context.Background()
+
+	e, err := loadEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	state, err := discoverState(ctx, e, logger)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	gen := e.newGenerator(e.configsDir, logger)
+	meta, err := gen.Generate(state)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	if _, ok := meta[group]; !ok {
+		groups := make([]string, 0, len(meta))
+		for name := range meta {
+			groups = append(groups, name)
+		}
+		sort.Strings(groups)
+		fmt.Fprintf(os.Stderr, "error: unknown group %q; discovered groups: %s\n", group, strings.Join(groups, ", "))
+		return 1
+	}
+
+	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	configPath := filepath.Join(e.configsDir, group+".yaml")
+	argv := append([]string{borgmaticPath, "--config", configPath}, args[1:]...)
+	env := os.Environ()
+
+	// Replace the process: borgmatic owns the terminal from here.
+	// #nosec G702 G204 -- deliberately exec'ing the resolved borgmatic binary with the operator's own CLI arguments
+	if err := syscall.Exec(borgmaticPath, argv, env); err != nil {
+		fmt.Fprintln(os.Stderr, "error executing borgmatic:", err)
+		return 1
+	}
+	return 0
 }

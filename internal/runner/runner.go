@@ -244,7 +244,7 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
 				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
 					"group", groupName,
-					"hint", fmt.Sprintf("borgmatic --config %s repo-create --encryption repokey-blake2", configPath))
+					"hint", fmt.Sprintf("borgmatic-manager borgmatic %s repo-create --encryption repokey-blake2", groupName))
 			}
 		}
 		r.logger.Error("borgmatic failed", "group", groupName, "exit_code", exitCode,

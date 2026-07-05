@@ -106,43 +106,81 @@ func TestGenerateArchiveNameFormat(t *testing.T) {
 	assert.Equal(t, "{hostname}-myapp-{now:%Y-%m-%d_%H:%M}", format)
 }
 
-func TestGenerateContainerModeDatabases(t *testing.T) {
+func TestGenerateHelperModeDatabases(t *testing.T) {
 	state := models.NewBackupState()
 	state.AddDatabases("db-group", []models.DatabaseConfig{
-		{Type: "postgresql", Name: "appdb", Username: "pguser", Container: "pg-svc", NetworkMode: "bridge"},
-		{Type: "mariadb", Name: "wiki", Username: "wiki", Password: "pw", Port: 3306, Container: "maria-svc", NetworkMode: "bridge"},
+		{Type: "postgresql", Name: "appdb", Username: "pguser", Password: "pw", Container: "pg-svc", Image: "postgres:17-alpine"},
+		{Type: "mariadb", Name: "wiki", Username: "wiki", Password: "mpw", Port: 3306, Container: "maria-svc", Image: "mariadb:11"},
 	})
 
-	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
+	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{
+		RuntimeDir:   "/run/borgmatic-manager",
+		ContainerCLI: "docker",
+	})
 	_, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "db-group")
 
-	pgDBs, ok := parsed["postgresql_databases"].([]interface{})
-	require.True(t, ok, "should have postgresql_databases")
-	require.Len(t, pgDBs, 1)
-	pg := pgDBs[0].(map[string]interface{})
-	assert.Equal(t, "pg-svc", pg["container"], "default mode connects via the labeled container")
-	assert.Equal(t, "pguser", pg["username"])
-	assert.NotContains(t, pg, "hostname")
+	pg := parsed["postgresql_databases"].([]interface{})[0].(map[string]interface{})
+	assert.Equal(t, "127.0.0.1", pg["hostname"], "helper joins the DB netns; localhost is the DB")
+	assert.Equal(t, "pg-svc", pg["label"], "container name keeps archive dump paths unique")
+	assert.Equal(t, "docker run --rm --network container:pg-svc --env PGPASSWORD postgres:17-alpine pg_dump", pg["pg_dump_command"],
+		"helper uses the DB container's own image so client always matches server")
+	assert.Equal(t, "docker run --rm -i --network container:pg-svc --env PGPASSWORD postgres:17-alpine pg_restore", pg["pg_restore_command"])
+	assert.Equal(t, "docker run --rm -i --network container:pg-svc --env PGPASSWORD postgres:17-alpine psql", pg["psql_command"])
+	assert.NotContains(t, pg, "container", "the bridge-IP container: option is retired")
 
-	mariaDBs, ok := parsed["mariadb_databases"].([]interface{})
-	require.True(t, ok)
-	require.Len(t, mariaDBs, 1)
-	maria := mariaDBs[0].(map[string]interface{})
-	assert.Equal(t, "maria-svc", maria["container"])
+	maria := parsed["mariadb_databases"].([]interface{})[0].(map[string]interface{})
+	assert.Equal(t, "environment", maria["password_transport"],
+		"a defaults-file pipe cannot cross the container boundary")
+	assert.Equal(t, "docker run --rm -v /run/borgmatic-manager:/run/borgmatic-manager --network container:maria-svc --env MYSQL_PWD mariadb:11 mariadb-dump", maria["mariadb_dump_command"],
+		"the runtime dir mount lets the client reach borgmatic's dump FIFO")
 	assert.Equal(t, 3306, maria["port"])
-	assert.Equal(t, "pw", maria["password"])
 }
 
-func TestGenerateHostnameModeOverridesContainer(t *testing.T) {
+func TestGenerateHelperModeUsesPodmanCLI(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddDatabases("db-group", []models.DatabaseConfig{
-		{Type: "postgresql", Name: "appdb", Username: "u", Hostname: "127.0.0.1", Port: 5433, Container: "pg-svc"},
+	state.AddDatabases("g", []models.DatabaseConfig{
+		{Type: "mysql", Name: "db", Username: "u", Container: "mysql-svc", Image: "mysql:8"},
 	})
 
-	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
+	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{
+		RuntimeDir:   "/run/borgmatic-manager",
+		ContainerCLI: "podman",
+	})
+	_, err := g.Generate(state)
+	require.NoError(t, err)
+
+	parsed := readGenerated(t, outDir, "g")
+	my := parsed["mysql_databases"].([]interface{})[0].(map[string]interface{})
+	assert.Contains(t, my["mysql_dump_command"], "podman run --rm")
+	assert.Contains(t, my["mysql_dump_command"], "mysqldump")
+}
+
+func TestGenerateExecModePostgres(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddDatabases("g", []models.DatabaseConfig{
+		{Type: "postgresql", Name: "appdb", Username: "u", Container: "pg-svc", Image: "postgres:17", Mode: "exec"},
+	})
+
+	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{ContainerCLI: "docker"})
+	_, err := g.Generate(state)
+	require.NoError(t, err)
+
+	parsed := readGenerated(t, outDir, "g")
+	pg := parsed["postgresql_databases"].([]interface{})[0].(map[string]interface{})
+	assert.Equal(t, "docker exec --env PGPASSWORD pg-svc pg_dump", pg["pg_dump_command"])
+	assert.Equal(t, "docker exec -i --env PGPASSWORD pg-svc pg_restore", pg["pg_restore_command"])
+}
+
+func TestGenerateHostnameModeSkipsHelper(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddDatabases("db-group", []models.DatabaseConfig{
+		{Type: "postgresql", Name: "appdb", Username: "u", Hostname: "127.0.0.1", Port: 5433, Container: "pg-svc", Image: "postgres:17"},
+	})
+
+	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{ContainerCLI: "docker"})
 	_, err := g.Generate(state)
 	require.NoError(t, err)
 
@@ -150,55 +188,35 @@ func TestGenerateHostnameModeOverridesContainer(t *testing.T) {
 	pg := parsed["postgresql_databases"].([]interface{})[0].(map[string]interface{})
 	assert.Equal(t, "127.0.0.1", pg["hostname"])
 	assert.Equal(t, 5433, pg["port"])
-	assert.NotContains(t, pg, "container", "hostname mode must not emit container")
+	assert.NotContains(t, pg, "pg_dump_command", "hostname mode uses the host client, no helper container")
 }
 
-func TestGenerateRefusesContainerModeWhenRootless(t *testing.T) {
+func TestGenerateLabelConfigMergesOverGroupFiles(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddDatabases("db-group", []models.DatabaseConfig{
-		{Type: "postgresql", Name: "appdb", Username: "u", Container: "pg-svc"},
+	state.AddVolume("app", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	state.AddLabelConfig("app", map[string]interface{}{
+		"keep_daily": 30,
+		"healthchecks": map[string]interface{}{
+			"ping_url": "https://hc-ping.com/label",
+		},
 	})
-	state.AddVolume("db-group", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
 
-	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{Rootless: true})
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{"keep_daily": 7, "keep_weekly": 4},
+	}
+	overrides := map[string]map[string]interface{}{
+		"app": {"keep_daily": 14},
+	}
+
+	g, outDir := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
 	_, err := g.Generate(state)
 	require.NoError(t, err)
 
-	parsed := readGenerated(t, outDir, "db-group")
-	assert.NotContains(t, parsed, "postgresql_databases",
-		"container mode cannot work rootless; the entry must be refused, not emitted broken")
-}
-
-func TestGenerateRefusesContainerModeForHostNetwork(t *testing.T) {
-	state := models.NewBackupState()
-	state.AddDatabases("db-group", []models.DatabaseConfig{
-		{Type: "postgresql", Name: "appdb", Username: "u", Container: "pg-svc", NetworkMode: "host"},
-		{Type: "postgresql", Name: "gooddb", Username: "u", Container: "pg2", NetworkMode: "bridge"},
-	})
-
-	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
-	require.NoError(t, err)
-
-	parsed := readGenerated(t, outDir, "db-group")
-	pgDBs := parsed["postgresql_databases"].([]interface{})
-	require.Len(t, pgDBs, 1, "host-network entry refused, bridge entry kept")
-	assert.Equal(t, "gooddb", pgDBs[0].(map[string]interface{})["name"])
-}
-
-func TestGenerateHostnameModeWorksRootless(t *testing.T) {
-	state := models.NewBackupState()
-	state.AddDatabases("db-group", []models.DatabaseConfig{
-		{Type: "mariadb", Name: "wiki", Username: "u", Hostname: "127.0.0.1", Port: 13306, Container: "maria"},
-	})
-
-	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{Rootless: true})
-	_, err := g.Generate(state)
-	require.NoError(t, err)
-
-	parsed := readGenerated(t, outDir, "db-group")
-	maria := parsed["mariadb_databases"].([]interface{})[0].(map[string]interface{})
-	assert.Equal(t, "127.0.0.1", maria["hostname"])
+	parsed := readGenerated(t, outDir, "app")
+	assert.Equal(t, 30, parsed["keep_daily"], "label config wins over groups/*.yaml which wins over defaults")
+	assert.Equal(t, 4, parsed["keep_weekly"], "untouched defaults survive")
+	hc := parsed["healthchecks"].(map[string]interface{})
+	assert.Equal(t, "https://hc-ping.com/label", hc["ping_url"])
 }
 
 func TestGenerateSQLiteDatabases(t *testing.T) {
@@ -223,7 +241,7 @@ func TestGenerateSQLiteDatabases(t *testing.T) {
 func TestGenerateWarnsOnMissingHostClient(t *testing.T) {
 	state := models.NewBackupState()
 	state.AddDatabases("db-group", []models.DatabaseConfig{
-		{Type: "postgresql", Name: "appdb", Username: "u", Container: "pg", NetworkMode: "bridge"},
+		{Type: "postgresql", Name: "appdb", Username: "u", Hostname: "127.0.0.1"},
 	})
 
 	var buf strings.Builder

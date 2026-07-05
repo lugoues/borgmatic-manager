@@ -49,6 +49,23 @@ nfpms:
 checksum:
   name_template: checksums.txt
 
+# Keyless (OIDC) cosign signatures over every artifact, verifiable with:
+#   cosign verify-blob --certificate <artifact>.pem --signature <artifact>.sig \
+#     --certificate-identity-regexp 'github.com/lugoues/borgmatic-manager' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com <artifact>
+signs:
+  - cmd: cosign
+    signature: ${artifact}.sig
+    certificate: ${artifact}.pem
+    args:
+      - sign-blob
+      - --yes
+      - --output-signature=${signature}
+      - --output-certificate=${certificate}
+      - ${artifact}
+    artifacts: all
+    output: true
+
 changelog:
   use: git
   sort: asc

@@ -30,9 +30,21 @@ type VolumeInfo struct {
 type ContainerInfo struct {
 	ID   string
 	Name string
-	// NetworkMode is the container's network mode (e.g. "bridge", "host").
-	NetworkMode string
-	Labels      map[string]string
+	// Image is the container's image reference. Helper-container database
+	// dumps run this image so client and server versions always match.
+	Image  string
+	Labels map[string]string
+	// Mounts lists named volume mounts (bind/tmpfs excluded).
+	Mounts []VolumeMount
+}
+
+// VolumeMount is a named volume attached to a container.
+type VolumeMount struct {
+	Name string
+	// Source is the volume's data path on the host.
+	Source string
+	// Destination is the mount path inside the container.
+	Destination string
 }
 
 // Event is a runtime event (container/volume create or removal).

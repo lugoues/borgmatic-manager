@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/lugoues/borgmatic-manager/internal/models"
@@ -20,11 +22,8 @@ var (
 	canReadDir   = defaultCanReadDir
 )
 
-// Discover queries the container runtime for volumes and containers, then
-// populates a BackupState using the label parser. Listings are unfiltered and
-// label matching happens here, so misconfigured ("near-miss") labels produce
-// warnings instead of silence, and unlabeled volumes can be referenced by
-// sqlite database labels.
+// Discover queries the runtime and builds a BackupState from container labels.
+// Volume labels are no longer consulted: immutable after creation, they were a trap.
 func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Logger) (*models.BackupState, error) {
 	state := models.NewBackupState()
 
@@ -33,44 +32,26 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 		return nil, fmt.Errorf("listing volumes: %w", err)
 	}
 
-	// Index all volumes by name for sqlite path resolution, including ones
-	// not labeled for backup.
+	// Index all volumes for skip checks and sqlite path resolution.
 	volumesByName := make(map[string]runtime.VolumeInfo, len(volumes))
 	for _, v := range volumes {
 		volumesByName[v.Name] = v
+		if HasManagerLabels(v.Labels) {
+			logger.Warn("volume labels are no longer supported: label the container instead (borgmatic-manager.backup + .group on the service)",
+				"volume", v.Name)
+		}
 	}
 
-	for _, v := range volumes {
-		if !IsBackupEnabled(v.Labels) {
-			if HasManagerLabels(v.Labels) {
-				logger.Warn("volume has borgmatic-manager labels but is not enabled: set borgmatic-manager.backup=\"true\"",
-					"volume", v.Name, "backup_label", v.Labels[labelBackup])
-			}
-			continue
-		}
-
-		group := GetGroup(v.Labels)
-		if group == "" {
-			logger.Warn("volume has backup=true but no group label", "volume", v.Name)
-			continue
-		}
-
-		if skip, reason := shouldSkipVolume(v); skip {
-			logger.Warn("skipping volume: "+reason, "volume", v.Name, "group", group, "driver", v.Driver)
-			continue
-		}
-
-		state.AddVolume(group, models.VolumeInfo{
-			Name:     v.Name,
-			HostPath: v.Mountpoint,
-		})
-	}
-
-	// Discover containers with database labels.
 	containers, err := rt.ListContainers(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing containers: %w", err)
 	}
+
+	// Deterministic processing order for stable dedupe and config merging.
+	sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+
+	// Dedupe per group: two containers sharing a volume must not back it up twice.
+	seenVolumes := make(map[string]map[string]bool)
 
 	for _, c := range containers {
 		group := GetGroup(c.Labels)
@@ -80,10 +61,27 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			}
 			continue
 		}
+
+		if IsBackupEnabled(c.Labels) {
+			discoverContainerVolumes(state, c, group, volumesByName, seenVolumes, logger)
+		} else if c.Labels[labelBackup] != "" {
+			logger.Warn("container backup label is not \"true\"; its volumes will not be backed up",
+				"container", c.Name, "backup_label", c.Labels[labelBackup])
+		}
+
 		dbs := ParseDatabaseLabels(c.Labels, logger)
 		dbs = finalizeDatabases(dbs, c, volumesByName, logger)
 		if len(dbs) > 0 {
 			state.AddDatabases(group, dbs)
+		}
+
+		if labelCfg := ParseConfigLabels(c.Labels, logger); labelCfg != nil {
+			state.AddLabelConfig(group, labelCfg)
+		}
+
+		if !IsBackupEnabled(c.Labels) && len(dbs) == 0 && ParseConfigLabels(c.Labels, discardLogger()) == nil {
+			logger.Warn("container has a group label but no backup=true, db.*, or config.* labels; it contributes nothing",
+				"container", c.Name, "group", group)
 		}
 	}
 
@@ -91,7 +89,7 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	totalDBs := countDatabases(state)
 
 	if len(state.Groups) == 0 {
-		logger.Warn("no backup groups discovered; check volume/container labels")
+		logger.Warn("no backup groups discovered; check container labels")
 	}
 
 	logger.Info("discovery complete",
@@ -101,6 +99,74 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	)
 
 	return state, nil
+}
+
+// discardLogger avoids double-warning when probing labels a second time.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+var anonymousVolumeName = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// discoverContainerVolumes adds the container's named volumes to its group.
+// Anonymous volumes are excluded unless the filter names them (usually caches, not data).
+func discoverContainerVolumes(state *models.BackupState, c runtime.ContainerInfo, group string, volumesByName map[string]runtime.VolumeInfo, seenVolumes map[string]map[string]bool, logger *slog.Logger) {
+	filter, hasFilter := VolumesFilter(c.Labels)
+	matched := make(map[string]bool, len(filter))
+
+	if seenVolumes[group] == nil {
+		seenVolumes[group] = make(map[string]bool)
+	}
+
+	for _, m := range c.Mounts {
+		included := true
+		if hasFilter {
+			included = false
+			for _, f := range filter {
+				if f == m.Name || f == m.Destination {
+					included = true
+					matched[f] = true
+					break
+				}
+			}
+		} else if anonymousVolumeName.MatchString(m.Name) {
+			continue
+		}
+		if !included || seenVolumes[group][m.Name] {
+			continue
+		}
+
+		vol, ok := volumesByName[m.Name]
+		if !ok {
+			logger.Warn("container mount references a volume the runtime did not list; skipping",
+				"container", c.Name, "volume", m.Name)
+			continue
+		}
+		if skip, reason := shouldSkipVolume(vol); skip {
+			logger.Warn("skipping volume: "+reason, "volume", m.Name, "group", group, "container", c.Name, "driver", vol.Driver)
+			continue
+		}
+
+		hostPath := vol.Mountpoint
+		if hostPath == "" {
+			hostPath = m.Source
+		}
+
+		seenVolumes[group][m.Name] = true
+		state.AddVolume(group, models.VolumeInfo{
+			Name:     m.Name,
+			HostPath: hostPath,
+		})
+	}
+
+	if !hasFilter && len(c.Mounts) == 0 {
+		logger.Warn("container has backup=true but no named volumes attached", "container", c.Name, "group", group)
+	}
+	for _, f := range filter {
+		if !matched[f] {
+			logger.Warn("volumes filter entry matched no attached volume", "container", c.Name, "entry", f)
+		}
+	}
 }
 
 // shouldSkipVolume reports whether a volume cannot be backed up from the host:
@@ -125,7 +191,7 @@ func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, vol
 	result := dbs[:0]
 	for _, db := range dbs {
 		db.Container = c.Name
-		db.NetworkMode = c.NetworkMode
+		db.Image = c.Image
 
 		if db.Type == dbTypeSQLite {
 			vol, ok := volumesByName[db.Volume]

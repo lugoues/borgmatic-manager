@@ -33,16 +33,15 @@ type GroupRunMeta struct {
 
 // GeneratorOptions carries host-environment facts the generator needs.
 type GeneratorOptions struct {
-	// RuntimeDir is pinned as borgmatic's user_runtime_directory (dump FIFOs,
-	// zfs snapshot mounts). Usually the manager's own RuntimeDirectory.
+	// RuntimeDir is pinned as borgmatic's user_runtime_directory; helper dump
+	// containers bind-mount it to reach borgmatic's dump FIFOs.
 	RuntimeDir string
 	// StateDir is pinned as borgmatic's user_state_directory (check-frequency
 	// records). Relocating it makes borgmatic re-run all checks.
 	StateDir string
-	// Rootless indicates a rootless container engine. Rootless (userspace)
-	// networking has no host-reachable container IPs, so container-mode
-	// database connections are refused at generation time.
-	Rootless bool
+	// ContainerCLI is the container CLI binary ("docker" or "podman") used in
+	// generated helper/exec dump commands. Empty defaults to "docker".
+	ContainerCLI string
 }
 
 // Generator produces per-group borgmatic YAML configuration files.
@@ -100,6 +99,12 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 			if override, ok := g.groupOverrides[groupName]; ok {
 				base = DeepMerge(base, override)
 			}
+		}
+
+		// 2b. Apply borgmatic-manager.config.* label fragments (labels win
+		// over files; discovered data still wins over both).
+		for _, labelCfg := range group.LabelConfigs {
+			base = DeepMerge(base, labelCfg)
 		}
 
 		// 3. Build discovered data from volumes and databases.
@@ -196,31 +201,32 @@ func (g *Generator) buildDiscoveredData(groupName string, group *models.VolumeGr
 // engineClients maps a database type to host client binaries borgmatic will
 // invoke; at least one must be present on the host for dumps to work.
 var engineClients = map[string][]string{
-	"postgresql": {"pg_dump"},
-	"mysql":      {"mysqldump"},
-	"mariadb":    {"mariadb-dump", "mysqldump"},
-	dbTypeSQLite: {"sqlite3"},
+	dbTypePostgres: {"pg_dump"},
+	dbTypeMySQL:    {mysqldumpBin},
+	dbTypeMariaDB:  {"mariadb-dump", mysqldumpBin},
+	dbTypeSQLite:   {"sqlite3"},
 }
 
-// dbTypeSQLite entries emit a path, never a connection.
-const dbTypeSQLite = "sqlite"
+// Database engine types. SQLite entries emit a path, never a connection.
+const (
+	dbTypePostgres = "postgresql"
+	dbTypeMySQL    = "mysql"
+	dbTypeMariaDB  = "mariadb"
+	dbTypeSQLite   = "sqlite"
+)
+
+// mysqldumpBin also serves as MariaDB's fallback dump client.
+const mysqldumpBin = "mysqldump"
 
 var engineKey = map[string]string{
-	"postgresql": "postgresql_databases",
-	"mysql":      "mysql_databases",
-	"mariadb":    "mariadb_databases",
-	dbTypeSQLite: "sqlite_databases",
+	dbTypePostgres: "postgresql_databases",
+	dbTypeMySQL:    "mysql_databases",
+	dbTypeMariaDB:  "mariadb_databases",
+	dbTypeSQLite:   "sqlite_databases",
 }
 
-// buildDatabaseHooks emits borgmatic database hook entries. Connection modes:
-//
-//   - hostname mode: the hostname label is set; emitted as hostname/port and
-//     must be reachable from the host (e.g. 127.0.0.1 + published port).
-//   - container mode (default): borgmatic resolves the labeled container's
-//     bridge IP by name. Refused when the engine is rootless or the container
-//     uses host networking, borgmatic cannot resolve an IP in either case,
-//     so a config that can never work is never written.
-//   - sqlite: name + host path (resolved by discovery); no connection.
+// buildDatabaseHooks emits borgmatic database hook entries: helper container
+// (default), hostname (host client), exec (postgresql only), or sqlite (host path).
 func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseConfig) map[string]interface{} {
 	if len(dbs) == 0 {
 		return nil
@@ -246,24 +252,11 @@ func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseCo
 			if db.Port != 0 {
 				entry["port"] = db.Port
 			}
+			g.warnIfMissing(groupName, db.Type, engineClients[db.Type]...)
 
 		default:
-			// Container mode.
-			if g.opts.Rootless {
-				g.logger.Error("cannot generate container-mode database connection under a rootless engine: set the borgmatic-manager.db.N.hostname label to a host-reachable address (e.g. 127.0.0.1 with a published port)",
-					"group", groupName, "database", db.Name, "container", db.Container)
-				continue
-			}
-			if db.NetworkMode == "host" {
-				g.logger.Error("cannot generate container-mode database connection for a host-network container: set the borgmatic-manager.db.N.hostname label (e.g. 127.0.0.1) instead",
-					"group", groupName, "database", db.Name, "container", db.Container)
-				continue
-			}
-			entry["container"] = db.Container
-			if db.Port != 0 {
-				entry["port"] = db.Port
-			}
-			g.warnIfMissing(groupName, db.Type, "docker", "podman")
+			g.buildContainerClientEntry(entry, db)
+			g.warnIfMissing(groupName, db.Type, g.containerCLI())
 		}
 
 		if db.Username != "" {
@@ -276,8 +269,6 @@ func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseCo
 			entry["options"] = db.Options
 		}
 
-		g.warnIfMissing(groupName, db.Type, engineClients[db.Type]...)
-
 		grouped[key] = append(grouped[key], entry)
 	}
 
@@ -289,6 +280,69 @@ func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseCo
 		return nil
 	}
 	return result
+}
+
+func (g *Generator) containerCLI() string {
+	if g.opts.ContainerCLI != "" {
+		return g.opts.ContainerCLI
+	}
+	return "docker"
+}
+
+// clientBinaries maps engines to (dump, interact) client binaries used in
+// generated helper/exec commands.
+var clientBinaries = map[string]struct{ dump, restore, interact string }{
+	dbTypePostgres: {"pg_dump", "pg_restore", "psql"},
+	dbTypeMySQL:    {mysqldumpBin, "mysql", "mysql"},
+	dbTypeMariaDB:  {"mariadb-dump", "mariadb", "mariadb"},
+}
+
+// buildContainerClientEntry fills an entry whose client runs in a container
+// (helper in the database container's netns, or exec into it). The target is
+// always 127.0.0.1; the container name doubles as the borgmatic label.
+func (g *Generator) buildContainerClientEntry(entry map[string]interface{}, db models.DatabaseConfig) {
+	cli := g.containerCLI()
+	bins := clientBinaries[db.Type]
+
+	var base, interactive string
+	if db.Mode == "exec" {
+		base = fmt.Sprintf("%s exec --env PGPASSWORD %s", cli, db.Container)
+		interactive = fmt.Sprintf("%s exec -i --env PGPASSWORD %s", cli, db.Container)
+	} else {
+		run := fmt.Sprintf("%s run --rm", cli)
+		if db.Type == dbTypeMySQL || db.Type == dbTypeMariaDB {
+			// Mount the runtime dir at the identical path so the client reaches borgmatic's dump FIFO.
+			run += fmt.Sprintf(" -v %s:%s", g.opts.RuntimeDir, g.opts.RuntimeDir)
+		}
+		envFlag := "--env PGPASSWORD"
+		if db.Type != dbTypePostgres {
+			envFlag = "--env MYSQL_PWD"
+		}
+		net := fmt.Sprintf("--network container:%s", db.Container)
+		base = fmt.Sprintf("%s %s %s %s", run, net, envFlag, db.Image)
+		interactive = fmt.Sprintf("%s -i %s %s %s", run, net, envFlag, db.Image)
+	}
+
+	entry["hostname"] = "127.0.0.1"
+	if db.Port != 0 {
+		entry["port"] = db.Port
+	}
+	entry["label"] = db.Container
+
+	switch db.Type {
+	case dbTypePostgres:
+		entry["pg_dump_command"] = base + " " + bins.dump
+		entry["pg_restore_command"] = interactive + " " + bins.restore
+		entry["psql_command"] = interactive + " " + bins.interact
+	case dbTypeMySQL:
+		entry["password_transport"] = "environment"
+		entry["mysql_dump_command"] = base + " " + bins.dump
+		entry["mysql_command"] = interactive + " " + bins.interact
+	case dbTypeMariaDB:
+		entry["password_transport"] = "environment"
+		entry["mariadb_dump_command"] = base + " " + bins.dump
+		entry["mariadb_command"] = interactive + " " + bins.interact
+	}
 }
 
 // warnIfMissing warns when none of the candidate host binaries are on PATH;

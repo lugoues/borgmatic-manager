@@ -80,4 +80,5 @@ jobs:
           go-version-file: go.mod
       - uses: goreleaser/goreleaser-action@v6
         with:
-          args: release --snapshot --clean
+          # Signing needs an OIDC token; only real releases sign.
+          args: release --snapshot --clean --skip=sign

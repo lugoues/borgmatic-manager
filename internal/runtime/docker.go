@@ -9,6 +9,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 )
@@ -103,11 +104,23 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 		if len(c.Names) > 0 {
 			name = strings.TrimPrefix(c.Names[0], "/")
 		}
+		var mounts []VolumeMount
+		for _, m := range c.Mounts {
+			if m.Type != mount.TypeVolume {
+				continue
+			}
+			mounts = append(mounts, VolumeMount{
+				Name:        m.Name,
+				Source:      m.Source,
+				Destination: m.Destination,
+			})
+		}
 		infos = append(infos, ContainerInfo{
-			ID:          c.ID,
-			Name:        name,
-			NetworkMode: c.HostConfig.NetworkMode,
-			Labels:      c.Labels,
+			ID:     c.ID,
+			Name:   name,
+			Image:  c.Image,
+			Labels: c.Labels,
+			Mounts: mounts,
 		})
 	}
 	return infos, nil

@@ -3,12 +3,14 @@
 #
 # End-to-end test of the borgmatic-manager host-service model:
 #   1. builds the manager binary
-#   2. creates a labeled docker volume with data
+#   2. starts a labeled container (backup=true + group + config label) with a
+#      named volume holding data
 #   3. starts the manager (as root: it must read /var/lib/docker/volumes)
 #   4. asserts the guided "repo-create" bootstrap error appears
-#   5. initializes the repository with the hinted command
-#   6. creates a second labeled volume -> event-driven re-discovery cycle
-#   7. asserts a borg archive exists and contains the volume data
+#   5. initializes the repository via the borgmatic passthrough subcommand
+#   6. starts a second labeled container -> event-driven re-discovery cycle
+#   7. asserts a borg archive exists and contains the volume data, and that
+#      the config label was applied
 #   8. asserts the discover/generate one-shots work
 #   9. SIGTERMs the manager and asserts clean shutdown
 #
@@ -43,6 +45,8 @@ mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR" "$STATE_DIR"
 
 VOL_A="e2e-vol-a-$$"
 VOL_B="e2e-vol-b-$$"
+APP_A="e2e-app-a-$$"
+APP_B="e2e-app-b-$$"
 PG_NAME="e2e-pg-$$"
 GROUP="e2e"
 MANAGER_PID=""
@@ -52,7 +56,7 @@ BORG_ENV=(BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes BORG_RELOCATED_REPO_ACC
 
 cleanup() {
   [ -n "$MANAGER_PID" ] && sudo kill -TERM "$MANAGER_PID" 2>/dev/null || true
-  $CLI rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  $CLI rm -f "$PG_NAME" "$APP_A" "$APP_B" >/dev/null 2>&1 || true
   $CLI volume rm -f "$VOL_A" "$VOL_B" >/dev/null 2>&1 || true
   sudo rm -rf "$WORK" 2>/dev/null || true
 }
@@ -72,9 +76,14 @@ borgmatic:
   lock_wait: 30
 EOF
 
-log "creating labeled volume with data"
-$CLI volume create --label borgmatic-manager.backup=true --label borgmatic-manager.group=$GROUP "$VOL_A" >/dev/null
-$CLI run --rm -v "$VOL_A:/data" alpine sh -c 'echo e2e-data-a > /data/file-a.txt' >/dev/null
+log "starting labeled container with a data volume"
+$CLI volume create "$VOL_A" >/dev/null
+$CLI run -d --name "$APP_A" \
+  -v "$VOL_A:/data" \
+  -l borgmatic-manager.backup=true \
+  -l borgmatic-manager.group=$GROUP \
+  -l borgmatic-manager.config.keep_daily=14 \
+  alpine sh -c 'echo e2e-data-a > /data/file-a.txt && sleep 600' >/dev/null
 
 WITH_PG=0
 if [ "${E2E_POSTGRES:-0}" = "1" ]; then
@@ -121,13 +130,22 @@ sudo test -f "$GEN_CONFIG" || fail "generated config missing at $GEN_CONFIG"
 PERM=$(sudo stat -c %a "$GEN_CONFIG")
 [ "$PERM" = "600" ] || fail "generated config must be 0600, got $PERM"
 
-log "initializing repository with the hinted command"
-sudo env "PATH=$PATH" "${BORG_ENV[@]}" \
-  "$BORGMATIC_PATH" --config "$GEN_CONFIG" repo-create --encryption none
+log "asserting the config label was applied"
+sudo grep -q "keep_daily: 14" "$GEN_CONFIG" || fail "borgmatic-manager.config.keep_daily label not applied to generated config"
 
-log "creating second labeled volume (event-driven re-discovery)"
-$CLI volume create --label borgmatic-manager.backup=true --label borgmatic-manager.group=$GROUP "$VOL_B" >/dev/null
-$CLI run --rm -v "$VOL_B:/data" alpine sh -c 'echo e2e-data-b > /data/file-b.txt' >/dev/null
+log "initializing repository via the borgmatic passthrough subcommand"
+sudo env "PATH=$PATH" "${BORG_ENV[@]}" \
+  BORGMATIC_PATH="$BORGMATIC_PATH" CONTAINER_SOCKET="$CONTAINER_SOCKET" \
+  CONFIG_DIR="$CONFIG_DIR" RUNTIME_DIR="$RUNTIME_DIR" STATE_DIR="$STATE_DIR" \
+  "$WORK/borgmatic-manager" borgmatic "$GROUP" repo-create --encryption none
+
+log "starting second labeled container (event-driven re-discovery)"
+$CLI volume create "$VOL_B" >/dev/null
+$CLI run -d --name "$APP_B" \
+  -v "$VOL_B:/data" \
+  -l borgmatic-manager.backup=true \
+  -l borgmatic-manager.group=$GROUP \
+  alpine sh -c 'echo e2e-data-b > /data/file-b.txt && sleep 600' >/dev/null
 
 log "waiting for a successful backup"
 wait_for_log '"msg":"borgmatic finished"' 120

@@ -1,17 +1,19 @@
 # borgmatic-manager
 
 Label-driven backup orchestration for Docker and Podman. A host systemd
-service that discovers labeled containers and volumes, generates
+service that discovers labeled containers, generates
 [borgmatic](https://torsion.org/borgmatic/) configurations, and runs periodic,
 snapshot-consistent backups — no per-service config files.
 
 ## How it works
 
-1. **Discover** — watches the Docker/Podman socket for volumes and containers
-   with `borgmatic-manager.*` labels (periodically and on create/remove events)
+1. **Discover** — watches the Docker/Podman socket for containers with
+   `borgmatic-manager.*` labels (periodically and on create/remove events);
+   a labeled container's named volumes and databases join its backup group
 2. **Generate** — compiles per-group borgmatic YAML from labels + your defaults
 3. **Backup** — runs host-installed borgmatic per group:
-   `create prune compact check`
+   `create prune compact check`; database dumps run in short-lived helper
+   containers joined to the database's network namespace
 4. **Snapshots** — on btrfs/zfs/LVM hosts, borgmatic's built-in hooks snapshot
    the filesystem for crash-consistent backups
 
@@ -42,7 +44,7 @@ reimplements.
 | borgmatic | **2.1.0** | distro packages usually too old — use `sudo uv tool install borgmatic` or `pipx install borgmatic` (as root) |
 | borg | **1.4** | needed for original-path recording with snapshot hooks |
 | Docker or Podman | — | socket access; rootless Podman supported with [limitations](#rootless-podman) |
-| DB client tools | — | `pg_dump`/`psql`, `mariadb-dump`, `mysqldump`, `sqlite3` on the host, per database type you back up |
+| `sqlite3` | — | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers — no host clients needed) |
 
 ## Quick start
 
@@ -53,17 +55,22 @@ sudo make install     # builds and installs binary, unit, default config
 sudo uv tool install borgmatic   # if you don't have borgmatic >= 2.1
 ```
 
-**2. Label your volumes** — ⚠️ volume labels are **immutable**: they only
-apply at creation. For existing volumes see [migrating existing
-volumes](#migrating-existing-volumes).
+**2. Label your containers** — labels live on the *service*, not the volume,
+so a normal `docker compose up` after editing applies them:
 
 ```yaml
 # docker-compose.yaml
+services:
+  myapp:
+    image: myapp:latest
+    volumes:
+      - app-data:/data
+    labels:
+      borgmatic-manager.backup: "true"   # back up this service's named volumes
+      borgmatic-manager.group: "myapp"
+
 volumes:
   app-data:
-    labels:
-      borgmatic-manager.backup: "true"
-      borgmatic-manager.group: "myapp"
 ```
 
 **3. Configure** `/etc/borgmatic-manager/manager.yaml`:
@@ -85,8 +92,8 @@ exact command:
 ```bash
 sudo systemctl enable --now borgmatic-manager
 journalctl -u borgmatic-manager | grep repo-create
-# then run the printed command, e.g.:
-sudo borgmatic --config /run/borgmatic-manager/configs/myapp.yaml repo-create --encryption repokey-blake2
+# then run the printed command:
+sudo borgmatic-manager borgmatic myapp repo-create --encryption repokey-blake2
 ```
 
 The next cycle backs up. Verify labels any time with
@@ -94,59 +101,75 @@ The next cycle backs up. Verify labels any time with
 
 ## Labels reference
 
-### Volume labels
+All labels go on **containers** (volume labels are not supported — they are
+immutable after creation, which made them a trap).
 
-| Label | Required | Description |
-|-------|----------|-------------|
-| `borgmatic-manager.backup` | Yes | `"true"` to enable backup |
-| `borgmatic-manager.group` | Yes | Backup group; volumes sharing a group back up together |
+| Label | Description |
+|-------|-------------|
+| `borgmatic-manager.group` | Backup group. Required for a container to participate at all; containers sharing a group back up together. |
+| `borgmatic-manager.backup` | `"true"` to back up this container's named volumes. |
+| `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Default: all named volumes (anonymous volumes excluded). |
+| `borgmatic-manager.db.{n}.*` | Database dump definitions (below). |
+| `borgmatic-manager.config.<option>` | Any borgmatic option for this group (below). |
 
-Only `local`-driver volumes are supported. Volumes with mount options
+Only `local`-driver volumes are supported; volumes with mount options
 (NFS/CIFS) are backed up only while mounted; other drivers are skipped with a
 warning. Anything carrying a `borgmatic-manager.*` label that doesn't parse
-produces a warning in the logs — typos are never silent.
+produces a warning — typos are never silent (`borgmatic-manager discover`
+shows the result).
 
-### Container labels (database backups)
+### Database labels
 
 | Label | Required | Description |
 |-------|----------|-------------|
-| `borgmatic-manager.group` | Yes | Group to attach the databases to |
 | `borgmatic-manager.db.{n}.type` | Yes | `postgresql`, `mysql`, `mariadb`, or `sqlite` |
 | `borgmatic-manager.db.{n}.name` | Yes | Database name |
 | `borgmatic-manager.db.{n}.username` | Yes* | DB user (*not for sqlite*) |
 | `borgmatic-manager.db.{n}.password` | No | DB password (see [Secrets](#secrets)) |
-| `borgmatic-manager.db.{n}.hostname` | No | Host-reachable address — switches to hostname mode |
-| `borgmatic-manager.db.{n}.port` | No | Container-internal port (or published port in hostname mode) |
+| `borgmatic-manager.db.{n}.hostname` | No | Host-reachable address — switches to hostname mode (host client tools required) |
+| `borgmatic-manager.db.{n}.port` | No | Database port (container-internal in the default mode) |
+| `borgmatic-manager.db.{n}.mode` | No | `exec` to exec into the DB container instead of a helper (postgresql only) |
 | `borgmatic-manager.db.{n}.volume` | sqlite | Volume containing the database file |
 | `borgmatic-manager.db.{n}.path` | sqlite | Path of the `.db` file inside that volume |
 
 `{n}` is a zero-based index; gaps are allowed. The v1 `db.{n}.network` label
 is deprecated and ignored.
 
-### How database connections work
+### How database dumps run
 
-Dump clients (`pg_dump`, `mariadb-dump`, …) run **on the host**. Two modes:
+By default the manager generates borgmatic commands that spawn a
+**short-lived helper container from the database container's own image**,
+joined to its network namespace (`--network container:<name>`):
 
-- **Container mode (default):** borgmatic resolves the labeled container's
-  bridge IP by name (requires the docker/podman CLI). Works for containers on
-  bridge networks under a root engine.
-- **Hostname mode:** set `db.{n}.hostname` (e.g. `127.0.0.1` plus a published
-  `port`). **Required** for host-network containers and rootless engines —
-  the manager refuses to generate container mode there and logs what to do.
+- works with **any** network setup — bridge, custom, internal, host, none,
+  pods, rootless — no published ports needed
+- the dump client is always the **same version as the server** (it ships in
+  the same image)
+- zero database client tools on the host
 
-PostgreSQL caveat: `pg_dump` refuses servers newer than itself. Match your
-host client to the container's major version, or use the officially-supported
-docker-exec pattern in a group override (`groups/myapp.yaml`):
+You never write these commands; `borgmatic-manager generate` shows what is
+produced. Setting `db.{n}.hostname` switches that database to a plain
+host-side connection instead (requires `pg_dump`/`mariadb-dump`/`mysqldump`
+on the host), and `db.{n}.mode: exec` runs the client inside the DB container
+itself (postgresql only — mysql/mariadb dumps stream through a FIFO that an
+exec'd client cannot reach).
+
+### Config labels (traefik-style)
+
+Any borgmatic option can be set per group straight from a label — dotted
+paths become nested YAML, values are parsed as YAML (numbers, booleans,
+`[flow, lists]`):
 
 ```yaml
-postgresql_databases:
-  - name: appdb
-    hostname: 127.0.0.1
-    username: postgres
-    pg_dump_command: docker exec my_pg_container pg_dump
-    pg_restore_command: docker exec -i my_pg_container pg_restore
-    psql_command: docker exec -i my_pg_container psql
+labels:
+  borgmatic-manager.config.keep_daily: "14"
+  borgmatic-manager.config.healthchecks.ping_url: "https://hc-ping.com/uuid"
+  borgmatic-manager.config.repositories: "[{path: ssh://borg@host/./myapp}]"
 ```
+
+Precedence: `manager.yaml` defaults → `groups/<group>.yaml` → **config
+labels** → discovered data (source dirs, database hooks). Typo'd option
+names fail the per-run `borgmatic config validate` gate with a precise error.
 
 ## Filesystem snapshots (btrfs / zfs / LVM)
 
@@ -214,17 +237,24 @@ Or set `ssh_command: ssh -o StrictHostKeyChecking=accept-new` in the
 
 ## Restoring
 
-Restores are plain borgmatic — the manager stays out of the way:
+Everything goes through the passthrough subcommand — it regenerates the
+group's config from live labels and hands you borgmatic, so it works even
+after a reboot cleared the runtime directory:
 
-- **Manager running:** use the generated config directly:
-  `sudo borgmatic --config /run/borgmatic-manager/configs/myapp.yaml extract --archive latest`
-  (databases: `... restore --archive latest`; the target container must be
-  running in container mode).
-- **Configs gone** (service stopped/rebooted): regenerate them from live
-  labels: `sudo borgmatic-manager generate -output /tmp/restore`.
-- **Host lost:** borgmatic embeds its config in every archive —
-  `borgmatic config bootstrap --repository ssh://…` recovers it, then extract
-  as above.
+```bash
+sudo borgmatic-manager borgmatic myapp list
+sudo borgmatic-manager borgmatic myapp extract --archive latest
+sudo borgmatic-manager borgmatic myapp restore --archive latest   # databases
+```
+
+Database restores run through the same generated helper containers as dumps
+(the target container must be running). Configs change safely while backups
+run: files are replaced atomically and borgmatic reads its config once at
+start, so an in-flight run never sees a partial or changed config.
+
+**Host lost entirely:** borgmatic embeds its config in every archive —
+`borgmatic config bootstrap --repository ssh://…` recovers it, then extract
+as above.
 
 ## Monitoring
 
@@ -254,17 +284,18 @@ loginctl enable-linger $USER
 ```
 
 Limitations: no snapshot hooks (except btrfs's documented non-root path);
-database backups need hostname mode (userspace networking has no reachable
-container IPs — the manager tells you exactly this if you forget); volume
-files owned by subordinate UIDs are skipped with a warning (fix ownership
-with `podman unshare chown`).
+volume files owned by subordinate UIDs are skipped with a warning (fix
+ownership with `podman unshare chown`). Database dumps work normally — the
+helper container joins the DB container's network namespace, which needs no
+routable container IP.
 
 ## CLI
 
 ```
-borgmatic-manager run                  # the daemon (default)
-borgmatic-manager discover             # one-shot: print discovered groups
-borgmatic-manager generate -output D   # one-shot: write configs to D
+borgmatic-manager run                     # the daemon (default)
+borgmatic-manager discover                # one-shot: print discovered groups
+borgmatic-manager generate -output D      # one-shot: write configs to D
+borgmatic-manager borgmatic <group> ...   # run borgmatic against a group
 borgmatic-manager version
 ```
 
@@ -310,9 +341,9 @@ doesn't instantly fail a cycle.
 - `journalctl -u borgmatic-manager` — JSON logs; per-group results include
   `exit_code`, `warnings`, `duration`
 - "repository does not exist" — run the printed `repo-create` command (once)
-- database dumps fail — is the client tool installed on the host? right
-  major version for postgres? host-reachable address for host-network /
-  rootless containers?
+- database dumps fail — is the DB container running? (helper containers join
+  its network namespace, so it must be up); in hostname mode, is the client
+  tool on the host and the address reachable?
 
 ## Development
 

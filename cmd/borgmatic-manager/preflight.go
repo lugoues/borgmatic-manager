@@ -92,15 +92,24 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 		}
 	}
 
-	// docker/podman CLI: borgmatic shells out to it for container-mode DB
-	// connections. Generation warns per group; this is the generic heads-up.
-	if _, err := exec.LookPath("docker"); err != nil {
-		if _, err := exec.LookPath("podman"); err != nil {
-			slog.Warn("neither docker nor podman CLI found on PATH; container-mode database backups will fail")
-		}
+	// docker/podman CLI: generated helper/exec dump commands invoke it.
+	// Generation warns per group; this is the generic heads-up.
+	if detectContainerCLI() == "" {
+		slog.Warn("neither docker nor podman CLI found on PATH; database dump commands will fail")
 	}
 
 	return res, nil
+}
+
+// detectContainerCLI picks the container CLI used in generated dump
+// commands: docker if present, else podman, else empty (docker assumed).
+func detectContainerCLI() string {
+	for _, cli := range []string{"docker", "podman"} {
+		if _, err := exec.LookPath(cli); err == nil {
+			return cli
+		}
+	}
+	return ""
 }
 
 // resolveBorgmatic finds the borgmatic binary: BORGMATIC_PATH env, then the
