@@ -1,0 +1,31 @@
+# borgmatic-manager user unit (rootless Podman).
+# Install: cp to ~/.config/systemd/user/borgmatic-manager.service, then
+#   systemctl --user enable --now podman.socket
+#   systemctl --user daemon-reload && systemctl --user enable --now borgmatic-manager
+#   loginctl enable-linger $USER   # start at boot, survive logout
+#
+# Rootless limitations (see README):
+#   - snapshot hooks are unsupported (except btrfs's documented non-root path)
+#   - container-mode DB connections don't work with userspace networking:
+#     set borgmatic-manager.db.N.hostname=127.0.0.1 + a published port
+#   - volume files owned by subordinate UIDs are skipped with a warning
+[Unit]
+Description=borgmatic-manager - label-driven borgmatic backup orchestration (rootless)
+Wants=podman.socket
+After=podman.socket
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/borgmatic-manager run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=900
+Environment=CONTAINER_SOCKET=%t/podman/podman.sock
+Environment=CONFIG_DIR=%h/.config/borgmatic-manager
+Environment=RUNTIME_DIR=%t/borgmatic-manager
+Environment=STATE_DIR=%h/.local/state/borgmatic-manager
+# borgmatic from uv/pipx:
+#Environment=BORGMATIC_PATH=%h/.local/bin/borgmatic
+
+[Install]
+WantedBy=default.target

@@ -1,8 +1,0 @@
-.git
-.planning
-.claude
-.devcontainer
-.mise
-*.md
-tests/
-deploy/

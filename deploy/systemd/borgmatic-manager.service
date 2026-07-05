@@ -1,0 +1,76 @@
+# borgmatic-manager system unit (root; Docker or rootful Podman).
+# Install: cp to /etc/systemd/system/ (or via the deb/rpm), then
+#   systemctl daemon-reload && systemctl enable --now borgmatic-manager
+[Unit]
+Description=borgmatic-manager - label-driven borgmatic backup orchestration
+Documentation=https://github.com/lugoues/borgmatic-manager
+Wants=network-online.target
+After=network-online.target docker.service podman.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/borgmatic-manager run
+Restart=on-failure
+RestartSec=10
+# Shutdown waits for in-flight backups (they get SIGTERM and exit cleanly);
+# this is the hard backstop.
+TimeoutStopSec=900
+
+# /etc/borgmatic-manager, /run/borgmatic-manager, /var/lib/borgmatic-manager.
+# Generated configs (contain credentials) live in the 0700 runtime dir;
+# Preserve=restart keeps them across restarts for debugging/restore, while
+# a full stop still cleans them up.
+ConfigurationDirectory=borgmatic-manager
+RuntimeDirectory=borgmatic-manager
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+StateDirectory=borgmatic-manager
+StateDirectoryMode=0700
+
+# uv/pipx root installs land at /root/.local/bin, which is not on the
+# default service PATH. Uncomment if that's how you installed borgmatic.
+#Environment=BORGMATIC_PATH=/root/.local/bin/borgmatic
+
+# Repository passphrase without plaintext in config files:
+#   systemd-creds encrypt --name=borgmatic.pw secret.txt /etc/credstore.encrypted/borgmatic.pw
+# then set: encryption_passphrase: "{credential systemd borgmatic.pw}"
+#LoadCredentialEncrypted=borgmatic.pw
+
+# --- Hardening ----------------------------------------------------------
+# Every directive also constrains the children: borgmatic, borg, ssh, and
+# the btrfs/zfs/lvm snapshot tools. Annotations follow borgmatic's own
+# sample unit, loosen per feature, don't guess.
+NoNewPrivileges=yes
+LockPersonality=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+# LVM snapshot hook: preload dm_snapshot at boot, or set this to no.
+ProtectKernelModules=yes
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+# @mount is required by the zfs/lvm hooks' snapshot mounts.
+SystemCallFilter=@system-service @mount
+SystemCallErrorNumber=EPERM
+# Required by borgmatic's Healthchecks integration.
+MemoryDenyWriteExecute=no
+# Breaks the zfs and lvm hooks (/dev/zfs, /dev/mapper/control). Enable only
+# for btrfs-only or snapshot-less deployments.
+#PrivateDevices=yes
+# Never set ProtectHome=yes (borg cache/config and ssh keys live in /root)
+# and never ReadOnlyPaths= over volume trees (btrfs snapshots are created
+# inside the source subvolume).
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,54 @@
+version: 2
+project_name: borgmatic-manager
+
+builds:
+  - main: ./cmd/borgmatic-manager
+    binary: borgmatic-manager
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - config/manager.yaml
+      - deploy/systemd/*
+
+nfpms:
+  - package_name: borgmatic-manager
+    formats:
+      - deb
+      - rpm
+    homepage: https://github.com/lugoues/borgmatic-manager
+    description: Label-driven borgmatic backup orchestration for Docker and Podman
+    license: MIT
+    maintainer: borgmatic-manager contributors
+    # No hard dependency on borgmatic: distro packages usually sit below the
+    # required 2.1.0 floor. The README install matrix covers uv/pipx.
+    recommends:
+      - borgbackup
+    contents:
+      - src: deploy/systemd/borgmatic-manager.service
+        dst: /usr/lib/systemd/system/borgmatic-manager.service
+      - src: deploy/systemd/borgmatic-manager.user.service
+        dst: /usr/share/borgmatic-manager/borgmatic-manager.user.service
+      - src: config/manager.yaml
+        dst: /etc/borgmatic-manager/manager.yaml
+        type: config|noreplace
+    scripts:
+      postinstall: deploy/packaging/postinstall.sh
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  sort: asc
