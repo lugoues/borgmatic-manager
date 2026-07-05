@@ -6,7 +6,7 @@ BINDIR      := $(PREFIX)/bin
 UNITDIR     ?= /etc/systemd/system
 CONFDIR     ?= /etc/borgmatic-manager
 
-.PHONY: build test race lint fmt e2e install uninstall clean
+.PHONY: build test race lint fmt e2e e2e-dind install uninstall clean
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/borgmatic-manager ./cmd/borgmatic-manager
@@ -26,6 +26,11 @@ fmt:
 
 e2e: build
 	bash tests/integration/e2e_test.sh
+
+# Hermetic variant: manager + borg + borgmatic + test containers all inside
+# a privileged docker-in-docker host.
+e2e-dind:
+	bash tests/integration/dind_test.sh
 
 install: build
 	install -D -m 0755 bin/borgmatic-manager $(DESTDIR)$(BINDIR)/borgmatic-manager

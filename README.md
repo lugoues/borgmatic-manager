@@ -380,6 +380,7 @@ doesn't instantly fail a cycle.
 make test      # vet + unit tests
 make race      # race-detector run
 make e2e       # end-to-end test (needs docker, borgmatic, borg, sudo)
+make e2e-dind  # hermetic e2e inside a docker-in-docker host (needs only docker)
 make build     # bin/borgmatic-manager
 ```
 

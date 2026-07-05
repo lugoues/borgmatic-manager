@@ -41,13 +41,23 @@ jobs:
       - name: install borg + borgmatic
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq pkg-config libssl-dev libacl1-dev python3-dev postgresql-client
+          sudo apt-get install -y -qq pkg-config libssl-dev libacl1-dev python3-dev
           pipx install borgbackup
           pipx install borgmatic
           borg --version
           borgmatic --version
       - name: end-to-end (docker + postgres)
         run: E2E_POSTGRES=1 E2E_PG_IMAGE=postgres:16-alpine bash tests/integration/e2e_test.sh
+
+  e2e-dind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: end-to-end (hermetic docker-in-docker host)
+        run: bash tests/integration/dind_test.sh
 
   e2e-podman:
     runs-on: ubuntu-latest
