@@ -381,7 +381,7 @@ Tools and tasks are managed with [mise](https://mise.jdx.dev) (`mise install` on
 ```bash
 mise run test      # vet + unit tests
 mise run race      # race-detector run
-mise run e2e       # end-to-end test (needs docker, borgmatic, borg, sudo)
+mise run e2e       # end-to-end test (docker+compose, borgmatic, borg, sudo)
 mise run e2e-dind  # hermetic e2e inside a docker-in-docker host (needs only docker)
 mise run build     # bin/borgmatic-manager
 ```

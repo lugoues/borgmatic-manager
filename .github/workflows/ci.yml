@@ -36,7 +36,7 @@ jobs:
           borg --version
           borgmatic --version
       - name: end-to-end (docker + postgres + mariadb)
-        run: E2E_POSTGRES=1 E2E_MARIADB=1 E2E_PG_IMAGE=postgres:16-alpine mise run e2e
+        run: E2E_PG_IMAGE=postgres:16-alpine mise run e2e
 
   e2e-dind:
     runs-on: ubuntu-latest

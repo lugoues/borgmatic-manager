@@ -36,13 +36,15 @@ if [ -n "$out" ]; then echo "gofmt needed on:"; echo "$out"; exit 1; fi
 '''
 
 [tasks.e2e]
-description = "End-to-end test against the local daemon (needs docker, borgmatic, borg, sudo)"
+description = "End-to-end test against the local daemon (needs docker+compose, borgmatic, borg, sudo)"
 depends = ["build"]
-run = "bash tests/integration/e2e_test.sh"
+run = '''
+sudo -E env "PATH=$PATH" MANAGER_BIN="$PWD/bin/borgmatic-manager" bash tests/e2e/run.sh
+'''
 
 [tasks.e2e-dind]
 description = "Hermetic end-to-end inside a docker-in-docker host (needs only docker)"
-run = "bash tests/integration/dind_test.sh"
+run = "bash tests/e2e/dind.sh"
 
 [tasks.install]
 description = "Install binary, systemd unit, and default config (uses sudo)"

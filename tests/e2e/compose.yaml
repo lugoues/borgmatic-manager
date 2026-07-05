@@ -1,0 +1,93 @@
+# The e2e workload stack, everything the manager should discover, declared
+# in one place. This file doubles as living documentation of the label
+# schema: app-a uses flat labels (+ a config label), app-b the one-label
+# JSON spec, and the databases use db.{n}.* labels.
+#
+# Readiness is healthcheck-driven: `docker compose up --wait` blocks until
+# every service is healthy (data written, databases accepting connections),
+# so the test driver contains no readiness sleep loops.
+name: e2e
+
+services:
+  # ---- group "files": volumes only, no databases -------------------------
+  app-a:
+    image: alpine
+    container_name: e2e-app-a
+    command: sh -c 'echo e2e-data-a > /data/file-a.txt && sleep 3600'
+    volumes:
+      - data-a:/data
+    labels:
+      borgmatic-manager.backup: "true"
+      borgmatic-manager.group: files
+      borgmatic-manager.config.keep_daily: "14"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/file-a.txt"]
+      interval: 1s
+      retries: 30
+
+  # Started later (--profile late) to exercise event-driven re-discovery:
+  # its container-create event must trigger a backup cycle.
+  app-b:
+    profiles: [late]
+    image: alpine
+    container_name: e2e-app-b
+    command: sh -c 'echo e2e-data-b > /data/file-b.txt && sleep 3600'
+    volumes:
+      - data-b:/data
+    labels:
+      borgmatic-manager.spec: '{"group": "files", "backup": true}'
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/file-b.txt"]
+      interval: 1s
+      retries: 30
+
+  # ---- group "db": databases only, no volume backup ----------------------
+  # Dumps run in helper containers spawned from these images; the initdb
+  # scripts seed the marker rows the restore roundtrip asserts on.
+  postgres:
+    image: ${E2E_PG_IMAGE:-postgres:17-alpine}
+    container_name: e2e-postgres
+    environment:
+      POSTGRES_PASSWORD: e2esecret
+    volumes:
+      - ./initdb/postgres:/docker-entrypoint-initdb.d:ro
+    labels:
+      borgmatic-manager.group: db
+      borgmatic-manager.db.0.type: postgresql
+      borgmatic-manager.db.0.name: postgres
+      borgmatic-manager.db.0.username: postgres
+      borgmatic-manager.db.0.password: e2esecret
+    healthcheck:
+      # -h 127.0.0.1 forces TCP: the entrypoint's init-phase server listens
+      # only on the unix socket, so this stays unhealthy until the real start.
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
+      interval: 2s
+      retries: 60
+
+  mariadb:
+    image: ${E2E_MARIA_IMAGE:-mariadb:11}
+    container_name: e2e-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: e2esecret
+      MARIADB_DATABASE: e2edb
+    volumes:
+      - ./initdb/mariadb:/docker-entrypoint-initdb.d:ro
+    labels:
+      borgmatic-manager.group: db
+      borgmatic-manager.db.0.type: mariadb
+      borgmatic-manager.db.0.name: e2edb
+      borgmatic-manager.db.0.username: root
+      borgmatic-manager.db.0.password: e2esecret
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      start_period: 10s
+      retries: 60
+
+volumes:
+  # Explicit names so discovery output and assertions stay predictable
+  # (compose would otherwise prefix them with the project name).
+  data-a:
+    name: e2e-data-a
+  data-b:
+    name: e2e-data-b
