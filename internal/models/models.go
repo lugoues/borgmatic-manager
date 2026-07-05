@@ -61,6 +61,10 @@ type DatabaseConfig struct {
 	Port int
 	// Container is the labeled source container; set by discovery, not labels.
 	Container string
+	// NetworkMode is the source container's network mode (e.g. "bridge",
+	// "host"). Populated by discovery; host-network containers cannot use
+	// container-mode connection resolution.
+	NetworkMode string
 	// Volume is the named volume holding a SQLite database file (sqlite only).
 	Volume string
 	// Path inside Volume; discovery resolves it to an absolute host path.

@@ -57,7 +57,9 @@ func (r *Runner) getMutex(groupName string) *sync.Mutex {
 // TryRunGroup attempts to run a backup for the given group. If the group's
 // mutex is already held (another backup is running), it returns (false, nil)
 // without blocking. Otherwise it runs the backup and returns (true, err).
-func (r *Runner) TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig) (bool, error) {
+// The run metadata drives repo/snapshot serialization in the host-exec runner
+// (v2 phase 3); this container runner ignores it.
+func (r *Runner) TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig, _ config.GroupRunMeta) (bool, error) {
 	mu := r.getMutex(groupName)
 	if !mu.TryLock() {
 		r.logger.Debug("skipping group: backup already running", "group", groupName)
@@ -159,13 +161,11 @@ func (r *Runner) streamLogs(groupName, containerID string) {
 }
 
 // resolveImage determines the borgmatic container image to use.
-// Priority: BORGMATIC_IMAGE env var > config file > default.
-func resolveImage(cfg *config.ManagerConfig) string {
+// Priority: BORGMATIC_IMAGE env var > default. (The config option was removed
+// in the v2 pivot; this container runner is replaced entirely in phase 3.)
+func resolveImage(_ *config.ManagerConfig) string {
 	if img := os.Getenv("BORGMATIC_IMAGE"); img != "" {
 		return img
-	}
-	if cfg != nil && cfg.Manager.BorgmaticImage != "" {
-		return cfg.Manager.BorgmaticImage
 	}
 	return defaultBorgmaticImage
 }

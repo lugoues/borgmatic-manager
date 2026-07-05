@@ -1,20 +1,63 @@
 # Borgmatic Manager configuration
 # See: https://github.com/lugoues/borgmatic-manager
 manager:
-  # How often to run backups (Go duration format)
+  # How often to run backup cycles (Go duration format: 30m, 1h, 24h)
   period: "1h"
-  # borgmatic_image: ghcr.io/borgmatic-collective/borgmatic:latest
 
-# Default borgmatic settings applied to all groups
-# Per-group overrides go in groups/{group-name}.yaml
+  # Path to the host borgmatic binary. Defaults to searching PATH, then
+  # /root/.local/bin (where 'uv tool install' / pipx put it).
+  # borgmatic_path: /root/.local/bin/borgmatic
+
+  # Borgmatic actions run for each group per cycle, in order. The default
+  # applies retention and consistency checks, not just backup creation.
+  # Checks self-throttle (borgmatic runs them monthly by default).
+  # actions: [create, prune, compact, check]
+
+  # Bound a single group's borgmatic run (Go duration). 0 = no timeout.
+  # run_timeout: "0"
+
+# Default borgmatic settings applied to all groups.
+# Anything valid in borgmatic's schema can go here, it is deep-merged with
+# per-group overrides from groups/{group-name}.yaml and discovered data.
 borgmatic:
   repositories:
     - path: /mnt/borg-repository
+      label: local
+
+  # Repository encryption passphrase. Required for encrypted repos (recommended).
+  # Plain value, or a credential reference resolved by borgmatic at runtime:
+  #   encryption_passphrase: "{credential systemd borgmatic.pw}"
+  # encryption_passphrase: "change-me"
+
   keep_daily: 7
   keep_weekly: 4
   keep_monthly: 6
+
   checks:
     - name: repository
-      frequency: "1 week"
+      frequency: 1 week
     - name: archives
-      frequency: "1 month"
+      frequency: 1 month
+
+  # Wait up to this many seconds for another borg process to release the
+  # repository lock (e.g. a manually-run borgmatic). Borg's default of 1s
+  # fails almost immediately on any contention.
+  lock_wait: 120
+
+  # --- Filesystem snapshots (crash-consistent backups) -------------------
+  # If your container volumes live on btrfs, zfs, or LVM, enable the matching
+  # hook and borgmatic snapshots the containing subvolume/dataset for each
+  # backup, then cleans up. For clean granularity, make the volumes directory
+  # its own subvolume/dataset (see the README snapshot guide).
+  # btrfs:
+  # zfs:
+  # lvm:
+
+  # --- Monitoring (know when backups fail) -------------------------------
+  # Any borgmatic monitoring hook works here; a dead manager means missed
+  # pings, which your monitor alerts on.
+  # healthchecks:
+  #   ping_url: https://hc-ping.com/your-uuid
+  # ntfy:
+  #   topic: my-backups
+  #   states: [fail]

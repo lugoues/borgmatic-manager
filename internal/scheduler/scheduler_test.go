@@ -30,7 +30,7 @@ func newMockGroupRunner() *mockGroupRunner {
 	}
 }
 
-func (m *mockGroupRunner) TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig) (bool, error) {
+func (m *mockGroupRunner) TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig, meta config.GroupRunMeta) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, groupName)
@@ -67,14 +67,14 @@ func TestRunAllGroups_Parallel(t *testing.T) {
 	}
 	logger := slog.Default()
 
-	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
+	s := NewScheduler(runner, nil, logger, cfg, nil)
 
 	state := models.NewBackupState()
 	state.AddVolume("group-a", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 	state.AddVolume("group-b", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 	state.AddVolume("group-c", models.VolumeInfo{Name: "vol3", HostPath: "/mnt/vol3"})
 
-	s.RunAllGroups(context.Background(), state)
+	s.RunAllGroups(context.Background(), state, nil)
 
 	calls := runner.getCalls()
 	expected := []string{"group-a", "group-b", "group-c"}
@@ -95,14 +95,14 @@ func TestRunAllGroups_SkipEmptyGroups(t *testing.T) {
 	}
 	logger := slog.Default()
 
-	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
+	s := NewScheduler(runner, nil, logger, cfg, nil)
 
 	state := models.NewBackupState()
 	state.AddVolume("has-volumes", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 	// "empty-group" has no volumes (only databases or nothing)
 	state.Groups["empty-group"] = &models.VolumeGroup{}
 
-	s.RunAllGroups(context.Background(), state)
+	s.RunAllGroups(context.Background(), state, nil)
 
 	calls := runner.getCalls()
 	if len(calls) != 1 {
@@ -122,13 +122,13 @@ func TestRunAllGroups_MutexSkip(t *testing.T) {
 	}
 	logger := slog.Default()
 
-	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
+	s := NewScheduler(runner, nil, logger, cfg, nil)
 
 	state := models.NewBackupState()
 	state.AddVolume("busy-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 	state.AddVolume("free-group", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 
-	s.RunAllGroups(context.Background(), state)
+	s.RunAllGroups(context.Background(), state, nil)
 
 	calls := runner.getCalls()
 	if len(calls) != 2 {
@@ -147,14 +147,14 @@ func TestRunAllGroups_ErrorContinues(t *testing.T) {
 	}
 	logger := slog.Default()
 
-	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
+	s := NewScheduler(runner, nil, logger, cfg, nil)
 
 	state := models.NewBackupState()
 	state.AddVolume("error-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 	state.AddVolume("ok-group", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 
 	// Should not panic or abort; both groups should be attempted.
-	s.RunAllGroups(context.Background(), state)
+	s.RunAllGroups(context.Background(), state, nil)
 
 	calls := runner.getCalls()
 	if len(calls) != 2 {
@@ -175,16 +175,16 @@ func TestRunCycle_DiscoverAndGenerate(t *testing.T) {
 	discoverCalled := false
 	generateCalled := false
 
-	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
+	s := NewScheduler(runner, nil, logger, cfg, nil)
 
 	// Override discover and generate funcs for testing.
 	s.discoverFunc = func(ctx context.Context) (*models.BackupState, error) {
 		discoverCalled = true
 		return state, nil
 	}
-	s.generateFunc = func(st *models.BackupState) error {
+	s.generateFunc = func(st *models.BackupState) (map[string]config.GroupRunMeta, error) {
 		generateCalled = true
-		return nil
+		return nil, nil
 	}
 
 	err := s.RunCycle(context.Background())
@@ -212,7 +212,7 @@ func TestStart_InvalidPeriod(t *testing.T) {
 	}
 	logger := slog.Default()
 
-	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
+	s := NewScheduler(runner, nil, logger, cfg, nil)
 
 	err := s.Start(context.Background())
 	if err == nil {
@@ -230,14 +230,14 @@ func TestStart_ContextCancellation(t *testing.T) {
 	state := models.NewBackupState()
 	state.AddVolume("test-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 
-	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
+	s := NewScheduler(runner, nil, logger, cfg, nil)
 
 	// Override discover and generate to return quickly.
 	s.discoverFunc = func(ctx context.Context) (*models.BackupState, error) {
 		return state, nil
 	}
-	s.generateFunc = func(st *models.BackupState) error {
-		return nil
+	s.generateFunc = func(st *models.BackupState) (map[string]config.GroupRunMeta, error) {
+		return nil, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

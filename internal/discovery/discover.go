@@ -125,6 +125,7 @@ func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, vol
 	result := dbs[:0]
 	for _, db := range dbs {
 		db.Container = c.Name
+		db.NetworkMode = c.NetworkMode
 
 		if db.Type == "sqlite" {
 			vol, ok := volumesByName[db.Volume]

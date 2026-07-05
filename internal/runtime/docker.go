@@ -20,7 +20,8 @@ import (
 // DockerRuntime implements ContainerRuntime using the Docker SDK.
 // It works with both Docker and Podman via the Docker-compatible API socket.
 type DockerRuntime struct {
-	client *dockerclient.Client
+	client     *dockerclient.Client
+	socketPath string
 }
 
 // NewDockerRuntime creates a new DockerRuntime connected to the container socket.
@@ -41,7 +42,24 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 		return nil, fmt.Errorf("creating docker client: %w", err)
 	}
 
-	return &DockerRuntime{client: cli}, nil
+	return &DockerRuntime{client: cli, socketPath: socketPath}, nil
+}
+
+// Rootless reports whether the engine runs rootless. It checks the engine's
+// reported security options, falling back to a socket-path heuristic when the
+// info call fails. Rootless engines use userspace networking, which breaks
+// container-IP database connections.
+func (d *DockerRuntime) Rootless(ctx context.Context) bool {
+	info, err := d.client.Info(ctx)
+	if err == nil {
+		for _, opt := range info.SecurityOptions {
+			if strings.Contains(opt, "rootless") {
+				return true
+			}
+		}
+		return false
+	}
+	return strings.Contains(d.socketPath, "/run/user/")
 }
 
 // ListVolumes returns all volumes. Filtering is client-side so near-miss labels

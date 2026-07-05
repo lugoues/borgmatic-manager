@@ -25,11 +25,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// Config paths from environment or defaults.
+	// Directory layout from environment or systemd-conventional defaults.
 	configDir := getEnv("CONFIG_DIR", "/etc/borgmatic-manager")
+	runtimeDir := getEnv("RUNTIME_DIR", "/run/borgmatic-manager")
+	stateDir := getEnv("STATE_DIR", "/var/lib/borgmatic-manager")
 	managerPath := filepath.Join(configDir, "manager.yaml")
 	groupsDir := filepath.Join(configDir, "groups")
-	outputDir := filepath.Join(configDir, "generated")
+	configsDir := filepath.Join(runtimeDir, "configs")
 
 	// Load configuration.
 	cfg, groupOverrides, err := config.LoadConfig(managerPath, groupsDir)
@@ -38,15 +40,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create container runtime.
+	// Create the container runtime client (discovery + events).
 	rt, err := runtime.NewDockerRuntime()
 	if err != nil {
-		slog.Error("failed to create container runtime", "error", err)
+		slog.Error("failed to create container runtime client", "error", err)
 		os.Exit(1)
 	}
 
-	r := runner.NewRunner(rt, slog.Default(), outputDir)
-	s := scheduler.NewScheduler(r, rt, slog.Default(), cfg, groupOverrides, outputDir)
+	gen := config.NewGenerator(cfg, groupOverrides, configsDir, config.GeneratorOptions{
+		RuntimeDir: runtimeDir,
+		StateDir:   stateDir,
+		Rootless:   rt.Rootless(ctx),
+	}, slog.Default())
+	r := runner.NewRunner(rt, slog.Default(), configsDir)
+	s := scheduler.NewScheduler(r, rt, slog.Default(), cfg, gen)
 	l := events.NewListener(rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())
 

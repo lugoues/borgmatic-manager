@@ -18,8 +18,17 @@ type ManagerConfig struct {
 
 // ManagerSettings holds manager-specific runtime configuration.
 type ManagerSettings struct {
-	Period         string `yaml:"period"`
-	BorgmaticImage string `yaml:"borgmatic_image"`
+	// Period is the backup cycle interval (Go duration format, e.g. "1h").
+	Period string `yaml:"period"`
+	// BorgmaticPath is the path to the host borgmatic binary. Empty means
+	// resolve via BORGMATIC_PATH env, then PATH, then well-known locations.
+	BorgmaticPath string `yaml:"borgmatic_path"`
+	// Actions are the borgmatic actions run per group per cycle, in order.
+	// Empty means the default: create, prune, compact, check.
+	Actions []string `yaml:"actions"`
+	// RunTimeout bounds a single group's borgmatic run (Go duration format).
+	// Empty or "0" means no timeout.
+	RunTimeout string `yaml:"run_timeout"`
 }
 
 // LoadConfig reads the manager configuration from managerPath and loads any

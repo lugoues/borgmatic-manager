@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -30,11 +29,7 @@ func stdcopyFrame(streamType byte, data string) []byte {
 }
 
 func newTestConfig() *config.ManagerConfig {
-	return &config.ManagerConfig{
-		Manager: config.ManagerSettings{
-			BorgmaticImage: "borgmatic:test",
-		},
-	}
+	return &config.ManagerConfig{}
 }
 
 func newTestGroup() *models.VolumeGroup {
@@ -98,70 +93,6 @@ func TestRunGroup_Mounts(t *testing.T) {
 	err := r.RunGroup(context.Background(), "mygroup", group, cfg)
 	assert.NoError(t, err)
 	m.AssertExpectations(t)
-}
-
-func TestRunGroup_Image(t *testing.T) {
-	tests := []struct {
-		name      string
-		envImage  string
-		cfgImage  string
-		wantImage string
-	}{
-		{
-			name:      "env var takes precedence",
-			envImage:  "custom:v1",
-			cfgImage:  "config:v2",
-			wantImage: "custom:v1",
-		},
-		{
-			name:      "config fallback when no env",
-			envImage:  "",
-			cfgImage:  "config:v2",
-			wantImage: "config:v2",
-		},
-		{
-			name:      "default fallback when both empty",
-			envImage:  "",
-			cfgImage:  "",
-			wantImage: "ghcr.io/borgmatic-collective/borgmatic:latest",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.envImage != "" {
-				t.Setenv("BORGMATIC_IMAGE", tt.envImage)
-			} else {
-				os.Unsetenv("BORGMATIC_IMAGE")
-			}
-
-			m := &runtime.MockRuntime{}
-			logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-			r := NewRunner(m, logger, "/etc/borgmatic/generated")
-
-			group := newTestGroup()
-			cfg := &config.ManagerConfig{
-				Manager: config.ManagerSettings{
-					BorgmaticImage: tt.cfgImage,
-				},
-			}
-
-			logData := stdcopyFrame(1, "done\n")
-
-			m.On("CreateContainer", mock.Anything, mock.MatchedBy(func(c runtime.ContainerConfig) bool {
-				return c.Image == tt.wantImage
-			})).Return("ctr-123", nil)
-			m.On("ContainerNetworkConnect", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
-			m.On("StartContainer", mock.Anything, "ctr-123").Return(nil)
-			m.On("ContainerLogs", mock.Anything, "ctr-123").Return(io.NopCloser(bytes.NewReader(logData)), nil)
-			m.On("WaitContainer", mock.Anything, "ctr-123").Return(int64(0), nil)
-			m.On("RemoveContainer", mock.Anything, "ctr-123").Return(nil)
-
-			err := r.RunGroup(context.Background(), "mygroup", group, cfg)
-			assert.NoError(t, err)
-			m.AssertExpectations(t)
-		})
-	}
 }
 
 func TestRunGroup_Cleanup(t *testing.T) {
@@ -250,7 +181,7 @@ func TestTryRunGroup_MutexSkip(t *testing.T) {
 	mu.Lock()
 
 	// TryRunGroup should return false without running
-	ran, err := r.TryRunGroup(context.Background(), "mygroup", group, cfg)
+	ran, err := r.TryRunGroup(context.Background(), "mygroup", group, cfg, config.GroupRunMeta{})
 	assert.NoError(t, err)
 	assert.False(t, ran)
 
@@ -271,7 +202,7 @@ func TestTryRunGroup_Success(t *testing.T) {
 	logData := stdcopyFrame(1, "done\n")
 	setupMockForFullLifecycle(m, logData)
 
-	ran, err := r.TryRunGroup(context.Background(), "mygroup", group, cfg)
+	ran, err := r.TryRunGroup(context.Background(), "mygroup", group, cfg, config.GroupRunMeta{})
 	assert.NoError(t, err)
 	assert.True(t, ran)
 	m.AssertExpectations(t)

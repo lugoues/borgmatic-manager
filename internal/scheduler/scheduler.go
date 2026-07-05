@@ -15,23 +15,22 @@ import (
 
 // GroupRunner abstracts runner.Runner for testability.
 type GroupRunner interface {
-	TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig) (bool, error)
+	TryRunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig, meta config.GroupRunMeta) (bool, error)
 }
 
 // Scheduler runs a periodic ticker, invoking borgmatic for all discovered
-// groups in parallel on each tick. Groups with no volumes are skipped, and
-// the runner's per-group mutex prevents overlapping runs.
+// groups in parallel on each tick. Groups with neither volumes nor databases
+// are skipped, and the runner's per-group mutex prevents overlapping runs.
 type Scheduler struct {
-	runner         GroupRunner
-	rt             runtime.ContainerRuntime
-	logger         *slog.Logger
-	cfg            *config.ManagerConfig
-	groupOverrides map[string]map[string]interface{}
-	outputDir      string
+	runner    GroupRunner
+	rt        runtime.ContainerRuntime
+	logger    *slog.Logger
+	cfg       *config.ManagerConfig
+	generator *config.Generator
 
 	// discoverFunc and generateFunc are overridable for testing.
 	discoverFunc func(ctx context.Context) (*models.BackupState, error)
-	generateFunc func(state *models.BackupState) error
+	generateFunc func(state *models.BackupState) (map[string]config.GroupRunMeta, error)
 }
 
 // NewScheduler creates a new Scheduler with the given dependencies.
@@ -40,32 +39,31 @@ func NewScheduler(
 	rt runtime.ContainerRuntime,
 	logger *slog.Logger,
 	cfg *config.ManagerConfig,
-	groupOverrides map[string]map[string]interface{},
-	outputDir string,
+	generator *config.Generator,
 ) *Scheduler {
 	s := &Scheduler{
-		runner:         runner,
-		rt:             rt,
-		logger:         logger,
-		cfg:            cfg,
-		groupOverrides: groupOverrides,
-		outputDir:      outputDir,
+		runner:    runner,
+		rt:        rt,
+		logger:    logger,
+		cfg:       cfg,
+		generator: generator,
 	}
 
 	s.discoverFunc = func(ctx context.Context) (*models.BackupState, error) {
 		return discovery.Discover(ctx, s.rt, s.logger)
 	}
-	s.generateFunc = func(state *models.BackupState) error {
-		return config.GenerateConfigs(state, s.cfg, s.groupOverrides, s.outputDir)
+	s.generateFunc = func(state *models.BackupState) (map[string]config.GroupRunMeta, error) {
+		return s.generator.Generate(state)
 	}
 
 	return s
 }
 
 // RunAllGroups iterates all groups in the given state and runs them in parallel
-// goroutines. Groups with no volumes are skipped. Errors from individual groups
-// are logged but do not abort the tick.
-func (s *Scheduler) RunAllGroups(ctx context.Context, state *models.BackupState) {
+// goroutines. Groups with neither volumes nor databases are skipped, a group
+// defined only by database labels is a valid deployment. Errors from individual
+// groups are logged but do not abort the tick.
+func (s *Scheduler) RunAllGroups(ctx context.Context, state *models.BackupState, meta map[string]config.GroupRunMeta) {
 	// Sort group names for deterministic log output.
 	names := make([]string, 0, len(state.Groups))
 	for name := range state.Groups {
@@ -78,17 +76,16 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, state *models.BackupState)
 	for _, name := range names {
 		group := state.Groups[name]
 
-		// Skip groups with no volumes.
-		if len(group.Volumes) == 0 {
-			s.logger.Debug("skipping group with no volumes", "group", name)
+		if len(group.Volumes) == 0 && len(group.Databases) == 0 {
+			s.logger.Debug("skipping group with no volumes or databases", "group", name)
 			continue
 		}
 
 		wg.Add(1)
-		go func(groupName string, g *models.VolumeGroup) {
+		go func(groupName string, g *models.VolumeGroup, m config.GroupRunMeta) {
 			defer wg.Done()
 
-			acquired, err := s.runner.TryRunGroup(ctx, groupName, g, s.cfg)
+			acquired, err := s.runner.TryRunGroup(ctx, groupName, g, s.cfg, m)
 			if err != nil {
 				s.logger.Warn("group backup error", "group", groupName, "error", err)
 				return
@@ -96,7 +93,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, state *models.BackupState)
 			if !acquired {
 				s.logger.Debug("skipping group, already running", "group", groupName)
 			}
-		}(name, group)
+		}(name, group, meta[name])
 	}
 
 	wg.Wait()
@@ -111,11 +108,12 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 		return err
 	}
 
-	if err := s.generateFunc(state); err != nil {
+	meta, err := s.generateFunc(state)
+	if err != nil {
 		return err
 	}
 
-	s.RunAllGroups(ctx, state)
+	s.RunAllGroups(ctx, state, meta)
 	return nil
 }
 
