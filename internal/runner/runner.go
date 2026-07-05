@@ -23,11 +23,11 @@ const defaultBorgmaticImage = "ghcr.io/borgmatic-collective/borgmatic:latest"
 
 // Runner creates and manages ephemeral borgmatic containers for backup groups.
 type Runner struct {
-	rt         runtime.ContainerRuntime
-	logger     *slog.Logger
-	configDir  string
-	mutexes    map[string]*sync.Mutex
-	mutexesMu  sync.Mutex
+	rt        runtime.ContainerRuntime
+	logger    *slog.Logger
+	configDir string
+	mutexes   map[string]*sync.Mutex
+	mutexesMu sync.Mutex
 }
 
 // NewRunner creates a new Runner with the given container runtime, logger,
@@ -75,7 +75,9 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, group *model
 func (r *Runner) RunGroup(ctx context.Context, groupName string, group *models.VolumeGroup, cfg *config.ManagerConfig) error {
 	image := resolveImage(cfg)
 	mounts := r.buildMounts(groupName, group)
-	networks := collectNetworks(group)
+	// Network attachment was label-driven in v1; the label is deprecated and
+	// this runner is replaced by host execution in the v2 pivot.
+	var networks []string
 
 	containerCfg := runtime.ContainerConfig{
 		Image:      image,
@@ -199,30 +201,12 @@ func (r *Runner) buildMounts(groupName string, group *models.VolumeGroup) []moun
 		mounts = append(mounts, mount.Mount{
 			Type:     mount.TypeVolume,
 			Source:   vol.Name,
-			Target:   vol.MountPath,
+			Target:   vol.HostPath,
 			ReadOnly: true,
 		})
 	}
 
 	return mounts
-}
-
-// collectNetworks returns unique network names from the group's databases.
-func collectNetworks(group *models.VolumeGroup) []string {
-	seen := make(map[string]struct{})
-	var networks []string
-
-	for _, db := range group.Databases {
-		if db.Network == "" {
-			continue
-		}
-		if _, exists := seen[db.Network]; !exists {
-			seen[db.Network] = struct{}{}
-			networks = append(networks, db.Network)
-		}
-	}
-
-	return networks
 }
 
 // slogWriter implements io.Writer, emitting each complete line as a structured

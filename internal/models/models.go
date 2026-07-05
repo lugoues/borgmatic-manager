@@ -39,13 +39,11 @@ type VolumeGroup struct {
 	Databases []DatabaseConfig
 }
 
-// VolumeInfo describes a Docker volume to be backed up.
+// VolumeInfo describes a container volume to be backed up.
 type VolumeInfo struct {
-	// Name is the Docker volume name.
 	Name string
-	// MountPath is the path where the volume is mounted inside the backup container.
-	// This field is computed at a later stage (Phase 2/3) and may be empty initially.
-	MountPath string
+	// HostPath is the runtime-reported mountpoint on the host.
+	HostPath string
 }
 
 // DatabaseConfig describes a database backed up via borgmatic's database hooks.
@@ -53,16 +51,20 @@ type DatabaseConfig struct {
 	// Type is the database engine: postgresql, mysql, mariadb, or sqlite.
 	Type string
 	Name string
-	// Username is the database user for authentication.
+	// Username is the database user for authentication (required except sqlite).
 	Username string
 	// Password is the database password (optional).
 	Password string
-	// Hostname is the database server hostname (optional).
+	// Hostname, when set, overrides container-based connection resolution.
 	Hostname string
-	// Port is the database server port. A value of 0 means use the default port.
+	// Port; 0 means the default (container-internal in container mode).
 	Port int
-	// Network is the Docker network used to reach the database (optional).
-	Network string
+	// Container is the labeled source container; set by discovery, not labels.
+	Container string
+	// Volume is the named volume holding a SQLite database file (sqlite only).
+	Volume string
+	// Path inside Volume; discovery resolves it to an absolute host path.
+	Path string
 	// Options contains additional database-specific options (optional).
 	Options string
 }

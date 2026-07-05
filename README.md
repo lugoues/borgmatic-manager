@@ -1,5 +1,11 @@
 # borgmatic-manager
 
+> **⚠️ v2 pivot in progress.** This branch is mid-rewrite from container-based
+> execution to a host systemd service (see
+> [.planning/v2-host-pivot-SPEC.md](.planning/v2-host-pivot-SPEC.md)).
+> The deployment instructions below describe the old v1 model and will not
+> work until the pivot completes; this README is rewritten in the final phase.
+
 Automated backup orchestration for Docker and Podman. Discovers labeled containers and volumes, generates [borgmatic](https://torsion.org/borgmatic/) configurations, and runs periodic backups — all without manual config files.
 
 ## How It Works

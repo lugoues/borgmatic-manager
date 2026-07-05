@@ -93,7 +93,7 @@ func TestGetGroup(t *testing.T) {
 
 func TestParseDatabaseLabels(t *testing.T) {
 	tests := []struct {
-		name string
+		name   string
 		labels map[string]string
 		want   []models.DatabaseConfig
 	}{
@@ -116,7 +116,6 @@ func TestParseDatabaseLabels(t *testing.T) {
 				"borgmatic-manager.db.0.password": "secret",
 				"borgmatic-manager.db.0.hostname": "db.local",
 				"borgmatic-manager.db.0.port":     "5432",
-				"borgmatic-manager.db.0.network":  "backend",
 				"borgmatic-manager.db.0.options":  "--no-owner",
 			},
 			want: []models.DatabaseConfig{
@@ -127,9 +126,20 @@ func TestParseDatabaseLabels(t *testing.T) {
 					Password: "secret",
 					Hostname: "db.local",
 					Port:     5432,
-					Network:  "backend",
 					Options:  "--no-owner",
 				},
+			},
+		},
+		{
+			name: "deprecated network label is ignored",
+			labels: map[string]string{
+				"borgmatic-manager.db.0.type":     "postgresql",
+				"borgmatic-manager.db.0.name":     "appdb",
+				"borgmatic-manager.db.0.username": "admin",
+				"borgmatic-manager.db.0.network":  "backend",
+			},
+			want: []models.DatabaseConfig{
+				{Type: "postgresql", Name: "appdb", Username: "admin"},
 			},
 		},
 		{
@@ -224,20 +234,64 @@ func TestParseDatabaseLabels(t *testing.T) {
 			name: "non-borgmatic labels are ignored",
 			labels: map[string]string{
 				"com.example.label":               "value",
-				"borgmatic-manager.db.0.type":     "sqlite",
-				"borgmatic-manager.db.0.name":     "app.db",
+				"borgmatic-manager.db.0.type":     "mysql",
+				"borgmatic-manager.db.0.name":     "mydb",
 				"borgmatic-manager.db.0.username": "user",
 			},
 			want: []models.DatabaseConfig{
-				{Type: "sqlite", Name: "app.db", Username: "user"},
+				{Type: "mysql", Name: "mydb", Username: "user"},
+			},
+		},
+		{
+			name: "sqlite with volume and path",
+			labels: map[string]string{
+				"borgmatic-manager.db.0.type":   "sqlite",
+				"borgmatic-manager.db.0.name":   "app",
+				"borgmatic-manager.db.0.volume": "app-data",
+				"borgmatic-manager.db.0.path":   "db/app.sqlite3",
+			},
+			want: []models.DatabaseConfig{
+				{Type: "sqlite", Name: "app", Volume: "app-data", Path: "db/app.sqlite3"},
+			},
+		},
+		{
+			name: "sqlite missing volume skips entry",
+			labels: map[string]string{
+				"borgmatic-manager.db.0.type": "sqlite",
+				"borgmatic-manager.db.0.name": "app",
+				"borgmatic-manager.db.0.path": "app.sqlite3",
+			},
+			want: nil,
+		},
+		{
+			name: "sqlite missing path skips entry",
+			labels: map[string]string{
+				"borgmatic-manager.db.0.type":   "sqlite",
+				"borgmatic-manager.db.0.name":   "app",
+				"borgmatic-manager.db.0.volume": "app-data",
+			},
+			want: nil,
+		},
+		{
+			name: "sqlite does not require username and clears credentials",
+			labels: map[string]string{
+				"borgmatic-manager.db.0.type":     "sqlite",
+				"borgmatic-manager.db.0.name":     "app",
+				"borgmatic-manager.db.0.volume":   "app-data",
+				"borgmatic-manager.db.0.path":     "app.sqlite3",
+				"borgmatic-manager.db.0.username": "ignored",
+				"borgmatic-manager.db.0.hostname": "ignored.local",
+			},
+			want: []models.DatabaseConfig{
+				{Type: "sqlite", Name: "app", Volume: "app-data", Path: "app.sqlite3"},
 			},
 		},
 		{
 			name: "unknown borgmatic db fields are ignored silently",
 			labels: map[string]string{
-				"borgmatic-manager.db.0.type":     "mariadb",
-				"borgmatic-manager.db.0.name":     "db",
-				"borgmatic-manager.db.0.username": "user",
+				"borgmatic-manager.db.0.type":        "mariadb",
+				"borgmatic-manager.db.0.name":        "db",
+				"borgmatic-manager.db.0.username":    "user",
 				"borgmatic-manager.db.0.futureField": "value",
 			},
 			want: []models.DatabaseConfig{
@@ -249,6 +303,14 @@ func TestParseDatabaseLabels(t *testing.T) {
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type": "postgresql",
 				"borgmatic-manager.db.0.name": "db",
+			},
+			want: nil,
+		},
+		{
+			name: "unknown type is rejected before other required-field checks",
+			labels: map[string]string{
+				"borgmatic-manager.db.0.type": "redis",
+				"borgmatic-manager.db.0.name": "cache",
 			},
 			want: nil,
 		},

@@ -70,9 +70,9 @@ func TestRunAllGroups_Parallel(t *testing.T) {
 	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
 
 	state := models.NewBackupState()
-	state.AddVolume("group-a", models.VolumeInfo{Name: "vol1", MountPath: "/mnt/vol1"})
-	state.AddVolume("group-b", models.VolumeInfo{Name: "vol2", MountPath: "/mnt/vol2"})
-	state.AddVolume("group-c", models.VolumeInfo{Name: "vol3", MountPath: "/mnt/vol3"})
+	state.AddVolume("group-a", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
+	state.AddVolume("group-b", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
+	state.AddVolume("group-c", models.VolumeInfo{Name: "vol3", HostPath: "/mnt/vol3"})
 
 	s.RunAllGroups(context.Background(), state)
 
@@ -98,7 +98,7 @@ func TestRunAllGroups_SkipEmptyGroups(t *testing.T) {
 	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
 
 	state := models.NewBackupState()
-	state.AddVolume("has-volumes", models.VolumeInfo{Name: "vol1", MountPath: "/mnt/vol1"})
+	state.AddVolume("has-volumes", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 	// "empty-group" has no volumes (only databases or nothing)
 	state.Groups["empty-group"] = &models.VolumeGroup{}
 
@@ -125,8 +125,8 @@ func TestRunAllGroups_MutexSkip(t *testing.T) {
 	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
 
 	state := models.NewBackupState()
-	state.AddVolume("busy-group", models.VolumeInfo{Name: "vol1", MountPath: "/mnt/vol1"})
-	state.AddVolume("free-group", models.VolumeInfo{Name: "vol2", MountPath: "/mnt/vol2"})
+	state.AddVolume("busy-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
+	state.AddVolume("free-group", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 
 	s.RunAllGroups(context.Background(), state)
 
@@ -150,8 +150,8 @@ func TestRunAllGroups_ErrorContinues(t *testing.T) {
 	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
 
 	state := models.NewBackupState()
-	state.AddVolume("error-group", models.VolumeInfo{Name: "vol1", MountPath: "/mnt/vol1"})
-	state.AddVolume("ok-group", models.VolumeInfo{Name: "vol2", MountPath: "/mnt/vol2"})
+	state.AddVolume("error-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
+	state.AddVolume("ok-group", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 
 	// Should not panic or abort; both groups should be attempted.
 	s.RunAllGroups(context.Background(), state)
@@ -170,7 +170,7 @@ func TestRunCycle_DiscoverAndGenerate(t *testing.T) {
 	logger := slog.Default()
 
 	state := models.NewBackupState()
-	state.AddVolume("test-group", models.VolumeInfo{Name: "vol1", MountPath: "/mnt/vol1"})
+	state.AddVolume("test-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 
 	discoverCalled := false
 	generateCalled := false
@@ -228,7 +228,7 @@ func TestStart_ContextCancellation(t *testing.T) {
 	logger := slog.Default()
 
 	state := models.NewBackupState()
-	state.AddVolume("test-group", models.VolumeInfo{Name: "vol1", MountPath: "/mnt/vol1"})
+	state.AddVolume("test-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 
 	s := NewScheduler(runner, nil, logger, cfg, nil, "/tmp/test")
 

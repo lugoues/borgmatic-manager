@@ -75,15 +75,15 @@ func GenerateConfigs(state *models.BackupState, cfg *ManagerConfig, groupOverrid
 // the group's volumes and databases.
 func buildDiscoveredData(groupName string, group *models.VolumeGroup) map[string]interface{} {
 	data := map[string]interface{}{
-		"working_directory":  "/mnt/sources",
+		"working_directory":   "/mnt/sources",
 		"archive_name_format": fmt.Sprintf("{hostname}-%s-{now:%%Y-%%m-%%d_%%H:%%M}", groupName),
 	}
 
-	// Source directories from volume mount paths.
+	// Source directories from volume host paths.
 	if len(group.Volumes) > 0 {
 		dirs := make([]interface{}, 0, len(group.Volumes))
 		for _, vol := range group.Volumes {
-			dirs = append(dirs, vol.MountPath)
+			dirs = append(dirs, vol.HostPath)
 		}
 		data["source_directories"] = dirs
 	}

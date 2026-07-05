@@ -45,15 +45,23 @@ type ContainerRuntime interface {
 
 // VolumeInfo describes a container volume discovered by the runtime.
 type VolumeInfo struct {
-	Name   string
-	Labels map[string]string
+	Name string
+	// Mountpoint is the host data path (e.g. /var/lib/docker/volumes/<name>/_data).
+	Mountpoint string
+	// Driver is the volume driver ("local" for plain directories).
+	Driver string
+	// Options are driver creation options; non-empty on local implies lazy mounting (NFS/CIFS).
+	Options map[string]string
+	Labels  map[string]string
 }
 
 // ContainerInfo describes a container discovered by the runtime.
 type ContainerInfo struct {
-	ID     string
-	Name   string
-	Labels map[string]string
+	ID   string
+	Name string
+	// NetworkMode is the container's network mode (e.g. "bridge", "host").
+	NetworkMode string
+	Labels      map[string]string
 }
 
 // Event represents a container runtime event (e.g., container start/stop).

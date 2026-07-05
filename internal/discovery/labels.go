@@ -1,5 +1,3 @@
-// Package discovery implements Docker container label parsing for
-// borgmatic-manager's label-driven backup configuration.
 package discovery
 
 import (
@@ -26,7 +24,7 @@ var validDBTypes = map[string]bool{
 	"sqlite":     true,
 }
 
-// IsBackupEnabled checks whether the container has opted into backup
+// IsBackupEnabled checks whether the volume has opted into backup
 // via the borgmatic-manager.backup=true label.
 func IsBackupEnabled(labels map[string]string) bool {
 	return labels[labelBackup] == "true"
@@ -37,10 +35,23 @@ func GetGroup(labels map[string]string) string {
 	return labels[labelGroup]
 }
 
+// HasManagerLabels reports whether any borgmatic-manager.* label is present;
+// used to warn on near-miss configurations instead of staying silent.
+func HasManagerLabels(labels map[string]string) bool {
+	for key := range labels {
+		if strings.HasPrefix(key, labelPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseDatabaseLabels extracts indexed borgmatic-manager.db.{n}.* labels
 // into a sorted slice of DatabaseConfig structs. Entries missing required
-// fields (type, name, username) or having an unknown type are warned about
-// and skipped. Non-integer indices are warned about and the label is skipped.
+// fields or having an unknown type are warned about and skipped. Required
+// fields are per-type: postgresql/mysql/mariadb need type, name, and
+// username; sqlite needs type, name, volume, and path (and takes no
+// credentials or address, sqlite has no authentication).
 func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models.DatabaseConfig {
 	if len(labels) == 0 {
 		return nil
@@ -95,16 +106,21 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 			logger.Warn(fmt.Sprintf("db.%d missing required field 'type', skipping", idx))
 			continue
 		}
+		if !validDBTypes[cfg.Type] {
+			logger.Warn(fmt.Sprintf("db.%d has unknown type %q, skipping", idx, cfg.Type))
+			continue
+		}
 		if cfg.Name == "" {
 			logger.Warn(fmt.Sprintf("db.%d missing required field 'name', skipping", idx))
 			continue
 		}
-		if cfg.Username == "" {
+
+		if cfg.Type == "sqlite" {
+			if !validateSQLite(cfg, idx, logger) {
+				continue
+			}
+		} else if cfg.Username == "" {
 			logger.Warn(fmt.Sprintf("db.%d missing required field 'username', skipping", idx))
-			continue
-		}
-		if !validDBTypes[cfg.Type] {
-			logger.Warn(fmt.Sprintf("db.%d has unknown type %q, skipping", idx, cfg.Type))
 			continue
 		}
 
@@ -116,6 +132,27 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 	}
 
 	return result
+}
+
+// validateSQLite requires volume and path; credentials and addresses are
+// meaningless for sqlite and cleared with a warning.
+func validateSQLite(cfg *models.DatabaseConfig, idx int, logger *slog.Logger) bool {
+	if cfg.Volume == "" {
+		logger.Warn(fmt.Sprintf("db.%d (sqlite) missing required field 'volume', skipping", idx))
+		return false
+	}
+	if cfg.Path == "" {
+		logger.Warn(fmt.Sprintf("db.%d (sqlite) missing required field 'path', skipping", idx))
+		return false
+	}
+	if cfg.Username != "" || cfg.Password != "" || cfg.Hostname != "" || cfg.Port != 0 {
+		logger.Warn(fmt.Sprintf("db.%d (sqlite) ignoring username/password/hostname/port: sqlite has no authentication", idx))
+		cfg.Username = ""
+		cfg.Password = ""
+		cfg.Hostname = ""
+		cfg.Port = 0
+	}
+	return true
 }
 
 // setDBField maps a field name to the corresponding DatabaseConfig struct field.
@@ -139,10 +176,15 @@ func setDBField(cfg *models.DatabaseConfig, field, value string, logger *slog.Lo
 			return
 		}
 		cfg.Port = port
-	case "network":
-		cfg.Network = value
+	case "volume":
+		cfg.Volume = value
+	case "path":
+		cfg.Path = value
 	case "options":
 		cfg.Options = value
+	case "network":
+		// v1 label; host-run borgmatic connects via container IP or 'hostname' instead.
+		logger.Warn("the 'network' db label is deprecated and ignored: host-run borgmatic connects via the container's IP (default) or the 'hostname' label")
 	default:
 		// Unknown fields ignored silently (forward-compatible).
 	}

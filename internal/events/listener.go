@@ -80,11 +80,21 @@ func (l *Listener) reconnectLoop(ctx context.Context, triggerCh chan struct{}) {
 func (l *Listener) processStream(ctx context.Context, eventCh <-chan runtime.Event, errCh <-chan error, triggerCh chan struct{}) {
 	var debounceTimer *time.Timer
 
-	defer func() {
-		if debounceTimer != nil {
-			debounceTimer.Stop()
+	// On stream disconnect a pending debounce must fire rather than be
+	// dropped, or an observed event is silently lost across the reconnect.
+	// On shutdown (ctx cancelled) it is simply stopped.
+	fireOrStopPending := func() {
+		if debounceTimer == nil {
+			return
 		}
-	}()
+		if debounceTimer.Stop() && ctx.Err() == nil {
+			select {
+			case triggerCh <- struct{}{}:
+			default:
+			}
+		}
+	}
+	defer fireOrStopPending()
 
 	for {
 		select {

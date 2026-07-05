@@ -40,10 +40,10 @@ func newTestConfig() *config.ManagerConfig {
 func newTestGroup() *models.VolumeGroup {
 	return &models.VolumeGroup{
 		Volumes: []models.VolumeInfo{
-			{Name: "app-data", MountPath: "/mnt/source/app-data"},
+			{Name: "app-data", HostPath: "/mnt/source/app-data"},
 		},
 		Databases: []models.DatabaseConfig{
-			{Type: "postgresql", Name: "appdb", Network: "db_net"},
+			{Type: "postgresql", Name: "appdb"},
 		},
 	}
 }
@@ -97,40 +97,6 @@ func TestRunGroup_Mounts(t *testing.T) {
 
 	err := r.RunGroup(context.Background(), "mygroup", group, cfg)
 	assert.NoError(t, err)
-	m.AssertExpectations(t)
-}
-
-func TestRunGroup_Networks(t *testing.T) {
-	m := &runtime.MockRuntime{}
-	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	r := NewRunner(m, logger, "/etc/borgmatic/generated")
-
-	group := &models.VolumeGroup{
-		Volumes: []models.VolumeInfo{
-			{Name: "data", MountPath: "/mnt/source/data"},
-		},
-		Databases: []models.DatabaseConfig{
-			{Type: "postgresql", Name: "db1", Network: "net-a"},
-			{Type: "mysql", Name: "db2", Network: "net-b"},
-		},
-	}
-	cfg := newTestConfig()
-
-	logData := stdcopyFrame(1, "ok\n")
-
-	// The first network goes to CreateContainer, the second should trigger ContainerNetworkConnect
-	m.On("CreateContainer", mock.Anything, mock.MatchedBy(func(c runtime.ContainerConfig) bool {
-		return len(c.Networks) == 2
-	})).Return("ctr-123", nil)
-	m.On("ContainerNetworkConnect", mock.Anything, "net-b", "ctr-123").Return(nil)
-	m.On("StartContainer", mock.Anything, "ctr-123").Return(nil)
-	m.On("ContainerLogs", mock.Anything, "ctr-123").Return(io.NopCloser(bytes.NewReader(logData)), nil)
-	m.On("WaitContainer", mock.Anything, "ctr-123").Return(int64(0), nil)
-	m.On("RemoveContainer", mock.Anything, "ctr-123").Return(nil)
-
-	err := r.RunGroup(context.Background(), "mygroup", group, cfg)
-	assert.NoError(t, err)
-	m.AssertCalled(t, "ContainerNetworkConnect", mock.Anything, "net-b", "ctr-123")
 	m.AssertExpectations(t)
 }
 
@@ -349,41 +315,6 @@ func TestSlogWriter_MultipleLines(t *testing.T) {
 	assert.Contains(t, output, "line1")
 	assert.Contains(t, output, "line2")
 	assert.Contains(t, output, "line3")
-}
-
-func TestRunGroup_DuplicateNetworks(t *testing.T) {
-	// When multiple DBs share the same network, it should be deduplicated
-	m := &runtime.MockRuntime{}
-	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	r := NewRunner(m, logger, "/etc/borgmatic/generated")
-
-	group := &models.VolumeGroup{
-		Volumes: []models.VolumeInfo{
-			{Name: "data", MountPath: "/mnt/source/data"},
-		},
-		Databases: []models.DatabaseConfig{
-			{Type: "postgresql", Name: "db1", Network: "shared-net"},
-			{Type: "mysql", Name: "db2", Network: "shared-net"},
-		},
-	}
-	cfg := newTestConfig()
-
-	logData := stdcopyFrame(1, "ok\n")
-
-	m.On("CreateContainer", mock.Anything, mock.MatchedBy(func(c runtime.ContainerConfig) bool {
-		// Should only have 1 unique network
-		return len(c.Networks) == 1 && c.Networks[0] == "shared-net"
-	})).Return("ctr-123", nil)
-	m.On("StartContainer", mock.Anything, "ctr-123").Return(nil)
-	m.On("ContainerLogs", mock.Anything, "ctr-123").Return(io.NopCloser(bytes.NewReader(logData)), nil)
-	m.On("WaitContainer", mock.Anything, "ctr-123").Return(int64(0), nil)
-	m.On("RemoveContainer", mock.Anything, "ctr-123").Return(nil)
-
-	err := r.RunGroup(context.Background(), "mygroup", group, cfg)
-	assert.NoError(t, err)
-	// ContainerNetworkConnect should NOT be called since only 1 unique network
-	m.AssertNotCalled(t, "ContainerNetworkConnect", mock.Anything, mock.Anything, mock.Anything)
-	m.AssertExpectations(t)
 }
 
 // Verify getMutex is exported for testing (via lowercase but same package)

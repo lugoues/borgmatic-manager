@@ -44,13 +44,10 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 	return &DockerRuntime{client: cli}, nil
 }
 
-// ListVolumes returns volumes labeled with borgmatic-manager.backup=true.
+// ListVolumes returns all volumes. Filtering is client-side so near-miss labels
+// warn and unlabeled volumes stay referenceable (sqlite).
 func (d *DockerRuntime) ListVolumes(ctx context.Context) ([]VolumeInfo, error) {
-	resp, err := d.client.VolumeList(ctx, volume.ListOptions{
-		Filters: filters.NewArgs(
-			filters.Arg("label", "borgmatic-manager.backup=true"),
-		),
-	})
+	resp, err := d.client.VolumeList(ctx, volume.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing volumes: %w", err)
 	}
@@ -62,20 +59,21 @@ func (d *DockerRuntime) ListVolumes(ctx context.Context) ([]VolumeInfo, error) {
 	vols := make([]VolumeInfo, 0, len(resp.Volumes))
 	for _, v := range resp.Volumes {
 		vols = append(vols, VolumeInfo{
-			Name:   v.Name,
-			Labels: v.Labels,
+			Name:       v.Name,
+			Mountpoint: v.Mountpoint,
+			Driver:     v.Driver,
+			Options:    v.Options,
+			Labels:     v.Labels,
 		})
 	}
 	return vols, nil
 }
 
-// ListContainers returns containers labeled with borgmatic-manager.group.
+// ListContainers returns all containers. Label filtering happens client-side
+// in discovery so near-miss labels can be warned about.
 func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, error) {
 	containers, err := d.client.ContainerList(ctx, container.ListOptions{
 		All: true,
-		Filters: filters.NewArgs(
-			filters.Arg("label", "borgmatic-manager.group"),
-		),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("listing containers: %w", err)
@@ -92,17 +90,31 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 			name = strings.TrimPrefix(c.Names[0], "/")
 		}
 		infos = append(infos, ContainerInfo{
-			ID:     c.ID,
-			Name:   name,
-			Labels: c.Labels,
+			ID:          c.ID,
+			Name:        name,
+			NetworkMode: string(c.HostConfig.NetworkMode),
+			Labels:      c.Labels,
 		})
 	}
 	return infos, nil
 }
 
-// EventStream returns channels for container runtime events filtered to
-// container/volume create/remove actions. The returned channels close when
-// the context is cancelled or the underlying Docker event stream ends.
+// relevantActions trigger re-discovery. Docker emits "destroy", podman "remove";
+// matched client-side because server-side action filters are not portable.
+var relevantActions = map[string]bool{
+	"create":  true,
+	"destroy": true,
+	"remove":  true,
+}
+
+// EventStream returns channels for container runtime events, filtered to
+// container/volume create and removal actions. The event channel closes when
+// the context is cancelled or the underlying stream ends; the error channel
+// receives at most one error.
+//
+// The Docker SDK never closes its message channel, so the forwarding goroutine
+// holds a per-connection child context and cancels it on every exit path,
+// releasing the SDK's producer goroutine and preventing a leak per reconnect.
 // EventStream cancels a child context on every exit path: the Docker SDK never
 // closes its Events channel, so the SDK goroutine would otherwise leak per reconnect.
 func (d *DockerRuntime) EventStream(ctx context.Context) (<-chan Event, <-chan error) {
@@ -110,34 +122,44 @@ func (d *DockerRuntime) EventStream(ctx context.Context) (<-chan Event, <-chan e
 		Filters: filters.NewArgs(
 			filters.Arg("type", string(events.ContainerEventType)),
 			filters.Arg("type", string(events.VolumeEventType)),
-			filters.Arg("event", string(events.ActionCreate)),
-			filters.Arg("event", string(events.ActionRemove)),
 		),
 	}
 
-	dockerMsgCh, dockerErrCh := d.client.Events(ctx, opts)
+	streamCtx, cancel := context.WithCancel(ctx)
+	dockerMsgCh, dockerErrCh := d.client.Events(streamCtx, opts)
 
 	eventCh := make(chan Event)
 	errCh := make(chan error, 1)
 
-	// Forward Docker SDK messages as runtime Events.
 	go func() {
+		defer cancel()
 		defer close(eventCh)
-		for msg := range dockerMsgCh {
-			eventCh <- Event{
-				Type:   string(msg.Type),
-				Action: string(msg.Action),
-				Actor:  msg.Actor.ID,
-			}
-		}
-	}()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
 
-	// Forward errors from the Docker SDK.
-	go func() {
-		defer close(errCh)
-		for err := range dockerErrCh {
-			errCh <- err
-			return // only forward the first error
+			case err, ok := <-dockerErrCh:
+				if ok {
+					errCh <- err // buffered(1); at most one error arrives
+				}
+				return
+
+			case msg := <-dockerMsgCh:
+				if !relevantActions[string(msg.Action)] {
+					continue
+				}
+				evt := Event{
+					Type:   string(msg.Type),
+					Action: string(msg.Action),
+					Actor:  msg.Actor.ID,
+				}
+				select {
+				case eventCh <- evt:
+				case <-streamCtx.Done():
+					return
+				}
+			}
 		}
 	}()
 

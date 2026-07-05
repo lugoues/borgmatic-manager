@@ -15,8 +15,8 @@ import (
 
 func TestGenerateConfigsBasic(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddVolume("web", models.VolumeInfo{Name: "web_data", MountPath: "/mnt/web_data"})
-	state.AddVolume("web", models.VolumeInfo{Name: "web_assets", MountPath: "/mnt/web_assets"})
+	state.AddVolume("web", models.VolumeInfo{Name: "web_data", HostPath: "/mnt/web_data"})
+	state.AddVolume("web", models.VolumeInfo{Name: "web_assets", HostPath: "/mnt/web_assets"})
 
 	cfg := &config.ManagerConfig{
 		Borgmatic: map[string]interface{}{},
@@ -43,7 +43,7 @@ func TestGenerateConfigsBasic(t *testing.T) {
 
 func TestGenerateConfigsArchiveNameFormat(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddVolume("myapp", models.VolumeInfo{Name: "app_vol", MountPath: "/mnt/app"})
+	state.AddVolume("myapp", models.VolumeInfo{Name: "app_vol", HostPath: "/mnt/app"})
 
 	cfg := &config.ManagerConfig{
 		Borgmatic: map[string]interface{}{},
@@ -101,7 +101,7 @@ func TestGenerateConfigsDatabaseHooks(t *testing.T) {
 
 func TestGenerateConfigsDeepMerge(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddVolume("app", models.VolumeInfo{Name: "data", MountPath: "/mnt/data"})
+	state.AddVolume("app", models.VolumeInfo{Name: "data", HostPath: "/mnt/data"})
 
 	cfg := &config.ManagerConfig{
 		Borgmatic: map[string]interface{}{
@@ -140,7 +140,7 @@ func TestGenerateConfigsDeepMerge(t *testing.T) {
 
 func TestGenerateConfigsHeader(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddVolume("test", models.VolumeInfo{Name: "vol", MountPath: "/mnt/vol"})
+	state.AddVolume("test", models.VolumeInfo{Name: "vol", HostPath: "/mnt/vol"})
 
 	cfg := &config.ManagerConfig{
 		Borgmatic: map[string]interface{}{},
@@ -160,8 +160,8 @@ func TestGenerateConfigsHeader(t *testing.T) {
 
 func TestGenerateConfigsMultipleGroups(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddVolume("alpha", models.VolumeInfo{Name: "a_vol", MountPath: "/mnt/a"})
-	state.AddVolume("beta", models.VolumeInfo{Name: "b_vol", MountPath: "/mnt/b"})
+	state.AddVolume("alpha", models.VolumeInfo{Name: "a_vol", HostPath: "/mnt/a"})
+	state.AddVolume("beta", models.VolumeInfo{Name: "b_vol", HostPath: "/mnt/b"})
 
 	cfg := &config.ManagerConfig{
 		Borgmatic: map[string]interface{}{},
@@ -180,7 +180,7 @@ func TestGenerateConfigsMultipleGroups(t *testing.T) {
 
 func TestGenerateConfigsOmitempty(t *testing.T) {
 	state := models.NewBackupState()
-	state.AddVolume("minimal", models.VolumeInfo{Name: "vol", MountPath: "/mnt/vol"})
+	state.AddVolume("minimal", models.VolumeInfo{Name: "vol", HostPath: "/mnt/vol"})
 
 	cfg := &config.ManagerConfig{
 		Borgmatic: map[string]interface{}{},

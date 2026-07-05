@@ -191,3 +191,34 @@ func TestListener_ErrorReconnect(t *testing.T) {
 
 	m.AssertExpectations(t)
 }
+
+func TestListener_PendingDebounceFiresOnDisconnect(t *testing.T) {
+	m := &runtime.MockRuntime{}
+	eventCh, _ := setupMockStream(m)
+	// The reconnect loop will ask for a second stream after the disconnect;
+	// give it one that stays silent.
+	m.On("EventStream", mock.Anything).Return(
+		(<-chan runtime.Event)(make(chan runtime.Event)),
+		(<-chan error)(make(chan error)),
+	).Maybe()
+
+	logger := slog.Default()
+	// Long debounce: the disconnect arrives while the timer is still pending.
+	l := NewListenerWithDebounce(m, logger, 10*time.Second)
+	l.backoffDuration = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	triggerCh := l.Listen(ctx)
+
+	// Event observed, then the stream dies before the debounce fires.
+	eventCh <- runtime.Event{Type: "volume", Action: "destroy", Actor: "vol1"}
+	close(eventCh)
+
+	select {
+	case _, ok := <-triggerCh:
+		assert.True(t, ok, "pending debounce must fire on disconnect, not be dropped")
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected trigger on disconnect with pending debounce, got timeout")
+	}
+}
