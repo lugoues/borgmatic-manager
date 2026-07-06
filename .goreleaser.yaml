@@ -35,6 +35,8 @@ nfpms:
     # required 2.1.0 floor. The README install matrix covers uv/pipx.
     recommends:
       - borgbackup
+    section: admin
+    priority: optional
     contents:
       - src: deploy/systemd/borgmatic-manager.service
         dst: /usr/lib/systemd/system/borgmatic-manager.service
@@ -43,8 +45,14 @@ nfpms:
       - src: config/manager.yaml
         dst: /etc/borgmatic-manager/manager.yaml
         type: config|noreplace
+      - src: LICENSE
+        dst: /usr/share/doc/borgmatic-manager/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/borgmatic-manager/README.md
     scripts:
       postinstall: deploy/packaging/postinstall.sh
+      preremove: deploy/packaging/preremove.sh
+      postremove: deploy/packaging/postremove.sh
 
 checksum:
   name_template: checksums.txt

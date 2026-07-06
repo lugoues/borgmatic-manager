@@ -51,7 +51,12 @@ reimplements.
 **1. Install** (binary + unit from a [release](https://github.com/lugoues/borgmatic-manager/releases), or from source):
 
 ```bash
+# From a release: grab the .deb/.rpm and install it
+sudo apt install ./borgmatic-manager_*_linux_amd64.deb
+
+# Or from source
 mise run install      # builds and installs binary, unit, default config (sudo inside)
+
 sudo uv tool install borgmatic   # if you don't have borgmatic >= 2.1
 ```
 

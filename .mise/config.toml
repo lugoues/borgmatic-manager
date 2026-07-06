@@ -1,6 +1,7 @@
 [tools]
 go = "1.25"
 "aqua:golangci/golangci-lint" = "latest"
+"aqua:goreleaser/goreleaser" = "latest"
 
 [tasks.build]
 description = "Build bin/borgmatic-manager (static, version-stamped)"
@@ -65,6 +66,10 @@ description = "Remove installed binary and unit (config is kept)"
 run = '''
 sudo rm -f /usr/local/bin/borgmatic-manager /etc/systemd/system/borgmatic-manager.service
 '''
+
+[tasks.package]
+description = "Build snapshot release artifacts (tarballs, deb, rpm) into dist/"
+run = "goreleaser release --snapshot --clean --skip=sign"
 
 [tasks.clean]
 description = "Remove build artifacts"
