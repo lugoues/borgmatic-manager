@@ -75,3 +75,5 @@ jobs:
         with:
           # Signing needs an OIDC token; only real releases sign.
           args: release --snapshot --clean --skip=sign
+      - name: verify the built deb (install/upgrade/remove on current distros)
+        run: bash tests/packaging/verify-deb.sh

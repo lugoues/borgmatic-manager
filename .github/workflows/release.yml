@@ -19,6 +19,8 @@ jobs:
           fetch-depth: 0
       - uses: jdx/mise-action@v2
       - uses: sigstore/cosign-installer@v3
+      - name: verify packages before publishing (snapshot build + deb install/remove cycle)
+        run: mise run package-verify
       - uses: goreleaser/goreleaser-action@v6
         with:
           args: release --clean
