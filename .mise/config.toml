@@ -71,6 +71,11 @@ sudo rm -f /usr/local/bin/borgmatic-manager /etc/systemd/system/borgmatic-manage
 description = "Build snapshot release artifacts (tarballs, deb, rpm) into dist/"
 run = "goreleaser release --snapshot --clean --skip=sign"
 
+[tasks.package-verify]
+description = "Verify the built deb installs/upgrades/removes cleanly on current distros"
+depends = ["package"]
+run = "bash tests/packaging/verify-deb.sh"
+
 [tasks.clean]
 description = "Remove build artifacts"
 run = "rm -rf bin dist"
