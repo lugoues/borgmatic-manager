@@ -49,6 +49,18 @@ LOG_FILE="$WORK/manager.log"
 MANAGER_PID=""
 
 compose() { docker compose -f "$HERE/compose.yaml" "$@"; }
+
+# stack_up ARGS...: compose up gated by healthchecks; on failure, dump every
+# container's state and logs so CI/DinD failures are diagnosable from output.
+stack_up() {
+  if ! compose "$@" up -d --wait; then
+    echo "=== stack state ===" >&2
+    compose "$@" ps -a >&2 || true
+    echo "=== stack logs ===" >&2
+    compose "$@" logs --no-color --timestamps >&2 || true
+    fail "stack failed to become healthy"
+  fi
+}
 manager() { "$WORK/borgmatic-manager" "$@"; }
 
 cleanup() {
@@ -105,7 +117,7 @@ else
 fi
 
 log "stack up (healthcheck-gated)"
-compose up -d --wait
+stack_up
 
 # --- phase 1: manager up, guided bootstrap ---------------------------------
 
@@ -130,7 +142,7 @@ manager borgmatic files repo-create --encryption none
 # --- phase 2: event-driven cycle, content validation ------------------------
 
 log "starting app-b (spec label; its create event must trigger a cycle)"
-compose --profile late up -d --wait app-b
+stack_up --profile late
 
 log "waiting for a 'files' archive containing both volumes"
 FILES_ARCHIVE=$(wait_for_archive files "file-b.txt" 120)
