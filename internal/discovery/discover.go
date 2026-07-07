@@ -20,6 +20,7 @@ import (
 var (
 	isMountPoint = defaultIsMountPoint
 	canReadDir   = defaultCanReadDir
+	dirIsEmpty   = defaultDirIsEmpty
 )
 
 // Discover queries the runtime and builds a BackupState from container labels.
@@ -224,8 +225,11 @@ func shouldSkipVolume(v runtime.VolumeInfo) (bool, string) {
 	if v.Driver != "local" {
 		return true, fmt.Sprintf("driver %q has no readable host path; only the local driver is supported", v.Driver)
 	}
-	if len(v.Options) > 0 && !isMountPoint(v.Mountpoint) {
-		return true, "volume has mount options but is not currently mounted; its data directory is empty until a container uses it"
+	// Lazily-mounted volumes (NFS/CIFS via the local driver) have an empty
+	// Lazily-mounted volumes (NFS/CIFS) are empty dirs while unused; options alone
+	// don't prove lazy mounting (podman), so the empty unmounted dir is the signal.
+	if len(v.Options) > 0 && !isMountPoint(v.Mountpoint) && dirIsEmpty(v.Mountpoint) {
+		return true, fmt.Sprintf("volume has mount options (%v), is not currently mounted, and its data directory is empty", v.Options)
 	}
 	if !canReadDir(v.Mountpoint) {
 		return true, "mountpoint is not readable by the manager (rootless subuid ownership? see 'podman unshare')"
@@ -312,6 +316,12 @@ func parseOctal(s string) (byte, error) {
 		n = n*8 + int(c-'0')
 	}
 	return byte(n), nil
+}
+
+// defaultDirIsEmpty: unreadable or missing counts as empty (no data either way).
+func defaultDirIsEmpty(path string) bool {
+	entries, err := os.ReadDir(path)
+	return err != nil || len(entries) == 0
 }
 
 func defaultCanReadDir(path string) bool {

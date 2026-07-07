@@ -225,9 +225,10 @@ func TestDiscoverSkipsNonLocalDriver(t *testing.T) {
 }
 
 func TestDiscoverSkipsUnmountedLazyVolume(t *testing.T) {
-	restore := discovery.StubFSProbes(
+	restore := discovery.StubAllFSProbes(
 		func(string) bool { return false }, // nothing is mounted
 		func(string) bool { return true },
+		func(string) bool { return true }, // and the data dir is empty
 	)
 	t.Cleanup(restore)
 
@@ -254,6 +255,31 @@ func TestDiscoverSkipsUnmountedLazyVolume(t *testing.T) {
 	require.Len(t, state.Groups["myapp"].Volumes, 1)
 	assert.Equal(t, "plain-vol", state.Groups["myapp"].Volumes[0].Name)
 	assert.Contains(t, buf.String(), "not currently mounted")
+}
+
+func TestDiscoverBacksUpOptionedVolumeWithData(t *testing.T) {
+	// Podman attaches options to ordinary local volumes, so options alone
+	// must not trigger the lazy-mount skip when data is visibly present.
+	restore := discovery.StubAllFSProbes(
+		func(string) bool { return false }, // not a mountpoint
+		func(string) bool { return true },
+		func(string) bool { return false }, // data directory has entries
+	)
+	t.Cleanup(restore)
+
+	vol := volumeFixture("pg-data")
+	vol.Options = map[string]string{"o": "noquota"}
+
+	rt := mockLists(
+		[]runtime.VolumeInfo{vol},
+		[]runtime.ContainerInfo{backupContainer("pg", "app", mountFixture("pg-data", "/var/lib/postgresql/data"))},
+	)
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+
+	require.Contains(t, state.Groups, "app")
+	assert.Len(t, state.Groups["app"].Volumes, 1, "visible data must always be backed up")
 }
 
 func TestDiscoverSkipsUnreadableVolume(t *testing.T) {
