@@ -29,7 +29,7 @@ var (
 	styleName   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	styleDetail = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleBad    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("5")).Padding(0, 1)
+	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 )
 
 // printGroups renders the discovered backup groups with their last-backup ages.
@@ -207,7 +207,7 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 	} else if soonest > 0 {
 		header = "next run in " + shortDuration(soonest)
 	}
-	fmt.Println(placeRight(styleDetail.Render(header)))
+	fmt.Println(spreadLine(styleTitle.Render("Status"), styleDetail.Render(header)))
 	fmt.Println()
 
 	tbl := table.New().
@@ -238,14 +238,6 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 		tbl.Row(r.name, r.last, r.result, r.files, r.size, r.next)
 	}
 	fmt.Println(lipgloss.NewStyle().MarginLeft(hPad).Render(tbl.Render()))
-}
-
-// placeRight right-aligns a styled string on a TTY, plain-left when piped.
-func placeRight(s string) string {
-	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 2*hPad {
-		return edgePad + lipgloss.PlaceHorizontal(width-2*hPad, lipgloss.Right, s)
-	}
-	return edgePad + s
 }
 
 // humanBytes renders a byte count in decimal units, like borg's output.
