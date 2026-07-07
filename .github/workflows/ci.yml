@@ -61,8 +61,9 @@ jobs:
         run: sudo systemctl enable --now podman.socket
       - name: end-to-end (podman compat API, incl. event path)
         run: |
-          # Rootful podman: CLI calls need sudo; the socket path is podman's.
-          E2E_CLI="sudo podman" CONTAINER_SOCKET=/run/podman/podman.sock mise run e2e
+          # DOCKER_HOST points compose AND the manager at podman's socket
+          # (run.sh derives CONTAINER_SOCKET from it), one daemon for both.
+          DOCKER_HOST=unix:///run/podman/podman.sock mise run e2e
 
   release-dry-run:
     runs-on: ubuntu-latest
