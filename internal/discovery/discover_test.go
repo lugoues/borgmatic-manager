@@ -579,11 +579,8 @@ func TestDiscoverSpecShadowsFlatLabels(t *testing.T) {
 	assert.Contains(t, buf.String(), "borgmatic-manager.group")
 }
 
-func TestDiscoverSpecInvalidJSONSkipsContainer(t *testing.T) {
+func TestDiscoverSpecInvalidJSONFailsDiscovery(t *testing.T) {
 	stubProbes(t)
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
-
 	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
 		{
 			ID:     "c1",
@@ -592,19 +589,15 @@ func TestDiscoverSpecInvalidJSONSkipsContainer(t *testing.T) {
 		},
 	})
 
-	state, err := discovery.Discover(context.Background(), rt, logger)
-	require.NoError(t, err)
-
-	assert.Empty(t, state.Groups, "an invalid spec must not half-apply")
-	assert.Contains(t, buf.String(), "invalid borgmatic-manager.spec")
-	assert.Contains(t, buf.String(), "must be valid JSON", "the warning must teach the accepted syntax")
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err, "a broken spec silently shrinks the backup set; the cycle must fail, not warn")
+	assert.Nil(t, state)
+	assert.Contains(t, err.Error(), "invalid borgmatic-manager.spec")
+	assert.Contains(t, err.Error(), "must be valid JSON", "the error must teach the accepted syntax")
 }
 
-func TestDiscoverSpecUnknownFieldRejected(t *testing.T) {
+func TestDiscoverSpecUnknownFieldFailsDiscovery(t *testing.T) {
 	stubProbes(t)
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
-
 	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
 		{
 			ID:     "c1",
@@ -613,18 +606,13 @@ func TestDiscoverSpecUnknownFieldRejected(t *testing.T) {
 		},
 	})
 
-	state, err := discovery.Discover(context.Background(), rt, logger)
-	require.NoError(t, err)
-
-	assert.Empty(t, state.Groups)
-	assert.Contains(t, buf.String(), "invalid borgmatic-manager.spec", "typo'd field names must be rejected, not dropped")
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err, "typo'd field names must be rejected, not dropped")
+	assert.Contains(t, err.Error(), "databses")
 }
 
-func TestDiscoverSpecMissingGroupSkips(t *testing.T) {
+func TestDiscoverSpecMissingGroupFailsDiscovery(t *testing.T) {
 	stubProbes(t)
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
-
 	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
 		{
 			ID:     "c1",
@@ -633,11 +621,9 @@ func TestDiscoverSpecMissingGroupSkips(t *testing.T) {
 		},
 	})
 
-	state, err := discovery.Discover(context.Background(), rt, logger)
-	require.NoError(t, err)
-
-	assert.Empty(t, state.Groups)
-	assert.Contains(t, buf.String(), "missing the required")
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing the required")
 }
 
 func TestDiscoverSpecDatabaseValidationShared(t *testing.T) {
@@ -662,9 +648,6 @@ func TestDiscoverSpecDatabaseValidationShared(t *testing.T) {
 
 func TestDiscoverSpecRejectsNonJSON(t *testing.T) {
 	stubProbes(t)
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
-
 	// The spec is defined as JSON; YAML-flow dialects must be rejected with
 	// guidance, not half-supported as a parser accident.
 	c := runtime.ContainerInfo{
@@ -678,12 +661,10 @@ func TestDiscoverSpecRejectsNonJSON(t *testing.T) {
 
 	rt := mockLists([]runtime.VolumeInfo{volumeFixture("systemd-home-assistant-postgresql")}, []runtime.ContainerInfo{c})
 
-	state, err := discovery.Discover(context.Background(), rt, logger)
-	require.NoError(t, err)
-
-	assert.Empty(t, state.Groups)
-	assert.Contains(t, buf.String(), "strips them", "quote-less JSON-shaped values must get the quadlet-specific hint")
-	assert.Contains(t, buf.String(), "single quotes")
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "strips them", "quote-less JSON-shaped values must get the quadlet-specific hint")
+	assert.Contains(t, err.Error(), "single quotes")
 }
 
 func TestDiscoverRenamedBackupLabelWarns(t *testing.T) {
@@ -709,4 +690,17 @@ func TestDiscoverRenamedBackupLabelWarns(t *testing.T) {
 	assert.Empty(t, state.Groups, "the old label must not silently work")
 	assert.Contains(t, buf.String(), "renamed")
 	assert.Contains(t, buf.String(), "borgmatic-manager.enable")
+}
+
+func TestDiscoverCollectsAllSpecErrors(t *testing.T) {
+	stubProbes(t)
+	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
+		{ID: "c1", Name: "broken-one", Labels: map[string]string{"borgmatic-manager.spec": `{bad`}},
+		{ID: "c2", Name: "broken-two", Labels: map[string]string{"borgmatic-manager.spec": `{"enable": true}`}},
+	})
+
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "broken-one", "every broken spec is reported so one pass fixes them all")
+	assert.Contains(t, err.Error(), "broken-two")
 }

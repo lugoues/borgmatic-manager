@@ -3,6 +3,7 @@ package discovery
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,8 +55,14 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	// Dedupe per group: two containers sharing a volume must not back it up twice.
 	seenVolumes := make(map[string]map[string]bool)
 
+	var specErrs []error
 	for _, c := range containers {
-		intent, ok := containerIntentFor(c, logger)
+		intent, ok, err := containerIntentFor(c, logger)
+		if err != nil {
+			// Collect every broken spec; the cycle fails rather than shrinking the backup set.
+			specErrs = append(specErrs, err)
+			continue
+		}
 		if !ok {
 			continue
 		}
@@ -77,6 +84,10 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			logger.Warn("container has a group but no enable=true, databases, or config; it contributes nothing",
 				"container", c.Name, "group", intent.group)
 		}
+	}
+
+	if len(specErrs) > 0 {
+		return nil, fmt.Errorf("refusing to run with invalid spec labels (a broken spec silently shrinks the backup set): %w", errors.Join(specErrs...))
 	}
 
 	totalVols := countVolumes(state)
@@ -105,14 +116,12 @@ type containerIntent struct {
 	config           map[string]interface{}
 }
 
-// containerIntentFor builds the container's intent. A spec label, when
-// present, is authoritative and shadows all flat labels; otherwise the flat
-// labels are parsed. ok is false when the container contributes nothing
-// parseable (warnings already emitted).
-func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (containerIntent, bool) {
-	if spec, present := ParseSpecLabel(c.Labels, c.Name, logger); present {
-		if spec == nil {
-			return containerIntent{}, false
+// containerIntentFor builds the container's intent; a spec label shadows all flat
+// labels. ok=false means nothing parseable; a structurally invalid spec is an error.
+func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (containerIntent, bool, error) {
+	if spec, present, err := ParseSpecLabel(c.Labels, c.Name); present || err != nil {
+		if err != nil {
+			return containerIntent{}, false, err
 		}
 		warnIgnoredFlatLabels(c.Labels, c.Name, logger)
 		intent := containerIntent{
@@ -125,7 +134,7 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 			intent.volumesFilter = *spec.Volumes
 			intent.hasVolumesFilter = true
 		}
-		return intent, true
+		return intent, true, nil
 	}
 
 	group := GetGroup(c.Labels)
@@ -133,7 +142,7 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 		if HasManagerLabels(c.Labels) {
 			logger.Warn("container has borgmatic-manager labels but no group label", "container", c.Name)
 		}
-		return containerIntent{}, false
+		return containerIntent{}, false, nil
 	}
 
 	if c.Labels[labelEnableRenamed] != "" {
@@ -152,7 +161,7 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 		config:    ParseConfigLabels(c.Labels, logger),
 	}
 	intent.volumesFilter, intent.hasVolumesFilter = VolumesFilter(c.Labels)
-	return intent, true
+	return intent, true, nil
 }
 
 var anonymousVolumeName = regexp.MustCompile(`^[0-9a-f]{64}$`)

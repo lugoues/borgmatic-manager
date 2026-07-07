@@ -42,16 +42,12 @@ type SpecDatabase struct {
 	Options  string `json:"options"`
 }
 
-// ParseSpecLabel parses the borgmatic-manager.spec label. The second return
-// reports whether the label is present at all. A present-but-invalid spec
-// returns (nil, true) after warning, the container is skipped entirely
-// rather than half-applied. The value is strict JSON: unknown field names
-// are errors (typos surface instead of silently dropping settings), and
-// non-JSON dialects are rejected rather than half-supported.
-func ParseSpecLabel(labels map[string]string, containerName string, logger *slog.Logger) (*ContainerSpec, bool) {
+// ParseSpecLabel parses the strict-JSON borgmatic-manager.spec label (bool = present).
+// A present-but-invalid spec fails discovery: skipping it silently shrinks the backup set.
+func ParseSpecLabel(labels map[string]string, containerName string) (*ContainerSpec, bool, error) {
 	raw, ok := labels[labelSpec]
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 
 	dec := json.NewDecoder(strings.NewReader(raw))
@@ -67,18 +63,14 @@ func ParseSpecLabel(labels map[string]string, containerName string, logger *slog
 			// Quadlet: systemd strips unquoted double quotes from Label= values.
 			hint = `the label value contains no double quotes, systemd/quadlet strips them from unquoted Label= lines; wrap the whole assignment in single quotes: Label='borgmatic-manager.spec={"group": "x", "enable": true}'`
 		}
-		logger.Warn("invalid borgmatic-manager.spec label; container skipped",
-			"container", containerName, "error", err, "value", raw, "hint", hint)
-		return nil, true
+		return nil, true, fmt.Errorf("container %s: invalid borgmatic-manager.spec label %q: %w (%s)", containerName, raw, err, hint)
 	}
 
 	if spec.Group == "" {
-		logger.Warn("borgmatic-manager.spec is missing the required \"group\" field; container skipped",
-			"container", containerName)
-		return nil, true
+		return nil, true, fmt.Errorf("container %s: borgmatic-manager.spec is missing the required \"group\" field", containerName)
 	}
 
-	return &spec, true
+	return &spec, true, nil
 }
 
 // databases converts and validates the spec's database entries using the
