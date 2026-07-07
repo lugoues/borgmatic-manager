@@ -35,6 +35,10 @@ borgmatic:
   keep_weekly: 4
   keep_monthly: 6
 
+  # Archive naming; {group} is filled in by the manager, the rest by borg.
+  # Repo-per-host setups often drop the redundant {hostname}.
+  # archive_name_format: "{group}-{now:%Y-%m-%d_%H:%M}"
+
   checks:
     - name: repository
       frequency: 1 week

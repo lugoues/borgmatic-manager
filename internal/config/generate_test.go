@@ -446,3 +446,94 @@ func TestGenerateOmitempty(t *testing.T) {
 	assert.NotContains(t, content, "mariadb_databases")
 	assert.NotContains(t, content, "sqlite_databases")
 }
+
+func TestGenerateCustomArchiveFormatWithGroupToken(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("home-assistant", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+
+	// Repo-per-host setups drop the redundant {hostname}.
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"archive_name_format": "{group}-{now:%Y-%m-%d}",
+		},
+	}
+
+	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	_, err := g.Generate(state)
+	require.NoError(t, err)
+
+	parsed := readGenerated(t, outDir, "home-assistant")
+	assert.Equal(t, "home-assistant-{now:%Y-%m-%d}", parsed["archive_name_format"],
+		"{group} is substituted by the manager; borg placeholders pass through")
+}
+
+func TestGenerateCustomFormatWithoutGroupAllowedOnExclusiveRepo(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("solo", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/solo-repo"}},
+			"archive_name_format": "backup-{now}",
+		},
+	}
+
+	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	meta, err := g.Generate(state)
+	require.NoError(t, err)
+
+	require.Contains(t, meta, "solo", "an exclusive repository permits any format")
+	parsed := readGenerated(t, outDir, "solo")
+	assert.Equal(t, "backup-{now}", parsed["archive_name_format"])
+}
+
+func TestGenerateCustomFormatWithoutGroupRefusedOnSharedRepo(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("alpha", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("beta", models.VolumeInfo{Name: "b", HostPath: "/mnt/b"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+			"archive_name_format": "backup-{now}", // no {group}: groups indistinguishable
+		},
+	}
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	outDir := t.TempDir()
+	g := config.NewGenerator(cfg, nil, outDir, config.GeneratorOptions{}, logger)
+	g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
+
+	meta, err := g.Generate(state)
+	require.NoError(t, err)
+
+	assert.Empty(t, meta, "groups sharing a repo with an indistinguishable format must be refused")
+	_, statErr := os.Stat(filepath.Join(outDir, "alpha.yaml"))
+	assert.True(t, os.IsNotExist(statErr), "no config may be written for a refused group")
+	assert.Contains(t, buf.String(), "must contain the group name")
+	assert.Contains(t, buf.String(), "{group}")
+}
+
+func TestGeneratePrefixGroupNamesWarnOnSharedRepo(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("app-prod", models.VolumeInfo{Name: "b", HostPath: "/mnt/b"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+		},
+	}
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	g := config.NewGenerator(cfg, nil, t.TempDir(), config.GeneratorOptions{}, logger)
+	g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
+
+	meta, err := g.Generate(state)
+	require.NoError(t, err)
+
+	assert.Len(t, meta, 2, "prefix collisions warn, they do not refuse")
+	assert.Contains(t, buf.String(), "retention can cross group boundaries")
+}

@@ -141,11 +141,26 @@ shows the result).
 `{n}` is a zero-based index; gaps are allowed. The v1 `db.{n}.network` label
 is deprecated and ignored.
 
-Each group backs up into one archive per cycle
-(`{hostname}-{group}-{timestamp}`), containing every volume at a
-volume-named path (`myvol/_data/...` — the storage location under
+Each group backs up into one archive per cycle, containing every volume at
+a volume-named path (`myvol/_data/...` — the storage location under
 `/var/lib/docker` is stripped) plus any database dumps. Exception: groups
 with snapshot hooks keep full host paths (the hooks own the path rewriting).
+
+Archives are named `{hostname}-{group}-{now:%Y-%m-%d_%H:%M}` by default.
+Override `archive_name_format` at any config layer; `{group}` is substituted
+by the manager, everything else is a borg placeholder. A repo-per-host setup
+can drop the redundant hostname:
+
+```yaml
+borgmatic:
+  archive_name_format: "{group}-{now:%Y-%m-%d_%H:%M}"
+```
+
+Safety rule, enforced at generation: when groups share a repository, the
+format must contain the group name (use `{group}`) — retention is scoped by
+archive name, so indistinguishable formats would let one group's prune eat
+another group's history. Groups with exclusive repositories may use any
+format.
 
 ### How database dumps run
 
