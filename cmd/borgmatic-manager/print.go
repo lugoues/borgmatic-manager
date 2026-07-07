@@ -32,6 +32,18 @@ func printGroups(state *models.BackupState) {
 	}
 	sort.Strings(names)
 
+	// One name-column width across all groups. Pad before styling: ANSI codes
+	// would throw off printf width math.
+	nameWidth := 0
+	for _, group := range state.Groups {
+		for _, v := range group.Volumes {
+			nameWidth = max(nameWidth, len(v.Name))
+		}
+		for _, db := range group.Databases {
+			nameWidth = max(nameWidth, len(db.Type+"/"+db.Name))
+		}
+	}
+
 	for i, name := range names {
 		if i > 0 {
 			fmt.Println()
@@ -40,9 +52,9 @@ func printGroups(state *models.BackupState) {
 		fmt.Println(styleGroup.Render("group " + name))
 
 		for _, v := range group.Volumes {
-			fmt.Printf("  %s %s  %s\n",
-				styleKind.Render("volume  "),
-				styleName.Render(fmt.Sprintf("%-28s", v.Name)),
+			fmt.Printf("  %s  %s  %s\n",
+				styleKind.Render(fmt.Sprintf("%-8s", "volume")),
+				styleName.Render(fmt.Sprintf("%-*s", nameWidth, v.Name)),
 				styleDetail.Render(v.HostPath),
 			)
 		}
@@ -56,9 +68,9 @@ func printGroups(state *models.BackupState) {
 			case db.Mode == "exec":
 				detail = "container=" + db.Container + " (exec)"
 			}
-			fmt.Printf("  %s %s  %s\n",
-				styleKind.Render("database"),
-				styleName.Render(fmt.Sprintf("%-28s", db.Type+"/"+db.Name)),
+			fmt.Printf("  %s  %s  %s\n",
+				styleKind.Render(fmt.Sprintf("%-8s", "database")),
+				styleName.Render(fmt.Sprintf("%-*s", nameWidth, db.Type+"/"+db.Name)),
 				styleDetail.Render(detail),
 			)
 		}
