@@ -656,8 +656,8 @@ func TestDiscoverSpecRejectsNonJSON(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Empty(t, state.Groups)
-	assert.Contains(t, buf.String(), "must be valid JSON")
-	assert.Contains(t, buf.String(), "single quotes", "the hint must cover quadlet quoting")
+	assert.Contains(t, buf.String(), "strips them", "quote-less JSON-shaped values must get the quadlet-specific hint")
+	assert.Contains(t, buf.String(), "single quotes")
 }
 
 func TestDiscoverRenamedBackupLabelWarns(t *testing.T) {

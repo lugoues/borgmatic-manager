@@ -70,9 +70,13 @@ func ParseSpecLabel(labels map[string]string, containerName string, logger *slog
 		err = fmt.Errorf("trailing data after the JSON document")
 	}
 	if err != nil {
+		hint := `the value must be valid JSON, e.g. {"group": "x", "enable": true}; fields: group, enable, volumes, databases, config`
+		if strings.HasPrefix(strings.TrimSpace(raw), "{") && !strings.Contains(raw, `"`) {
+			// Quadlet: systemd strips unquoted double quotes from Label= values.
+			hint = `the label value contains no double quotes, systemd/quadlet strips them from unquoted Label= lines; wrap the whole assignment in single quotes: Label='borgmatic-manager.spec={"group": "x", "enable": true}'`
+		}
 		logger.Warn("invalid borgmatic-manager.spec label; container skipped",
-			"container", containerName, "error", err,
-			"hint", `the value must be valid JSON, e.g. {"group": "x", "enable": true}; in quadlet files wrap the assignment in single quotes: Label='borgmatic-manager.spec={"group": "x"}'; fields: group, enable, volumes, databases, config`)
+			"container", containerName, "error", err, "value", raw, "hint", hint)
 		return nil, true
 	}
 
