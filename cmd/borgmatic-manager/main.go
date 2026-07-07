@@ -324,12 +324,12 @@ func discoverState(ctx context.Context, e *env, logger *slog.Logger) (*models.Ba
 	return discovery.Discover(ctx, e.rt, logger)
 }
 
-// interactiveLogger renders human-friendly, styled warnings/errors on stderr
-// for one-shot commands, keeping stdout for the command's own output. The
-// daemon uses JSON instead (journald).
+// interactiveLogger renders warnings and errors styled on stderr for one-shot
+// commands, keeping stdout for the command's own output.
 func interactiveLogger() *slog.Logger {
 	handler := charmlog.NewWithOptions(os.Stderr, charmlog.Options{
 		ReportTimestamp: false,
+		Level:           charmlog.WarnLevel,
 	})
 	return slog.New(handler)
 }

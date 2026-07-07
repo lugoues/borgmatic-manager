@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"sort"
 
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 
 	"github.com/lugoues/borgmatic-manager/internal/models"
 )
@@ -18,8 +20,12 @@ var (
 	styleDetail = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
-// printGroups renders the discovered backup groups.
+// printGroups renders the discovered backup groups, headed by a dim summary
+// aligned to the terminal's right edge (plain and left-aligned when piped).
 func printGroups(state *models.BackupState) {
+	fmt.Println(summaryLine(state))
+	fmt.Println()
+
 	names := make([]string, 0, len(state.Groups))
 	for name := range state.Groups {
 		names = append(names, name)
@@ -57,4 +63,29 @@ func printGroups(state *models.BackupState) {
 			)
 		}
 	}
+}
+
+// summaryLine renders "N groups · N volumes · N databases", right-aligned
+// on a TTY.
+func summaryLine(state *models.BackupState) string {
+	groups, volumes, databases := len(state.Groups), 0, 0
+	for _, g := range state.Groups {
+		volumes += len(g.Volumes)
+		databases += len(g.Databases)
+	}
+
+	s := styleDetail.Render(fmt.Sprintf("%s · %s · %s",
+		plural(groups, "group"), plural(volumes, "volume"), plural(databases, "database")))
+
+	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
+		return lipgloss.PlaceHorizontal(width, lipgloss.Right, s)
+	}
+	return s
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
