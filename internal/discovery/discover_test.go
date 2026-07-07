@@ -523,7 +523,7 @@ func TestDiscoverSpecLabel(t *testing.T) {
 		"spec sqlite paths resolve like flat labels")
 
 	require.Len(t, g.LabelConfigs, 1)
-	assert.Equal(t, 14, g.LabelConfigs[0]["keep_daily"], "spec config values come through typed")
+	assert.InDelta(t, 14, g.LabelConfigs[0]["keep_daily"], 0, "spec config values come through as JSON numbers")
 }
 
 func TestDiscoverSpecShadowsFlatLabels(t *testing.T) {
@@ -571,7 +571,7 @@ func TestDiscoverSpecInvalidJSONSkipsContainer(t *testing.T) {
 
 	assert.Empty(t, state.Groups, "an invalid spec must not half-apply")
 	assert.Contains(t, buf.String(), "invalid borgmatic-manager.spec")
-	assert.Contains(t, buf.String(), "YAML flow", "the warning must teach the accepted syntaxes")
+	assert.Contains(t, buf.String(), "must be valid JSON", "the warning must teach the accepted syntax")
 }
 
 func TestDiscoverSpecUnknownFieldRejected(t *testing.T) {
@@ -634,10 +634,13 @@ func TestDiscoverSpecDatabaseValidationShared(t *testing.T) {
 	assert.Contains(t, buf.String(), "exec mode is only supported for postgresql")
 }
 
-func TestDiscoverSpecAcceptsYAMLFlowWithoutQuotes(t *testing.T) {
+func TestDiscoverSpecRejectsNonJSON(t *testing.T) {
 	stubProbes(t)
-	// Quadlet Label= lines make JSON quoting painful; unquoted YAML flow
-	// (spaces after colons) must work. This is a real user label, corrected.
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// The spec is defined as JSON; YAML-flow dialects must be rejected with
+	// guidance, not half-supported as a parser accident.
 	c := runtime.ContainerInfo{
 		ID:   "id-ha-pg",
 		Name: "systemd-home-assistant-postgresql",
@@ -649,13 +652,12 @@ func TestDiscoverSpecAcceptsYAMLFlowWithoutQuotes(t *testing.T) {
 
 	rt := mockLists([]runtime.VolumeInfo{volumeFixture("systemd-home-assistant-postgresql")}, []runtime.ContainerInfo{c})
 
-	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	state, err := discovery.Discover(context.Background(), rt, logger)
 	require.NoError(t, err)
 
-	require.Contains(t, state.Groups, "home-assistant")
-	vols := state.Groups["home-assistant"].Volumes
-	require.Len(t, vols, 1)
-	assert.Equal(t, "systemd-home-assistant-postgresql", vols[0].Name)
+	assert.Empty(t, state.Groups)
+	assert.Contains(t, buf.String(), "must be valid JSON")
+	assert.Contains(t, buf.String(), "single quotes", "the hint must cover quadlet quoting")
 }
 
 func TestDiscoverRenamedBackupLabelWarns(t *testing.T) {

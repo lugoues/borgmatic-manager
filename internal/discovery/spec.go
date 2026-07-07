@@ -1,11 +1,10 @@
 package discovery
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/lugoues/borgmatic-manager/internal/models"
 )
@@ -25,50 +24,55 @@ const labelSpec = "borgmatic-manager.spec"
 //	}
 type ContainerSpec struct {
 	// Group is the backup group (required).
-	Group string `yaml:"group" json:"group"`
+	Group string `json:"group"`
 	// Enable opts the container's named volumes into raw file backup.
-	Enable bool `yaml:"enable" json:"enable"`
+	Enable bool `json:"enable"`
 	// Volumes filters which volumes back up (names or in-container mount
 	// paths). Absent means all named volumes.
-	Volumes *[]string `yaml:"volumes" json:"volumes"`
+	Volumes *[]string `json:"volumes"`
 	// Databases lists database dumps, mirroring the db.{n}.* labels.
-	Databases []SpecDatabase `yaml:"databases" json:"databases"`
+	Databases []SpecDatabase `json:"databases"`
 	// Config is a borgmatic config fragment for the group, mirroring config.* labels.
-	Config map[string]interface{} `yaml:"config" json:"config"`
+	Config map[string]interface{} `json:"config"`
 }
 
 // SpecDatabase mirrors the db.{n}.* label fields.
 type SpecDatabase struct {
-	Type     string `yaml:"type" json:"type"`
-	Name     string `yaml:"name" json:"name"`
-	Username string `yaml:"username" json:"username"`
-	Password string `yaml:"password" json:"password"`
-	Hostname string `yaml:"hostname" json:"hostname"`
-	Port     int    `yaml:"port" json:"port"`
-	Mode     string `yaml:"mode" json:"mode"`
-	Volume   string `yaml:"volume" json:"volume"`
-	Path     string `yaml:"path" json:"path"`
-	Options  string `yaml:"options" json:"options"`
+	Type     string `json:"type"`
+	Name     string `json:"name"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Hostname string `json:"hostname"`
+	Port     int    `json:"port"`
+	Mode     string `json:"mode"`
+	Volume   string `json:"volume"`
+	Path     string `json:"path"`
+	Options  string `json:"options"`
 }
 
 // ParseSpecLabel parses the borgmatic-manager.spec label. The second return
 // reports whether the label is present at all. A present-but-invalid spec
 // returns (nil, true) after warning, the container is skipped entirely
-// rather than half-applied. Decoding is strict: unknown field names are
-// errors, so typos surface instead of silently dropping settings.
+// rather than half-applied. The value is strict JSON: unknown field names
+// are errors (typos surface instead of silently dropping settings), and
+// non-JSON dialects are rejected rather than half-supported.
 func ParseSpecLabel(labels map[string]string, containerName string, logger *slog.Logger) (*ContainerSpec, bool) {
 	raw, ok := labels[labelSpec]
 	if !ok {
 		return nil, false
 	}
 
-	dec := yaml.NewDecoder(strings.NewReader(raw))
-	dec.KnownFields(true)
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
 	var spec ContainerSpec
-	if err := dec.Decode(&spec); err != nil {
+	err := dec.Decode(&spec)
+	if err == nil && dec.More() {
+		err = fmt.Errorf("trailing data after the JSON document")
+	}
+	if err != nil {
 		logger.Warn("invalid borgmatic-manager.spec label; container skipped",
 			"container", containerName, "error", err,
-			"hint", `write JSON ({"group": "x", "enable": true}) or YAML flow ({group: x, enable: true}, a space after each colon is required); fields: group, enable, volumes, databases, config`)
+			"hint", `the value must be valid JSON, e.g. {"group": "x", "enable": true}; in quadlet files wrap the assignment in single quotes: Label='borgmatic-manager.spec={"group": "x"}'; fields: group, enable, volumes, databases, config`)
 		return nil, true
 	}
 

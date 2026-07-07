@@ -206,17 +206,13 @@ Fields mirror the flat labels exactly: `group` (required), `enable`,
 `volumes` (filter; omit for all named volumes), `databases` (same fields as
 `db.{n}.*`), `config` (same as `config.*`, arbitrarily nested).
 
-Quoting-averse contexts like quadlet `Label=` lines can use unquoted YAML
-flow instead of JSON — a space after each colon is required. Note the
-systemd-level double quotes around the whole assignment (systemd word-splits
-unquoted values on spaces); flow syntax keeps it to that one quoting layer:
+The value is strict JSON. In quadlet `Label=` lines, wrap the whole
+assignment in systemd single quotes so the inner JSON quotes need no
+escaping (systemd word-splits unquoted values on spaces):
 
 ```
-Label="borgmatic-manager.spec={group: myapp, enable: true, volumes: [app-data]}"
+Label='borgmatic-manager.spec={"group": "myapp", "enable": true, "volumes": ["app-data"]}'
 ```
-
-(JSON works too if you prefer, wrapped in systemd single quotes:
-`Label='borgmatic-manager.spec={"group": "myapp"}'`.)
 
 Parsing is strict — an unknown or misspelled field rejects the whole spec with a
 warning rather than silently dropping it, and database entries get the same
