@@ -31,6 +31,9 @@ borgmatic:
   #   encryption_passphrase: "{credential systemd borgmatic.pw}"
   # encryption_passphrase: "change-me"
 
+  # Retention: cycles run every 'period', so keep_hourly decides whether
+  # hourly archives survive pruning or collapse to one per day.
+  keep_hourly: 24
   keep_daily: 7
   keep_weekly: 4
   keep_monthly: 6

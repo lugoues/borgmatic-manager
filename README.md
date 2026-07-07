@@ -369,7 +369,7 @@ borgmatic-manager version
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `manager.period` | `"1h"` | Backup cycle interval (Go duration) |
+| `manager.period` | `"1h"` | Backup cycle interval (Go duration). Creation cadence and retention are independent: without `keep_hourly`, hourly archives collapse to one per day at prune time |
 | `manager.borgmatic_path` | auto | borgmatic binary (PATH, then `/root/.local/bin`) |
 | `manager.actions` | `[create, prune, compact, check]` | borgmatic actions per cycle, in order |
 | `manager.run_timeout` | none | bound one group's run; SIGTERM → SIGKILL escalation |
