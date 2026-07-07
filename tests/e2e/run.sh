@@ -192,6 +192,12 @@ done
 manager generate --output "$WORK/generate-out" >/dev/null
 [ -f "$WORK/generate-out/files.yaml" ] || fail "generate --output did not write files.yaml"
 
+log "status one-shot reflects recorded runs"
+STATUS_OUT=$(manager status)
+echo "$STATUS_OUT" | grep -q "files" || fail "status missing files group: $STATUS_OUT"
+echo "$STATUS_OUT" | grep -Eq "ok \([0-9]" || fail "status missing an ok result with duration: $STATUS_OUT"
+echo "$STATUS_OUT" | grep -q "in " || fail "status missing a next-run estimate: $STATUS_OUT"
+
 log "clean shutdown on SIGTERM"
 kill -TERM "$MANAGER_PID"
 for _ in $(seq 1 60); do

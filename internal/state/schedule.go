@@ -10,6 +10,18 @@ import (
 	"time"
 )
 
+// RunOutcome is the observed result of a group's most recent borgmatic
+// run, successful or not, captured from the runner for status display.
+type RunOutcome struct {
+	Finished        time.Time `json:"finished"`
+	Result          string    `json:"result"` // ok | failed | terminated
+	ExitCode        int       `json:"exit_code"`
+	Warnings        int64     `json:"warnings"`
+	DurationSeconds int64     `json:"duration_seconds"`
+	// Archive is the archive name borg reported creating, when observed.
+	Archive string `json:"archive,omitempty"`
+}
+
 // GroupRecord is one group's persisted schedule state.
 type GroupRecord struct {
 	// LastSuccess is when the last successful run started; anchoring to starts
@@ -18,6 +30,9 @@ type GroupRecord struct {
 	// Fingerprint identifies the backed-up content set; a membership change
 	// makes the group due immediately.
 	Fingerprint string `json:"fingerprint"`
+	// LastRun is the most recent run's outcome, including failures,
+	// scheduling only trusts LastSuccess, but status wants the truth.
+	LastRun *RunOutcome `json:"last_run,omitempty"`
 }
 
 type scheduleFile struct {
@@ -86,11 +101,24 @@ func (s *ScheduleStore) Snapshot() map[string]GroupRecord {
 }
 
 // MarkSuccess records a successful run and persists immediately, so the
-// schedule survives a crash between the run and daemon shutdown.
+// schedule survives a crash before shutdown.
 func (s *ScheduleStore) MarkSuccess(name, fingerprint string, startedAt time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.groups[name] = GroupRecord{LastSuccess: startedAt, Fingerprint: fingerprint}
+	rec := s.groups[name]
+	rec.LastSuccess = startedAt
+	rec.Fingerprint = fingerprint
+	s.groups[name] = rec
+	s.save()
+}
+
+// RecordRun stores a run outcome without touching the schedule fields.
+func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.groups[name]
+	rec.LastRun = &outcome
+	s.groups[name] = rec
 	s.save()
 }
 

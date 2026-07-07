@@ -433,6 +433,12 @@ Consequences:
 - Missing or corrupt schedule state degrades to "everything is due" — the
   failure direction is an extra backup, never a skipped one.
 
+`borgmatic-manager status` shows the resulting schedule: each group's last
+run, its outcome (duration, warnings, archive name, exit code — captured
+from borgmatic's log stream, so no repository access is needed), and when
+the next run is due. For repository-level detail, use
+`borgmatic-manager borgmatic <group> info`.
+
 To force an immediate full run: `rm /var/lib/borgmatic-manager/schedule.json`
 and restart the service. Manual `borgmatic-manager borgmatic <group> create`
 runs bypass the schedule and don't update it.
@@ -447,6 +453,8 @@ doesn't instantly fail a cycle.
 
 ## Troubleshooting
 
+- `sudo borgmatic-manager status` — per-group last run, result (duration,
+  warnings, exit code), and when the next run is due
 - `sudo borgmatic-manager discover` — did my labels work? (near-miss labels
   warn here and in the journal)
 - `journalctl -u borgmatic-manager` — JSON logs; per-group results include

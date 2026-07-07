@@ -40,7 +40,7 @@ func main() {
 borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
 	}
 
-	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), borgmaticCmd(), versionCmd())
+	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), borgmaticCmd(), versionCmd())
 
 	if err := fang.Execute(context.Background(), root, fang.WithVersion(version)); err != nil {
 		os.Exit(1)
@@ -68,6 +68,37 @@ func discoverCmd() *cobra.Command {
 			return runDiscover()
 		},
 	}
+}
+
+func statusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show each group's last run, its result, and when the next run is due",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return runStatus(cmd.Context())
+		},
+	}
+}
+
+func runStatus(ctx context.Context) error {
+	logger := interactiveLogger()
+	e, err := loadEnv()
+	if err != nil {
+		return err
+	}
+	backupState, err := discovery.Discover(ctx, e.rt, logger)
+	if err != nil {
+		return err
+	}
+	period, err := time.ParseDuration(e.cfg.Manager.Period)
+	if err != nil {
+		return fmt.Errorf("parsing manager.period: %w", err)
+	}
+	store := state.LoadSchedule(e.stateDir, logger)
+	printStatus(backupState, store, period)
+	return nil
 }
 
 func generateCmd() *cobra.Command {
@@ -184,6 +215,7 @@ func runDaemon() error {
 	gen := e.newGenerator(e.configsDir, slog.Default())
 	r := runner.NewRunner(slog.Default(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
 	store := state.LoadSchedule(e.stateDir, slog.Default())
+	r.SetRecorder(store)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
 	l := events.NewListener(e.rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())

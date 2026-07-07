@@ -88,10 +88,9 @@ func NewScheduler(
 	return s
 }
 
-// groupFingerprint identifies a group's backup content set. Config-label
-// changes don't alter it (they regenerate configs but don't warrant an
-// off-schedule run); volume or database membership changes do.
-func groupFingerprint(group *models.VolumeGroup) string {
+// GroupFingerprint identifies a group's backup content set: volume/database
+// membership changes alter it, config-label changes do not.
+func GroupFingerprint(group *models.VolumeGroup) string {
 	lines := make([]string, 0, len(group.Volumes)+len(group.Databases))
 	for _, v := range group.Volumes {
 		lines = append(lines, "volume\x00"+v.Name)
@@ -151,7 +150,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 		}
 		live[name] = struct{}{}
 
-		fingerprint := groupFingerprint(group)
+		fingerprint := GroupFingerprint(group)
 		if due, next := s.groupDue(name, fingerprint, now); !due {
 			s.logger.Debug("group not due", "group", name, "next_run", next.Format(time.RFC3339))
 			waiting++

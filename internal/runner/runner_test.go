@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
 // fakeExecutor records every command the runner spawns and dispatches
@@ -408,4 +409,58 @@ func TestGroupLockReleasedAfterRun(t *testing.T) {
 		require.NoError(t, err, "iteration %d", i)
 		require.True(t, ran, "all locks must be released between sequential runs (iteration %d)", i)
 	}
+}
+
+// recordingStore captures RecordRun calls.
+type recordingStore struct {
+	mu       sync.Mutex
+	outcomes map[string]state.RunOutcome
+}
+
+func (r *recordingStore) RecordRun(group string, outcome state.RunOutcome) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.outcomes == nil {
+		r.outcomes = map[string]state.RunOutcome{}
+	}
+	r.outcomes[group] = outcome
+}
+
+func TestTryRunGroup_RecordsOutcome(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.runScript = `echo '{"levelname":"INFO","message":"Creating archive at \"/repo::files-2026-07-07\"","name":"borg"}'; echo '{"levelname":"WARNING","message":"w","name":"borg"}' >&2; exit 0`
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	ran, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.NoError(t, err)
+	require.True(t, ran)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o, ok := rec.outcomes["files"]
+	require.True(t, ok, "a completed run must record an outcome")
+	assert.Equal(t, "ok", o.Result)
+	assert.Equal(t, "files-2026-07-07", o.Archive, "archive name captured from borg's log line")
+	assert.Equal(t, int64(1), o.Warnings)
+	assert.False(t, o.Finished.IsZero())
+}
+
+func TestTryRunGroup_RecordsFailureOutcome(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.runScript = "exit 2"
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o, ok := rec.outcomes["files"]
+	require.True(t, ok, "failures must be recorded too, status wants the truth")
+	assert.Equal(t, "failed", o.Result)
+	assert.Equal(t, 2, o.ExitCode)
 }

@@ -79,3 +79,28 @@ func TestScheduleStateDirCreatedOnDemand(t *testing.T) {
 	_, ok := state.LoadSchedule(dir, discardLogger()).Record("files")
 	assert.True(t, ok)
 }
+
+func TestRecordRunPreservedAcrossMarkSuccess(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, discardLogger())
+
+	outcome := state.RunOutcome{
+		Finished: time.Date(2026, 7, 7, 3, 5, 0, 0, time.UTC),
+		Result:   "ok", Warnings: 2, DurationSeconds: 34, Archive: "files-2026-07-07",
+	}
+	s.RecordRun("files", outcome)
+	s.MarkSuccess("files", "fp-1", time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC))
+
+	rec, ok := state.LoadSchedule(dir, discardLogger()).Record("files")
+	require.True(t, ok)
+	require.NotNil(t, rec.LastRun, "MarkSuccess must not clobber the run outcome")
+	assert.Equal(t, "files-2026-07-07", rec.LastRun.Archive)
+	assert.Equal(t, int64(2), rec.LastRun.Warnings)
+	assert.Equal(t, "fp-1", rec.Fingerprint, "and RecordRun must not clobber schedule fields")
+
+	// A later failure overwrites the outcome but not the schedule.
+	s.RecordRun("files", state.RunOutcome{Result: "failed", ExitCode: 2})
+	rec, _ = state.LoadSchedule(dir, discardLogger()).Record("files")
+	assert.Equal(t, "failed", rec.LastRun.Result)
+	assert.False(t, rec.LastSuccess.IsZero())
+}

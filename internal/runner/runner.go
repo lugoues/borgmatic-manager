@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
 var defaultActions = []string{"create", "prune", "compact", "check"}
@@ -46,6 +47,19 @@ type Runner struct {
 
 	// execCommand is an exec.Command seam for testing.
 	execCommand func(ctx context.Context, name string, args ...string) *exec.Cmd
+
+	// recorder, when set, receives every run's outcome for status display.
+	recorder Recorder
+}
+
+// Recorder persists run outcomes; *state.ScheduleStore implements it.
+type Recorder interface {
+	RecordRun(group string, outcome state.RunOutcome)
+}
+
+// SetRecorder wires run-outcome persistence (nil disables it).
+func (r *Runner) SetRecorder(rec Recorder) {
+	r.recorder = rec
 }
 
 // NewRunner creates a Runner. borgmaticPath must be a resolved binary path;
@@ -228,18 +242,35 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 		}
 	}
 
+	record := func(result string) {
+		if r.recorder == nil {
+			return
+		}
+		r.recorder.RecordRun(groupName, state.RunOutcome{
+			Finished:        time.Now(),
+			Result:          result,
+			ExitCode:        exitCode,
+			Warnings:        warnings,
+			DurationSeconds: int64(duration.Seconds()),
+			Archive:         run.archiveName(),
+		})
+	}
+
 	switch exitCode {
 	case 0:
+		record("ok")
 		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode,
 			"warnings", warnings, "duration", duration.Round(time.Second).String())
 		return nil
 
 	case 143, 130:
+		record("terminated")
 		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
 			"timed_out", timedOut, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)
 
 	default:
+		record("failed")
 		if run.repoMissing.Load() {
 			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
 				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
@@ -259,6 +290,23 @@ type runState struct {
 	group       string
 	warnings    atomic.Int64
 	repoMissing atomic.Bool
+
+	// archive holds the archive name borg reported creating; guarded
+	// because stdout and stderr consumers run concurrently.
+	archiveMu sync.Mutex
+	archive   string
+}
+
+func (rs *runState) setArchive(name string) {
+	rs.archiveMu.Lock()
+	rs.archive = name
+	rs.archiveMu.Unlock()
+}
+
+func (rs *runState) archiveName() string {
+	rs.archiveMu.Lock()
+	defer rs.archiveMu.Unlock()
+	return rs.archive
 }
 
 // borgmaticLogRecord is one --log-json line (borgmatic's own records and
@@ -324,6 +372,16 @@ func (rs *runState) checkMessage(msg string) {
 	lower := strings.ToLower(msg)
 	if strings.Contains(lower, "repository") && strings.Contains(lower, "does not exist") {
 		rs.repoMissing.Store(true)
+	}
+	// Borg announces `Creating archive at "<repo>::<archive>"` at INFO.
+	if rest, ok := strings.CutPrefix(msg, "Creating archive at "); ok {
+		rest = strings.Trim(rest, `"`)
+		if i := strings.LastIndex(rest, "::"); i >= 0 {
+			rest = rest[i+2:]
+		}
+		if rest != "" {
+			rs.setArchive(rest)
+		}
 	}
 }
 
