@@ -56,10 +56,43 @@ func TestGenerateBasic(t *testing.T) {
 
 	srcDirs, ok := parsed["source_directories"].([]interface{})
 	require.True(t, ok, "source_directories should be a list")
-	assert.Contains(t, srcDirs, "/var/lib/docker/volumes/web_data/_data")
-	assert.Contains(t, srcDirs, "/var/lib/docker/volumes/web_assets/_data")
+	assert.Contains(t, srcDirs, "/var/lib/docker/volumes/./web_data/_data",
+		"the /./ marker makes archive paths start at the volume name")
+	assert.Contains(t, srcDirs, "/var/lib/docker/volumes/./web_assets/_data")
 	assert.NotContains(t, parsed, "working_directory",
 		"working_directory was a container-mount concept; host paths are absolute")
+}
+
+func TestGenerateSnapshotGroupsUsePlainPaths(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "web_data", HostPath: "/var/lib/docker/volumes/web_data/_data"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{"btrfs": nil},
+	}
+
+	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	_, err := g.Generate(state)
+	require.NoError(t, err)
+
+	parsed := readGenerated(t, outDir, "app")
+	srcDirs := parsed["source_directories"].([]interface{})
+	assert.Contains(t, srcDirs, "/var/lib/docker/volumes/web_data/_data",
+		"snapshot hooks build their own /./ rewrites; sources must stay plain")
+}
+
+func TestGenerateVolumeNameNotInPathFallsBack(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "oddvol", HostPath: "/mnt/somewhere/else"})
+
+	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
+	_, err := g.Generate(state)
+	require.NoError(t, err)
+
+	parsed := readGenerated(t, outDir, "app")
+	srcDirs := parsed["source_directories"].([]interface{})
+	assert.Contains(t, srcDirs, "/mnt/somewhere/else",
+		"paths without the volume name as a component are used unchanged")
 }
 
 func TestGeneratePinsRuntimeAndStateDirs(t *testing.T) {

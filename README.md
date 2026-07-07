@@ -141,6 +141,12 @@ shows the result).
 `{n}` is a zero-based index; gaps are allowed. The v1 `db.{n}.network` label
 is deprecated and ignored.
 
+Each group backs up into one archive per cycle
+(`{hostname}-{group}-{timestamp}`), containing every volume at a
+volume-named path (`myvol/_data/...` — the storage location under
+`/var/lib/docker` is stripped) plus any database dumps. Exception: groups
+with snapshot hooks keep full host paths (the hooks own the path rewriting).
+
 ### How database dumps run
 
 By default the manager generates borgmatic commands that spawn a

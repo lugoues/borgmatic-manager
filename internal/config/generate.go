@@ -107,8 +107,11 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 			base = DeepMerge(base, labelCfg)
 		}
 
-		// 3. Build discovered data from volumes and databases.
-		discovered := g.buildDiscoveredData(groupName, group)
+		// 3. Build discovered data from volumes and databases. Volume-named
+		// archive paths (the /./ marker) are disabled when snapshot hooks
+		// are enabled: the hooks construct their own /./ rewrites and borg
+		// allows only one marker per path.
+		discovered := g.buildDiscoveredData(groupName, group, !hasSnapshotHooks(base))
 
 		// 4. Merge discovered data on top (discovered wins).
 		final := DeepMerge(base, discovered)
@@ -168,7 +171,7 @@ func (g *Generator) reconcile(current []string) error {
 
 // buildDiscoveredData constructs a map of configuration values discovered from
 // the group's volumes and databases.
-func (g *Generator) buildDiscoveredData(groupName string, group *models.VolumeGroup) map[string]interface{} {
+func (g *Generator) buildDiscoveredData(groupName string, group *models.VolumeGroup, volumeNamedPaths bool) map[string]interface{} {
 	data := map[string]interface{}{
 		"archive_name_format": fmt.Sprintf("{hostname}-%s-{now:%%Y-%%m-%%d_%%H:%%M}", groupName),
 	}
@@ -181,11 +184,16 @@ func (g *Generator) buildDiscoveredData(groupName string, group *models.VolumeGr
 		data["user_state_directory"] = g.opts.StateDir
 	}
 
-	// Source directories from volume host paths.
+	// Volume-named paths use borg's "/./" marker (borg >= 1.4) so archives
+	// record "volA/_data/..." rather than the full /var/lib/docker path.
 	if len(group.Volumes) > 0 {
 		dirs := make([]interface{}, 0, len(group.Volumes))
 		for _, vol := range group.Volumes {
-			dirs = append(dirs, vol.HostPath)
+			path := vol.HostPath
+			if volumeNamedPaths {
+				path = volumeNamedPath(vol.HostPath, vol.Name)
+			}
+			dirs = append(dirs, path)
 		}
 		data["source_directories"] = dirs
 	}
@@ -343,6 +351,21 @@ func (g *Generator) buildContainerClientEntry(entry map[string]interface{}, db m
 		entry["mariadb_dump_command"] = base + " " + bins.dump
 		entry["mariadb_command"] = interactive + " " + bins.interact
 	}
+}
+
+// volumeNamedPath inserts borg's "/./" marker before the volume-name component
+// so archive paths start at the volume name; unmatched paths pass through unchanged.
+func volumeNamedPath(hostPath, volumeName string) string {
+	marker := string(filepath.Separator) + volumeName
+	idx := strings.LastIndex(hostPath, marker+string(filepath.Separator))
+	if idx < 0 {
+		if strings.HasSuffix(hostPath, marker) {
+			idx = len(hostPath) - len(marker)
+		} else {
+			return hostPath
+		}
+	}
+	return hostPath[:idx] + string(filepath.Separator) + "." + hostPath[idx:]
 }
 
 // warnIfMissing warns when none of the candidate host binaries are on PATH;

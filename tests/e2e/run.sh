@@ -147,8 +147,10 @@ stack_up --profile late
 log "waiting for a 'files' archive containing both volumes"
 FILES_ARCHIVE=$(wait_for_archive files "file-b.txt" 120)
 
-log "extracting and byte-comparing both files"
+log "extracting and byte-comparing both files (volume-named archive paths)"
 LISTING=$(borg list --format '{path}{NL}' "$REPO::$FILES_ARCHIVE")
+echo "$LISTING" | grep -q "^e2e-data-a/_data/file-a.txt$" \
+  || fail "archive paths must start at the volume name, got: $(echo "$LISTING" | grep file-a | head -1)"
 for f in a b; do
   path=$(echo "$LISTING" | grep "file-$f.txt" | head -1)
   [ -n "$path" ] || fail "archive $FILES_ARCHIVE is missing file-$f.txt"
