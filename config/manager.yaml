@@ -19,6 +19,8 @@ manager:
 # Default borgmatic settings applied to all groups.
 # Anything valid in borgmatic's schema can go here, it is deep-merged with
 # per-group overrides from groups/{group-name}.yaml and discovered data.
+# Sharing settings with standalone borgmatic configs works via !include:
+#   <<: !include /etc/borgmatic/common.yaml
 borgmatic:
   repositories:
     - path: /mnt/borg-repository

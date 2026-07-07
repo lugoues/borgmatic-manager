@@ -345,10 +345,25 @@ borgmatic-manager version
 | `manager.run_timeout` | none | bound one group's run; SIGTERM → SIGKILL escalation |
 | `borgmatic.*` | — | defaults merged into every group's config |
 
-Per-group overrides live in `/etc/borgmatic-manager/groups/{group}.yaml` and
-deep-merge over the defaults (lists replace). Anything borgmatic supports is
-valid — including backing up **bind-mounted host paths** by adding
-`source_directories` to a group override.
+Per-group overrides live in `/etc/borgmatic-manager/groups/{group}.yaml` —
+each file is a borgmatic config fragment (top-level options) deep-merged over
+the defaults (lists replace). Anything borgmatic supports is valid — including
+backing up **bind-mounted host paths** by adding `source_directories` to a
+group override.
+
+**Shared config in and out of BM:** borgmatic's `!include` tag works in
+`manager.yaml` and `groups/*.yaml`, so the same shared file can serve
+standalone borgmatic configs and the manager:
+
+```yaml
+borgmatic:
+  <<: !include /etc/borgmatic/common.yaml   # deep merge; local keys win
+  keep_daily: 14
+```
+
+Relative paths resolve against the including file; includes nest. borgmatic's
+`!retain`/`!omit` merge tags are not supported (use group files or config
+labels for overrides instead).
 
 ### Environment
 

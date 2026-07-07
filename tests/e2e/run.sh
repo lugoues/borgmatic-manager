@@ -106,7 +106,7 @@ wait_for_archive() {
 # --- phase 0: build & stack up ---------------------------------------------
 
 mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR" "$STATE_DIR"
-cp "$HERE/manager.yaml" "$CONFIG_DIR/manager.yaml"
+cp "$HERE/manager.yaml" "$HERE/common.yaml" "$CONFIG_DIR/"
 
 if [ -n "${MANAGER_BIN:-}" ]; then
   log "using prebuilt manager binary: $MANAGER_BIN"

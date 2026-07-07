@@ -32,19 +32,28 @@ type ManagerSettings struct {
 }
 
 // LoadConfig reads the manager configuration from managerPath and loads any
-// per-group override files from groupsDir. Each .yaml file in groupsDir
-// provides a borgmatic section that will be deep-merged with the base config.
+// per-group override files from groupsDir. Both support borgmatic's !include
+// tag (see loadYAMLWithIncludes), so shared config files work in and out of
+// borgmatic-manager.
 //
-// The returned overrides map is keyed by group name (filename without .yaml).
-// If groupsDir does not exist, no overrides are returned (not an error).
+// A group file is a borgmatic config fragment: top-level borgmatic options
+// deep-merged over the manager.yaml defaults. (A legacy wrapper form with a
+// single top-level "borgmatic" key is also accepted.) The returned overrides
+// map is keyed by group name (filename without .yaml). If groupsDir does not
+// exist, no overrides are returned (not an error).
 func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[string]map[string]interface{}, error) {
-	data, err := os.ReadFile(managerPath) // #nosec G304 -- operator-provided config path
+	managerMap, err := loadYAMLWithIncludes(managerPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading manager config: %w", err)
+		return nil, nil, fmt.Errorf("loading manager config: %w", err)
 	}
 
+	// Round-trip the resolved map into the typed struct.
+	resolved, err := yaml.Marshal(managerMap)
+	if err != nil {
+		return nil, nil, fmt.Errorf("processing manager config: %w", err)
+	}
 	var cfg ManagerConfig
-	if parseErr := yaml.Unmarshal(data, &cfg); parseErr != nil {
+	if parseErr := yaml.Unmarshal(resolved, &cfg); parseErr != nil {
 		return nil, nil, fmt.Errorf("parsing manager config: %w", parseErr)
 	}
 
@@ -70,21 +79,19 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 		groupName := strings.TrimSuffix(name, ".yaml")
 		groupPath := filepath.Join(groupsDir, name)
 
-		groupData, err := os.ReadFile(groupPath) // #nosec G304 -- files under the operator's groups directory
+		raw, err := loadYAMLWithIncludes(groupPath)
 		if err != nil {
-			return nil, nil, fmt.Errorf("reading group override %s: %w", groupPath, err)
+			return nil, nil, fmt.Errorf("loading group override %s: %w", groupPath, err)
 		}
 
-		var raw map[string]interface{}
-		if err := yaml.Unmarshal(groupData, &raw); err != nil {
-			return nil, nil, fmt.Errorf("parsing group override %s: %w", groupPath, err)
-		}
-
-		if borgmatic, ok := raw["borgmatic"]; ok {
-			if borgmaticMap, ok := borgmatic.(map[string]interface{}); ok {
-				overrides[groupName] = borgmaticMap
+		// Legacy wrapper form: a lone top-level "borgmatic" key.
+		if len(raw) == 1 {
+			if wrapped, ok := raw["borgmatic"].(map[string]interface{}); ok {
+				overrides[groupName] = wrapped
+				continue
 			}
 		}
+		overrides[groupName] = raw
 	}
 
 	return &cfg, overrides, nil

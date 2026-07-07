@@ -1,9 +1,9 @@
 # Manager configuration for the e2e run. Short period so cycles are quick;
-# lock_wait tolerates the passthrough subcommand racing a cycle.
+# common settings come from an !include to exercise borgmatic-style shared
+# config files.
 manager:
   period: "15s"
 borgmatic:
+  <<: !include common.yaml
   repositories:
     - path: /srv/borgmatic-e2e/repo
-  keep_daily: 7
-  lock_wait: 30
