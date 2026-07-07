@@ -27,7 +27,9 @@ for image in "${IMAGES[@]}"; do
   echo "=== $image ==="
   docker run --rm -v "$DEB:/pkg.deb:ro" "$image" bash -ec '
     export DEBIAN_FRONTEND=noninteractive
-    dpkg -i /pkg.deb >/dev/null
+    dpkg -i /pkg.deb > /tmp/install.out
+    grep -q "Next steps" /tmp/install.out \
+      || { echo "fresh install must print the bootstrap guide" >&2; exit 1; }
 
     /usr/bin/borgmatic-manager version >/dev/null
 
@@ -47,9 +49,13 @@ for image in "${IMAGES[@]}"; do
       || { echo "LICENSE missing from package" >&2; exit 1; }
 
     echo "# operator edit" >> /etc/borgmatic-manager/manager.yaml
-    dpkg -i /pkg.deb >/dev/null 2>&1
+    dpkg -i /pkg.deb > /tmp/upgrade.out 2>&1
     tail -1 /etc/borgmatic-manager/manager.yaml | grep -q "operator edit" \
       || { echo "operator config clobbered on reinstall" >&2; exit 1; }
+    # Upgrade takes the restart branch (a no-op without systemd) and must
+    # not re-print the bootstrap guide.
+    ! grep -q "Next steps" /tmp/upgrade.out \
+      || { echo "upgrade must not print the bootstrap guide" >&2; exit 1; }
 
     dpkg -r borgmatic-manager >/dev/null 2>&1
     test ! -f /usr/bin/borgmatic-manager || { echo "binary not removed" >&2; exit 1; }
