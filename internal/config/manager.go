@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -31,20 +32,19 @@ type ManagerSettings struct {
 	RunTimeout string `yaml:"run_timeout"`
 }
 
-// LoadConfig reads the manager configuration from managerPath and loads any
-// per-group override files from groupsDir. Both support borgmatic's !include
-// tag (see loadYAMLWithIncludes), so shared config files work in and out of
-// borgmatic-manager.
-//
-// A group file is a borgmatic config fragment: top-level borgmatic options
-// deep-merged over the manager.yaml defaults. (A legacy wrapper form with a
-// single top-level "borgmatic" key is also accepted.) The returned overrides
-// map is keyed by group name (filename without .yaml). If groupsDir does not
-// exist, no overrides are returned (not an error).
+// LoadConfig reads the manager config, deep-merges conf.d/*.yaml drop-ins
+// (lexical order, beside managerPath) over it, and loads per-group override
+// fragments from groupsDir, keyed by filename sans extension. All files
+// support borgmatic's !include tag. A missing groupsDir is not an error.
 func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[string]map[string]interface{}, error) {
 	managerMap, err := loadYAMLWithIncludes(managerPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading manager config: %w", err)
+	}
+
+	managerMap, err = mergeConfD(managerMap, filepath.Join(filepath.Dir(managerPath), "conf.d"))
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Round-trip the resolved map into the typed struct.
@@ -95,4 +95,34 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 	}
 
 	return &cfg, overrides, nil
+}
+
+// mergeConfD deep-merges conf.d/*.yaml drop-ins over the base config in
+// lexical filename order. A missing directory is fine.
+func mergeConfD(base map[string]interface{}, confDir string) (map[string]interface{}, error) {
+	entries, err := os.ReadDir(confDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return base, nil
+		}
+		return nil, fmt.Errorf("reading conf.d directory: %w", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		fragment, err := loadYAMLWithIncludes(filepath.Join(confDir, name))
+		if err != nil {
+			return nil, fmt.Errorf("loading conf.d drop-in %s: %w", name, err)
+		}
+		base = DeepMerge(base, fragment)
+	}
+	return base, nil
 }

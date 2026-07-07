@@ -1,4 +1,3 @@
 # Shared borgmatic settings, pulled into manager.yaml via borgmatic's
 # !include tag, exercising include support end-to-end.
 keep_daily: 7
-lock_wait: 30

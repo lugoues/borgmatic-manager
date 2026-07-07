@@ -375,6 +375,14 @@ borgmatic-manager version
 | `manager.run_timeout` | none | bound one group's run; SIGTERM → SIGKILL escalation |
 | `borgmatic.*` | — | defaults merged into every group's config |
 
+Local tweaks belong in `/etc/borgmatic-manager/conf.d/*.yaml` — full config
+fragments (`manager:` and/or `borgmatic:` sections) deep-merged over
+`manager.yaml` in lexical filename order. Package upgrades never touch
+`/etc`; the shipped default lives at
+`/usr/share/borgmatic-manager/manager.yaml` and is copied in only on first
+install, so improvements to it reach you via that reference copy without
+upgrade prompts.
+
 Per-group overrides live in `/etc/borgmatic-manager/groups/{group}.yaml` —
 each file is a borgmatic config fragment (top-level options) deep-merged over
 the defaults (lists replace). Anything borgmatic supports is valid — including
@@ -399,7 +407,7 @@ labels for overrides instead).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_DIR` | `/etc/borgmatic-manager` | manager.yaml + groups/ |
+| `CONFIG_DIR` | `/etc/borgmatic-manager` | manager.yaml + conf.d/ + groups/ |
 | `RUNTIME_DIR` | `/run/borgmatic-manager` | generated configs, borgmatic runtime dir |
 | `STATE_DIR` | `/var/lib/borgmatic-manager` | borgmatic check-frequency state |
 | `CONTAINER_SOCKET` | autodetected | Docker/Podman socket; probes `/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock` |

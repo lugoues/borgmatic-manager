@@ -42,9 +42,11 @@ nfpms:
         dst: /usr/lib/systemd/system/borgmatic-manager.service
       - src: deploy/systemd/borgmatic-manager.user.service
         dst: /usr/share/borgmatic-manager/borgmatic-manager.user.service
+      # The default config is NOT a conffile: the package owns only the
+      # /usr/share copy (freely updated on upgrade); postinstall seeds /etc
+      # once, and upgrades never touch operator files or prompt.
       - src: config/manager.yaml
-        dst: /etc/borgmatic-manager/manager.yaml
-        type: config|noreplace
+        dst: /usr/share/borgmatic-manager/manager.yaml
       - src: LICENSE
         dst: /usr/share/doc/borgmatic-manager/LICENSE
       - src: README.md

@@ -1,0 +1,4 @@
+# Exercises conf.d drop-in merging end-to-end: this fragment supplies
+# lock_wait, which manager.yaml deliberately omits.
+borgmatic:
+  lock_wait: 30

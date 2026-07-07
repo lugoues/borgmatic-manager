@@ -107,6 +107,8 @@ wait_for_archive() {
 
 mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR" "$STATE_DIR"
 cp "$HERE/manager.yaml" "$HERE/common.yaml" "$CONFIG_DIR/"
+mkdir -p "$CONFIG_DIR/conf.d"
+cp "$HERE"/conf.d/*.yaml "$CONFIG_DIR/conf.d/"
 
 if [ -n "${MANAGER_BIN:-}" ]; then
   log "using prebuilt manager binary: $MANAGER_BIN"
@@ -135,6 +137,7 @@ FILES_CONFIG="$RUNTIME_DIR/configs/files.yaml"
 [ -f "$FILES_CONFIG" ] || fail "generated config missing at $FILES_CONFIG"
 [ "$(stat -c %a "$FILES_CONFIG")" = "600" ] || fail "generated config must be 0600"
 grep -q "keep_daily: 14" "$FILES_CONFIG" || fail "config label (keep_daily) not applied"
+grep -q "lock_wait: 30" "$FILES_CONFIG" || fail "conf.d drop-in (lock_wait) not merged"
 
 log "initializing the repository via the borgmatic passthrough"
 manager borgmatic files repo-create --encryption none

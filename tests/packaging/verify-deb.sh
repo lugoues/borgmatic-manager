@@ -31,21 +31,25 @@ for image in "${IMAGES[@]}"; do
 
     /usr/bin/borgmatic-manager version >/dev/null
 
-    # Functional files must land on disk. Docs are asserted in the package
-    # listing instead: minimized cloud images (e.g. ubuntu:24.04) configure
-    # dpkg path-excludes that legitimately skip /usr/share/doc at install.
+    # Functional files must land on disk (/etc/... via postinstall seeding,
+    # not package contents). Docs are asserted in the package listing
+    # instead: minimized cloud images (e.g. ubuntu:24.04) configure dpkg
+    # path-excludes that legitimately skip /usr/share/doc at install.
     for f in /usr/lib/systemd/system/borgmatic-manager.service \
              /usr/share/borgmatic-manager/borgmatic-manager.user.service \
-             /etc/borgmatic-manager/manager.yaml; do
-      test -f "$f" || { echo "missing $f" >&2; exit 1; }
+             /usr/share/borgmatic-manager/manager.yaml \
+             /etc/borgmatic-manager/manager.yaml \
+             /etc/borgmatic-manager/conf.d; do
+      test -e "$f" || { echo "missing $f" >&2; exit 1; }
     done
+    dpkg -L borgmatic-manager | grep -q "^/etc" && { echo "package must not own /etc paths" >&2; exit 1; }
     dpkg-deb -c /pkg.deb | grep -q "doc/borgmatic-manager/LICENSE" \
       || { echo "LICENSE missing from package" >&2; exit 1; }
 
     echo "# operator edit" >> /etc/borgmatic-manager/manager.yaml
     dpkg -i /pkg.deb >/dev/null 2>&1
     tail -1 /etc/borgmatic-manager/manager.yaml | grep -q "operator edit" \
-      || { echo "conffile clobbered on reinstall" >&2; exit 1; }
+      || { echo "operator config clobbered on reinstall" >&2; exit 1; }
 
     dpkg -r borgmatic-manager >/dev/null 2>&1
     test ! -f /usr/bin/borgmatic-manager || { echo "binary not removed" >&2; exit 1; }

@@ -177,3 +177,43 @@ borgmatic:
 	assert.Equal(t, 7, cfg.Borgmatic["keep_daily"], "plain YAML anchor merges keep working")
 	assert.Equal(t, 4, cfg.Borgmatic["keep_weekly"])
 }
+
+func TestConfDDropInsMergeInLexicalOrder(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"manager.yaml": "manager:\n    period: \"1h\"\nborgmatic:\n    keep_daily: 7\n    keep_weekly: 4\n",
+		// Lexical order: 10- applies before 50-, so 50- wins on conflicts.
+		"conf.d/10-retention.yaml": "borgmatic:\n    keep_daily: 14\n    keep_hourly: 24\n",
+		"conf.d/50-period.yaml":    "manager:\n    period: \"30m\"\nborgmatic:\n    keep_daily: 30\n",
+		"conf.d/ignored.txt":       "not yaml\n",
+	})
+
+	cfg, _, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+	require.NoError(t, err)
+
+	assert.Equal(t, "30m", cfg.Manager.Period, "drop-ins can override the manager section")
+	assert.Equal(t, 30, cfg.Borgmatic["keep_daily"], "later drop-ins win over earlier ones")
+	assert.Equal(t, 24, cfg.Borgmatic["keep_hourly"], "non-conflicting drop-in keys accumulate")
+	assert.Equal(t, 4, cfg.Borgmatic["keep_weekly"], "manager.yaml keys survive when untouched")
+}
+
+func TestConfDSupportsIncludes(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"manager.yaml":         "manager:\n    period: \"1h\"\nborgmatic:\n    keep_daily: 7\n",
+		"shared.yaml":          "keep_monthly: 12\n",
+		"conf.d/10-local.yaml": "borgmatic:\n    <<: !include ../shared.yaml\n",
+	})
+
+	cfg, _, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+	require.NoError(t, err)
+	assert.Equal(t, 12, cfg.Borgmatic["keep_monthly"], "drop-ins support !include")
+}
+
+func TestConfDMissingIsFine(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"manager.yaml": "manager:\n    period: \"1h\"\nborgmatic:\n    keep_daily: 7\n",
+	})
+
+	cfg, _, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+	require.NoError(t, err)
+	assert.Equal(t, "1h", cfg.Manager.Period)
+}
