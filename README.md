@@ -210,7 +210,7 @@ labels:
       "group": "myapp",
       "enable": true,
       "volumes": ["app-data"],
-      "databases": [
+      "db": [
         {"type": "postgresql", "name": "appdb", "username": "postgres", "password": "secret"}
       ],
       "config": {"keep_daily": 14}
@@ -218,8 +218,8 @@ labels:
 ```
 
 Fields mirror the flat labels exactly: `group` (required), `enable`,
-`volumes` (filter; omit for all named volumes), `databases` (same fields as
-`db.{n}.*`), `config` (same as `config.*`, arbitrarily nested).
+`volumes` (filter; omit for all named volumes), `db` (a list with the same
+fields as `db.{n}.*`), `config` (same as `config.*`, arbitrarily nested).
 
 The value is strict JSON. In quadlet `Label=` lines, wrap the whole
 assignment in systemd single quotes so the inner JSON quotes need no

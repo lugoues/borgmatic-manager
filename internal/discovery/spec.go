@@ -14,14 +14,6 @@ import (
 const labelSpec = "borgmatic-manager.spec"
 
 // ContainerSpec is the one-label JSON configuration document.
-//
-//	{
-//	  "group": "myapp",
-//	  "enable": true,
-//	  "volumes": ["app-data", "/uploads"],
-//	  "databases": [{"type": "postgresql", "name": "appdb", "username": "u"}],
-//	  "config": {"keep_daily": 14}
-//	}
 type ContainerSpec struct {
 	// Group is the backup group (required).
 	Group string `json:"group"`
@@ -30,8 +22,8 @@ type ContainerSpec struct {
 	// Volumes filters which volumes back up (names or in-container mount
 	// paths). Absent means all named volumes.
 	Volumes *[]string `json:"volumes"`
-	// Databases lists database dumps, mirroring the db.{n}.* labels.
-	Databases []SpecDatabase `json:"databases"`
+	// Databases mirrors the db.{n}.* labels; the JSON field is "db".
+	Databases []SpecDatabase `json:"db"`
 	// Config is a borgmatic config fragment for the group, mirroring config.* labels.
 	Config map[string]interface{} `json:"config"`
 }
@@ -70,7 +62,7 @@ func ParseSpecLabel(labels map[string]string, containerName string, logger *slog
 		err = fmt.Errorf("trailing data after the JSON document")
 	}
 	if err != nil {
-		hint := `the value must be valid JSON, e.g. {"group": "x", "enable": true}; fields: group, enable, volumes, databases, config`
+		hint := `the value must be valid JSON, e.g. {"group": "x", "enable": true}; fields: group, enable, volumes, db, config`
 		if strings.HasPrefix(strings.TrimSpace(raw), "{") && !strings.Contains(raw, `"`) {
 			// Quadlet: systemd strips unquoted double quotes from Label= values.
 			hint = `the label value contains no double quotes, systemd/quadlet strips them from unquoted Label= lines; wrap the whole assignment in single quotes: Label='borgmatic-manager.spec={"group": "x", "enable": true}'`
@@ -106,7 +98,7 @@ func (s *ContainerSpec) databases(containerName string, logger *slog.Logger) []m
 			Path:     sdb.Path,
 			Options:  sdb.Options,
 		}
-		ref := fmt.Sprintf("%s spec databases[%d]", containerName, i)
+		ref := fmt.Sprintf("%s spec db[%d]", containerName, i)
 		if !validateDatabase(&cfg, ref, logger) {
 			continue
 		}

@@ -508,7 +508,7 @@ func TestDiscoverSpecLabel(t *testing.T) {
 	  "group": "myapp",
 	  "enable": true,
 	  "volumes": ["app-data"],
-	  "databases": [
+	  "db": [
 	    {"type": "postgresql", "name": "appdb", "username": "postgres", "password": "pw"},
 	    {"type": "sqlite", "name": "cache", "volume": "app-data", "path": "cache.db"}
 	  ],
@@ -646,7 +646,7 @@ func TestDiscoverSpecDatabaseValidationShared(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
 	// mariadb with mode=exec must fall back to helper, same as flat labels.
-	spec := `{"group": "g", "databases": [{"type": "mariadb", "name": "db", "username": "u", "mode": "exec"}]}`
+	spec := `{"group": "g", "db": [{"type": "mariadb", "name": "db", "username": "u", "mode": "exec"}]}`
 	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
 		{ID: "c1", Name: "maria", Image: "mariadb:11", Labels: map[string]string{"borgmatic-manager.spec": spec}},
 	})
