@@ -24,6 +24,8 @@ ConfigurationDirectory=borgmatic-manager
 RuntimeDirectory=borgmatic-manager
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=restart
+# State: the persisted group schedule (schedule.json, restarts resume the
+# period instead of re-running backups) plus borgmatic's check state.
 StateDirectory=borgmatic-manager
 StateDirectoryMode=0700
 

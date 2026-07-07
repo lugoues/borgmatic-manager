@@ -409,9 +409,32 @@ labels for overrides instead).
 |----------|---------|-------------|
 | `CONFIG_DIR` | `/etc/borgmatic-manager` | manager.yaml + conf.d/ + groups/ |
 | `RUNTIME_DIR` | `/run/borgmatic-manager` | generated configs, borgmatic runtime dir |
-| `STATE_DIR` | `/var/lib/borgmatic-manager` | borgmatic check-frequency state |
+| `STATE_DIR` | `/var/lib/borgmatic-manager` | schedule state (`schedule.json`) + borgmatic check-frequency state |
 | `CONTAINER_SOCKET` | autodetected | Docker/Podman socket; probes `/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock` |
 | `BORGMATIC_PATH` | — | borgmatic binary override |
+
+## Scheduling
+
+The schedule is persistent (like a systemd timer with `Persistent=true`):
+each group's last successful run is recorded in `$STATE_DIR/schedule.json`,
+and a group only runs when its period has elapsed since then **or its
+membership changed** (a volume or database joined/left — so a newly labeled
+container is backed up within seconds, without re-running everything else).
+Consequences:
+
+- Restarts and package upgrades resume the schedule; they don't trigger
+  backups. A backup interrupted by the restart is still due and re-runs
+  immediately.
+- Container create/remove events regenerate configs every time, but only
+  run groups whose membership actually changed.
+- Failed or interrupted groups stay due and retry; only borgmatic exit 0
+  marks success.
+- Missing or corrupt schedule state degrades to "everything is due" — the
+  failure direction is an extra backup, never a skipped one.
+
+To force an immediate full run: `rm /var/lib/borgmatic-manager/schedule.json`
+and restart the service. Manual `borgmatic-manager borgmatic <group> create`
+runs bypass the schedule and don't update it.
 
 ## Concurrency model
 

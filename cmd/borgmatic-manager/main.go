@@ -25,6 +25,7 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/runner"
 	"github.com/lugoues/borgmatic-manager/internal/runtime"
 	"github.com/lugoues/borgmatic-manager/internal/scheduler"
+	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".
@@ -182,7 +183,8 @@ func runDaemon() error {
 
 	gen := e.newGenerator(e.configsDir, slog.Default())
 	r := runner.NewRunner(slog.Default(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
-	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen)
+	store := state.LoadSchedule(e.stateDir, slog.Default())
+	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
 	l := events.NewListener(e.rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())
 
