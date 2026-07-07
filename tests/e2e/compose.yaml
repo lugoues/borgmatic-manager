@@ -17,7 +17,7 @@ services:
     volumes:
       - data-a:/data
     labels:
-      borgmatic-manager.backup: "true"
+      borgmatic-manager.enable: "true"
       borgmatic-manager.group: files
       borgmatic-manager.config.keep_daily: "14"
     healthcheck:
@@ -35,7 +35,7 @@ services:
     volumes:
       - data-b:/data
     labels:
-      borgmatic-manager.spec: '{"group": "files", "backup": true}'
+      borgmatic-manager.spec: '{"group": "files", "enable": true}'
     healthcheck:
       test: ["CMD", "test", "-f", "/data/file-b.txt"]
       interval: 1s

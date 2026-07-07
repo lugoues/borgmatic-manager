@@ -18,7 +18,7 @@ const labelSpec = "borgmatic-manager.spec"
 //
 //	{
 //	  "group": "myapp",
-//	  "backup": true,
+//	  "enable": true,
 //	  "volumes": ["app-data", "/uploads"],
 //	  "databases": [{"type": "postgresql", "name": "appdb", "username": "u"}],
 //	  "config": {"keep_daily": 14}
@@ -26,8 +26,8 @@ const labelSpec = "borgmatic-manager.spec"
 type ContainerSpec struct {
 	// Group is the backup group (required).
 	Group string `yaml:"group" json:"group"`
-	// Backup opts the container's named volumes into raw file backup.
-	Backup bool `yaml:"backup" json:"backup"`
+	// Enable opts the container's named volumes into raw file backup.
+	Enable bool `yaml:"enable" json:"enable"`
 	// Volumes filters which volumes back up (names or in-container mount
 	// paths). Absent means all named volumes.
 	Volumes *[]string `yaml:"volumes" json:"volumes"`
@@ -68,7 +68,7 @@ func ParseSpecLabel(labels map[string]string, containerName string, logger *slog
 	if err := dec.Decode(&spec); err != nil {
 		logger.Warn("invalid borgmatic-manager.spec label; container skipped",
 			"container", containerName, "error", err,
-			"hint", `write JSON ({"group": "x", "backup": true}) or YAML flow ({group: x, backup: true}, a space after each colon is required); fields: group, backup, volumes, databases, config`)
+			"hint", `write JSON ({"group": "x", "enable": true}) or YAML flow ({group: x, enable: true}, a space after each colon is required); fields: group, enable, volumes, databases, config`)
 		return nil, true
 	}
 

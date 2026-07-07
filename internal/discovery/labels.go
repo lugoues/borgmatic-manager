@@ -13,12 +13,14 @@ import (
 )
 
 const (
-	labelPrefix  = "borgmatic-manager."
-	labelBackup  = "borgmatic-manager.backup"
-	labelGroup   = "borgmatic-manager.group"
-	labelVolumes = "borgmatic-manager.volumes"
-	dbPrefix     = "borgmatic-manager.db."
-	configPrefix = "borgmatic-manager.config."
+	labelPrefix = "borgmatic-manager."
+	labelEnable = "borgmatic-manager.enable"
+	// labelEnableRenamed is the pre-rename spelling; seen -> warn, ignored.
+	labelEnableRenamed = "borgmatic-manager.backup"
+	labelGroup         = "borgmatic-manager.group"
+	labelVolumes       = "borgmatic-manager.volumes"
+	dbPrefix           = "borgmatic-manager.db."
+	configPrefix       = "borgmatic-manager.config."
 )
 
 // dbTypeSQLite gets special validation: no credentials, volume+path required.
@@ -31,11 +33,9 @@ var validDBTypes = map[string]bool{
 	dbTypeSQLite: true,
 }
 
-// IsBackupEnabled checks whether the container has opted its volumes into
-// backup via the borgmatic-manager.backup=true label. Containers with only
-// db.* labels contribute database dumps without raw volume backups.
-func IsBackupEnabled(labels map[string]string) bool {
-	return labels[labelBackup] == "true"
+// IsEnabled reports whether borgmatic-manager.enable=true opts the container's volumes in.
+func IsEnabled(labels map[string]string) bool {
+	return labels[labelEnable] == "true"
 }
 
 // VolumesFilter returns the parsed borgmatic-manager.volumes label (a

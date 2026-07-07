@@ -13,7 +13,7 @@ Next steps:
   1. Install borgmatic >= 2.1 and borg >= 1.4 (distro packages often lag):
        sudo uv tool install borgmatic   # or: pipx install borgmatic
   2. Edit /etc/borgmatic-manager/manager.yaml (repository, passphrase)
-  3. Label your containers (borgmatic-manager.backup=true, .group=<name>)
+  3. Label your containers (borgmatic-manager.enable=true, .group=<name>)
   4. systemctl enable --now borgmatic-manager
   5. Initialize the repository with the command the first cycle prints:
        journalctl -u borgmatic-manager | grep repo-create

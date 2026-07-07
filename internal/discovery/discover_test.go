@@ -51,7 +51,7 @@ func backupContainer(name, group string, mounts ...runtime.VolumeMount) runtime.
 		Name:  name,
 		Image: "example/" + name + ":1",
 		Labels: map[string]string{
-			"borgmatic-manager.backup": "true",
+			"borgmatic-manager.enable": "true",
 			"borgmatic-manager.group":  group,
 		},
 		Mounts: mounts,
@@ -165,13 +165,13 @@ func TestDiscoverSharedVolumeDeduped(t *testing.T) {
 	assert.Len(t, state.Groups["myapp"].Volumes, 1, "a volume shared by two group members backs up once")
 }
 
-func TestDiscoverBackupWithoutTrueDoesNothing(t *testing.T) {
+func TestDiscoverEnableWithoutTrueDoesNothing(t *testing.T) {
 	stubProbes(t)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
 	c := backupContainer("web", "myapp", mountFixture("app-data", "/data"))
-	c.Labels["borgmatic-manager.backup"] = "True" // wrong case
+	c.Labels["borgmatic-manager.enable"] = "True" // wrong case
 
 	rt := mockLists([]runtime.VolumeInfo{volumeFixture("app-data")}, []runtime.ContainerInfo{c})
 
@@ -189,7 +189,7 @@ func TestDiscoverVolumeLabelsDeprecationWarning(t *testing.T) {
 
 	v1Volume := volumeFixture("old-style")
 	v1Volume.Labels = map[string]string{
-		"borgmatic-manager.backup": "true",
+		"borgmatic-manager.enable": "true",
 		"borgmatic-manager.group":  "legacy",
 	}
 
@@ -480,7 +480,7 @@ func TestDiscoverSpecLabel(t *testing.T) {
 	stubProbes(t)
 	spec := `{
 	  "group": "myapp",
-	  "backup": true,
+	  "enable": true,
 	  "volumes": ["app-data"],
 	  "databases": [
 	    {"type": "postgresql", "name": "appdb", "username": "postgres", "password": "pw"},
@@ -535,9 +535,9 @@ func TestDiscoverSpecShadowsFlatLabels(t *testing.T) {
 		ID:   "id-web",
 		Name: "web",
 		Labels: map[string]string{
-			"borgmatic-manager.spec":   `{"group": "from-spec", "backup": true}`,
+			"borgmatic-manager.spec":   `{"group": "from-spec", "enable": true}`,
 			"borgmatic-manager.group":  "from-flat-labels",
-			"borgmatic-manager.backup": "true",
+			"borgmatic-manager.enable": "true",
 		},
 		Mounts: []runtime.VolumeMount{mountFixture("app-data", "/data")},
 	}
@@ -562,7 +562,7 @@ func TestDiscoverSpecInvalidJSONSkipsContainer(t *testing.T) {
 		{
 			ID:     "c1",
 			Name:   "web",
-			Labels: map[string]string{"borgmatic-manager.spec": `{"group": "myapp", "backup": tru`},
+			Labels: map[string]string{"borgmatic-manager.spec": `{"group": "myapp", "enable": tru`},
 		},
 	})
 
@@ -603,7 +603,7 @@ func TestDiscoverSpecMissingGroupSkips(t *testing.T) {
 		{
 			ID:     "c1",
 			Name:   "web",
-			Labels: map[string]string{"borgmatic-manager.spec": `{"backup": true}`},
+			Labels: map[string]string{"borgmatic-manager.spec": `{"enable": true}`},
 		},
 	})
 
@@ -642,7 +642,7 @@ func TestDiscoverSpecAcceptsYAMLFlowWithoutQuotes(t *testing.T) {
 		ID:   "id-ha-pg",
 		Name: "systemd-home-assistant-postgresql",
 		Labels: map[string]string{
-			"borgmatic-manager.spec": "{group: home-assistant, backup: true, volumes: [systemd-home-assistant-postgresql]}",
+			"borgmatic-manager.spec": "{group: home-assistant, enable: true, volumes: [systemd-home-assistant-postgresql]}",
 		},
 		Mounts: []runtime.VolumeMount{mountFixture("systemd-home-assistant-postgresql", "/var/lib/postgresql/data")},
 	}
@@ -656,4 +656,29 @@ func TestDiscoverSpecAcceptsYAMLFlowWithoutQuotes(t *testing.T) {
 	vols := state.Groups["home-assistant"].Volumes
 	require.Len(t, vols, 1)
 	assert.Equal(t, "systemd-home-assistant-postgresql", vols[0].Name)
+}
+
+func TestDiscoverRenamedBackupLabelWarns(t *testing.T) {
+	stubProbes(t)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	c := runtime.ContainerInfo{
+		ID:   "c1",
+		Name: "old-style",
+		Labels: map[string]string{
+			"borgmatic-manager.group":  "app",
+			"borgmatic-manager.backup": "true", // pre-rename spelling
+		},
+		Mounts: []runtime.VolumeMount{mountFixture("app-data", "/data")},
+	}
+
+	rt := mockLists([]runtime.VolumeInfo{volumeFixture("app-data")}, []runtime.ContainerInfo{c})
+
+	state, err := discovery.Discover(context.Background(), rt, logger)
+	require.NoError(t, err)
+
+	assert.Empty(t, state.Groups, "the old label must not silently work")
+	assert.Contains(t, buf.String(), "renamed")
+	assert.Contains(t, buf.String(), "borgmatic-manager.enable")
 }

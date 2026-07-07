@@ -71,7 +71,7 @@ services:
     volumes:
       - app-data:/data
     labels:
-      borgmatic-manager.backup: "true"   # back up this service's named volumes
+      borgmatic-manager.enable: "true"   # back up this service's named volumes
       borgmatic-manager.group: "myapp"
 
 volumes:
@@ -112,7 +112,7 @@ immutable after creation, which made them a trap).
 | Label | Description |
 |-------|-------------|
 | `borgmatic-manager.group` | Backup group. Required for a container to participate at all; containers sharing a group back up together. |
-| `borgmatic-manager.backup` | `"true"` to back up this container's named volumes. |
+| `borgmatic-manager.enable` | `"true"` to back up this container's named volumes. |
 | `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Default: all named volumes (anonymous volumes excluded). |
 | `borgmatic-manager.db.{n}.*` | Database dump definitions (below). |
 | `borgmatic-manager.config.<option>` | Any borgmatic option for this group (below). |
@@ -193,7 +193,7 @@ labels:
   borgmatic-manager.spec: >-
     {
       "group": "myapp",
-      "backup": true,
+      "enable": true,
       "volumes": ["app-data"],
       "databases": [
         {"type": "postgresql", "name": "appdb", "username": "postgres", "password": "secret"}
@@ -202,7 +202,7 @@ labels:
     }
 ```
 
-Fields mirror the flat labels exactly: `group` (required), `backup`,
+Fields mirror the flat labels exactly: `group` (required), `enable`,
 `volumes` (filter; omit for all named volumes), `databases` (same fields as
 `db.{n}.*`), `config` (same as `config.*`, arbitrarily nested).
 
@@ -210,7 +210,7 @@ Quoting-averse contexts like quadlet `Label=` lines can use unquoted YAML
 flow instead of JSON — a space after each colon is required:
 
 ```
-Label=borgmatic-manager.spec={group: myapp, backup: true, volumes: [app-data]}
+Label=borgmatic-manager.spec={group: myapp, enable: true, volumes: [app-data]}
 ```
 
 Parsing is strict — an unknown or misspelled field rejects the whole spec with a

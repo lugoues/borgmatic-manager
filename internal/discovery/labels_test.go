@@ -15,35 +15,35 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestIsBackupEnabled(t *testing.T) {
+func TestIsEnabled(t *testing.T) {
 	tests := []struct {
 		name   string
 		labels map[string]string
 		want   bool
 	}{
 		{
-			name:   "returns true when backup label is true",
-			labels: map[string]string{"borgmatic-manager.backup": "true"},
+			name:   "returns true when enable label is true",
+			labels: map[string]string{"borgmatic-manager.enable": "true"},
 			want:   true,
 		},
 		{
-			name:   "returns false when backup label is absent",
+			name:   "returns false when enable label is absent",
 			labels: map[string]string{},
 			want:   false,
 		},
 		{
-			name:   "returns false when backup label is false",
-			labels: map[string]string{"borgmatic-manager.backup": "false"},
+			name:   "returns false when enable label is false",
+			labels: map[string]string{"borgmatic-manager.enable": "false"},
 			want:   false,
 		},
 		{
-			name:   "returns false when backup label is yes",
-			labels: map[string]string{"borgmatic-manager.backup": "yes"},
+			name:   "returns false when enable label is yes",
+			labels: map[string]string{"borgmatic-manager.enable": "yes"},
 			want:   false,
 		},
 		{
-			name:   "returns false when backup label is empty",
-			labels: map[string]string{"borgmatic-manager.backup": ""},
+			name:   "returns false when enable label is empty",
+			labels: map[string]string{"borgmatic-manager.enable": ""},
 			want:   false,
 		},
 		{
@@ -55,7 +55,7 @@ func TestIsBackupEnabled(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := discovery.IsBackupEnabled(tt.labels)
+			got := discovery.IsEnabled(tt.labels)
 			assert.Equal(t, tt.want, got)
 		})
 	}

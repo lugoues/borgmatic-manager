@@ -37,7 +37,7 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	for _, v := range volumes {
 		volumesByName[v.Name] = v
 		if HasManagerLabels(v.Labels) {
-			logger.Warn("volume labels are no longer supported: label the container instead (borgmatic-manager.backup + .group on the service)",
+			logger.Warn("volume labels are no longer supported: label the container instead (borgmatic-manager.enable + .group on the service)",
 				"volume", v.Name)
 		}
 	}
@@ -59,7 +59,7 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			continue
 		}
 
-		if intent.backup {
+		if intent.enabled {
 			discoverContainerVolumes(state, c, intent, volumesByName, seenVolumes, logger)
 		}
 
@@ -72,8 +72,8 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			state.AddLabelConfig(intent.group, intent.config)
 		}
 
-		if !intent.backup && len(dbs) == 0 && intent.config == nil {
-			logger.Warn("container has a group but no volume backup, databases, or config; it contributes nothing",
+		if !intent.enabled && len(dbs) == 0 && intent.config == nil {
+			logger.Warn("container has a group but no enable=true, databases, or config; it contributes nothing",
 				"container", c.Name, "group", intent.group)
 		}
 	}
@@ -97,7 +97,7 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 // containerIntent is a container's normalized contribution, from flat labels or a spec blob.
 type containerIntent struct {
 	group            string
-	backup           bool
+	enabled          bool
 	volumesFilter    []string
 	hasVolumesFilter bool
 	databases        []models.DatabaseConfig
@@ -116,7 +116,7 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 		warnIgnoredFlatLabels(c.Labels, c.Name, logger)
 		intent := containerIntent{
 			group:     spec.Group,
-			backup:    spec.Backup,
+			enabled:   spec.Enable,
 			databases: spec.databases(c.Name, logger),
 			config:    spec.Config,
 		}
@@ -135,14 +135,18 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 		return containerIntent{}, false
 	}
 
-	if !IsBackupEnabled(c.Labels) && c.Labels[labelBackup] != "" {
-		logger.Warn("container backup label is not \"true\"; its volumes will not be backed up",
-			"container", c.Name, "backup_label", c.Labels[labelBackup])
+	if c.Labels[labelEnableRenamed] != "" {
+		logger.Warn("the borgmatic-manager.backup label was renamed: use borgmatic-manager.enable",
+			"container", c.Name)
+	}
+	if !IsEnabled(c.Labels) && c.Labels[labelEnable] != "" {
+		logger.Warn("container enable label is not \"true\"; its volumes will not be backed up",
+			"container", c.Name, "enable_label", c.Labels[labelEnable])
 	}
 
 	intent := containerIntent{
 		group:     group,
-		backup:    IsBackupEnabled(c.Labels),
+		enabled:   IsEnabled(c.Labels),
 		databases: ParseDatabaseLabels(c.Labels, logger),
 		config:    ParseConfigLabels(c.Labels, logger),
 	}
@@ -205,7 +209,7 @@ func discoverContainerVolumes(state *models.BackupState, c runtime.ContainerInfo
 	}
 
 	if !hasFilter && len(c.Mounts) == 0 {
-		logger.Warn("container has backup=true but no named volumes attached", "container", c.Name, "group", group)
+		logger.Warn("container has enable=true but no named volumes attached", "container", c.Name, "group", group)
 	}
 	for _, f := range filter {
 		if !matched[f] {
