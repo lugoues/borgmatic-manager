@@ -186,8 +186,8 @@ DISCOVER_OUT=$(manager discover)
 for expected in "group files" "group db" "e2e-data-a"; do
   echo "$DISCOVER_OUT" | grep -q "$expected" || fail "discover output missing '$expected': $DISCOVER_OUT"
 done
-manager generate -output "$WORK/generate-out" >/dev/null
-[ -f "$WORK/generate-out/files.yaml" ] || fail "generate -output did not write files.yaml"
+manager generate --output "$WORK/generate-out" >/dev/null
+[ -f "$WORK/generate-out/files.yaml" ] || fail "generate --output did not write files.yaml"
 
 log "clean shutdown on SIGTERM"
 kill -TERM "$MANAGER_PID"

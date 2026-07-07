@@ -1,15 +1,7 @@
-//
-// Commands:
-//
-//	borgmatic-manager [run]              run the daemon (default)
-//	borgmatic-manager discover           one-shot discovery, print groups and exit
-//	borgmatic-manager generate [-output] one-shot config generation and exit
-//	borgmatic-manager version            print the version and exit
 package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,7 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/fang"
+	charmlog "github.com/charmbracelet/log"
 	"github.com/coreos/go-systemd/v22/daemon"
+	"github.com/spf13/cobra"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
@@ -35,6 +30,93 @@ import (
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
+func main() {
+	root := &cobra.Command{
+		Use:     "borgmatic-manager",
+		Short:   "Label-driven borgmatic backup orchestration for Docker and Podman",
+		Version: version,
+		Long: `Discovers containers labeled borgmatic-manager.*, generates per-group
+borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
+	}
+
+	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), borgmaticCmd(), versionCmd())
+
+	if err := fang.Execute(context.Background(), root, fang.WithVersion(version)); err != nil {
+		os.Exit(1)
+	}
+}
+
+func runCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "run",
+		Short: "Run the manager daemon",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runDaemon()
+		},
+	}
+}
+
+func discoverCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "discover",
+		Short: "Discover labeled containers, print the backup groups, and exit",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return runDiscover()
+		},
+	}
+}
+
+func generateCmd() *cobra.Command {
+	var output string
+	cmd := &cobra.Command{
+		Use:   "generate",
+		Short: "Generate borgmatic configs once and exit",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return runGenerate(output)
+		},
+	}
+	cmd.Flags().StringVarP(&output, "output", "o", "", "output directory (default: $RUNTIME_DIR/configs)")
+	return cmd
+}
+
+func borgmaticCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "borgmatic <group> [borgmatic args...]",
+		Short: "Run borgmatic against a group's generated config",
+		Long: `Regenerates the group's config from live labels and execs borgmatic with
+it, the supported way to interact with a group's repository:
+
+  borgmatic-manager borgmatic myapp repo-create --encryption repokey-blake2
+  borgmatic-manager borgmatic myapp list
+  borgmatic-manager borgmatic myapp extract --archive latest`,
+		// Everything after the group belongs to borgmatic untouched.
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
+				return cmd.Help()
+			}
+			cmd.SilenceUsage = true
+			return runBorgmaticPassthrough(args)
+		},
+	}
+}
+
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the version and exit",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
+			fmt.Println(version)
+		},
+	}
+}
+
 // env holds the resolved directory layout and loaded configuration.
 type env struct {
 	configDir  string
@@ -46,52 +128,6 @@ type env struct {
 	groupOverrides map[string]map[string]interface{}
 	rt             *runtime.DockerRuntime
 }
-
-func main() {
-	cmd := "run"
-	args := os.Args[1:]
-	if len(args) > 0 {
-		cmd = args[0]
-		args = args[1:]
-	}
-
-	switch cmd {
-	case "run":
-		os.Exit(runDaemon())
-	case "discover":
-		os.Exit(runDiscover())
-	case "generate":
-		os.Exit(runGenerate(args))
-	case "borgmatic":
-		os.Exit(runBorgmaticPassthrough(args))
-	case "version", "--version", "-v":
-		fmt.Println(version)
-	case "help", "--help", "-h":
-		fmt.Print(usage)
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
-		os.Exit(2)
-	}
-}
-
-const usage = `usage: borgmatic-manager [command]
-
-commands:
-  run        run the manager daemon (default)
-  discover   discover labeled volumes/containers, print them, and exit
-  generate   generate borgmatic configs once and exit (-output DIR)
-  borgmatic  run borgmatic against a group's generated config:
-               borgmatic-manager borgmatic <group> [borgmatic args...]
-             e.g. repo-create --encryption repokey-blake2 | list | extract
-  version    print the version and exit
-
-environment:
-  CONFIG_DIR        config directory        (default /etc/borgmatic-manager)
-  RUNTIME_DIR       runtime directory       (default /run/borgmatic-manager)
-  STATE_DIR         state directory         (default /var/lib/borgmatic-manager)
-  CONTAINER_SOCKET  docker/podman socket    (default /var/run/docker.sock)
-  BORGMATIC_PATH    borgmatic binary        (default: config, then PATH)
-`
 
 func loadEnv() (*env, error) {
 	e := &env{
@@ -124,7 +160,7 @@ func (e *env) newGenerator(outputDir string, logger *slog.Logger) *config.Genera
 	}, logger)
 }
 
-func runDaemon() int {
+func runDaemon() error {
 	// Structured JSON logging to stdout (journald captures it).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
@@ -135,13 +171,13 @@ func runDaemon() int {
 	e, err := loadEnv()
 	if err != nil {
 		slog.Error("startup failed", "error", err)
-		return 1
+		return err
 	}
 
 	pf, err := preflight(ctx, e)
 	if err != nil {
 		slog.Error("preflight failed", "error", err)
-		return 1
+		return err
 	}
 
 	gen := e.newGenerator(e.configsDir, slog.Default())
@@ -164,88 +200,123 @@ func runDaemon() int {
 
 	if err := o.Run(ctx); err != nil {
 		slog.Error("fatal error", "error", err)
-		return 1
+		return err
 	}
 
 	slog.Info("borgmatic-manager stopped")
-	return 0
+	return nil
 }
 
-func runDiscover() int {
-	logger := textLogger()
+func runDiscover() error {
+	logger := interactiveLogger()
 	ctx := context.Background()
 
 	e, err := loadEnv()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
+		return err
 	}
 
 	state, err := discoverState(ctx, e, logger)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
+		return err
 	}
 
 	if len(state.Groups) == 0 {
-		fmt.Println("no backup groups discovered, check your labels (warnings above, if any, explain near-misses)")
-		return 1
+		return fmt.Errorf("no backup groups discovered, check your labels (warnings above, if any, explain near-misses)")
 	}
 
-	for name, group := range state.Groups {
-		fmt.Printf("group %s:\n", name)
-		for _, v := range group.Volumes {
-			fmt.Printf("  volume    %-20s %s\n", v.Name, v.HostPath)
-		}
-		for _, db := range group.Databases {
-			target := "container=" + db.Container
-			if db.Type == "sqlite" {
-				target = db.Path
-			} else if db.Hostname != "" {
-				target = fmt.Sprintf("hostname=%s port=%d", db.Hostname, db.Port)
-			}
-			fmt.Printf("  database  %-20s %s\n", db.Type+"/"+db.Name, target)
-		}
-	}
-	return 0
+	printGroups(state)
+	return nil
 }
 
-func runGenerate(args []string) int {
-	fs := flag.NewFlagSet("generate", flag.ExitOnError)
-	output := fs.String("output", "", "output directory (default: $RUNTIME_DIR/configs)")
-	_ = fs.Parse(args)
-
-	logger := textLogger()
+func runGenerate(output string) error {
+	logger := interactiveLogger()
 	ctx := context.Background()
 
 	e, err := loadEnv()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
+		return err
 	}
 
-	outDir := *output
+	outDir := output
 	if outDir == "" {
 		outDir = e.configsDir
 	}
 
 	state, err := discoverState(ctx, e, logger)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
+		return err
 	}
 
 	gen := e.newGenerator(outDir, logger)
 	meta, err := gen.Generate(state)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
+		return err
 	}
 
+	groups := make([]string, 0, len(meta))
 	for group := range meta {
+		groups = append(groups, group)
+	}
+	sort.Strings(groups)
+	for _, group := range groups {
 		fmt.Println(filepath.Join(outDir, group+".yaml"))
 	}
-	return 0
+	return nil
+}
+
+// runBorgmaticPassthrough regenerates the group's config from live labels and
+// execs borgmatic with it: the supported way to touch a group's repository.
+func runBorgmaticPassthrough(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: borgmatic-manager borgmatic <group> [borgmatic args...]")
+	}
+	group := args[0]
+	if strings.HasPrefix(group, "-") {
+		return fmt.Errorf("the first argument must be a group name, got flag %q (e.g.: borgmatic-manager borgmatic myapp create --dry-run); run 'borgmatic-manager discover' to list groups", group)
+	}
+
+	logger := interactiveLogger()
+	ctx := context.Background()
+
+	e, err := loadEnv()
+	if err != nil {
+		return err
+	}
+
+	state, err := discoverState(ctx, e, logger)
+	if err != nil {
+		return err
+	}
+
+	gen := e.newGenerator(e.configsDir, logger)
+	meta, err := gen.Generate(state)
+	if err != nil {
+		return err
+	}
+	if _, ok := meta[group]; !ok {
+		groups := make([]string, 0, len(meta))
+		for name := range meta {
+			groups = append(groups, name)
+		}
+		sort.Strings(groups)
+		return fmt.Errorf("unknown group %q; discovered groups: %s", group, strings.Join(groups, ", "))
+	}
+
+	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	if err != nil {
+		return err
+	}
+
+	configPath := filepath.Join(e.configsDir, group+".yaml")
+	argv := append([]string{borgmaticPath, "--config", configPath}, args[1:]...)
+
+	// Replace the process: borgmatic owns the terminal from here.
+	// #nosec G702 G204 -- deliberately exec'ing the resolved borgmatic binary with the operator's own CLI arguments
+	if err := syscall.Exec(borgmaticPath, argv, os.Environ()); err != nil {
+		return fmt.Errorf("executing borgmatic: %w", err)
+	}
+	return nil
 }
 
 // discoverState runs one discovery pass for the one-shot commands.
@@ -253,10 +324,14 @@ func discoverState(ctx context.Context, e *env, logger *slog.Logger) (*models.Ba
 	return discovery.Discover(ctx, e.rt, logger)
 }
 
-// textLogger logs human-readable warnings/errors to stderr for one-shot
-// commands, keeping stdout for the command's own output.
-func textLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+// interactiveLogger renders human-friendly, styled warnings/errors on stderr
+// for one-shot commands, keeping stdout for the command's own output. The
+// daemon uses JSON instead (journald).
+func interactiveLogger() *slog.Logger {
+	handler := charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+		ReportTimestamp: false,
+	})
+	return slog.New(handler)
 }
 
 func getEnv(key, defaultValue string) string {
@@ -276,67 +351,4 @@ func runTimeoutFromConfig(cfg *config.ManagerConfig) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid manager.run_timeout %q: %w", cfg.Manager.RunTimeout, err)
 	}
 	return d, nil
-}
-
-// runBorgmaticPassthrough regenerates the group's config from live labels and
-// execs borgmatic with it: the supported way to touch a group's repository.
-func runBorgmaticPassthrough(args []string) int {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: borgmatic-manager borgmatic <group> [borgmatic args...]")
-		return 2
-	}
-	group := args[0]
-	if strings.HasPrefix(group, "-") {
-		fmt.Fprintf(os.Stderr, "error: the first argument must be a group name, got flag %q\nusage: borgmatic-manager borgmatic <group> [borgmatic args...]   e.g.: borgmatic-manager borgmatic myapp create --dry-run\nrun 'borgmatic-manager discover' to list groups\n", group)
-		return 2
-	}
-
-	logger := textLogger()
-	ctx := context.Background()
-
-	e, err := loadEnv()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-
-	state, err := discoverState(ctx, e, logger)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-
-	gen := e.newGenerator(e.configsDir, logger)
-	meta, err := gen.Generate(state)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	if _, ok := meta[group]; !ok {
-		groups := make([]string, 0, len(meta))
-		for name := range meta {
-			groups = append(groups, name)
-		}
-		sort.Strings(groups)
-		fmt.Fprintf(os.Stderr, "error: unknown group %q; discovered groups: %s\n", group, strings.Join(groups, ", "))
-		return 1
-	}
-
-	borgmaticPath, err := resolveBorgmatic(e.cfg)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-
-	configPath := filepath.Join(e.configsDir, group+".yaml")
-	argv := append([]string{borgmaticPath, "--config", configPath}, args[1:]...)
-	env := os.Environ()
-
-	// Replace the process: borgmatic owns the terminal from here.
-	// #nosec G702 G204 -- deliberately exec'ing the resolved borgmatic binary with the operator's own CLI arguments
-	if err := syscall.Exec(borgmaticPath, argv, env); err != nil {
-		fmt.Fprintln(os.Stderr, "error executing borgmatic:", err)
-		return 1
-	}
-	return 0
 }

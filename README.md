@@ -341,9 +341,9 @@ routable container IP.
 ## CLI
 
 ```
-borgmatic-manager run                     # the daemon (default)
+borgmatic-manager run                     # the daemon
 borgmatic-manager discover                # one-shot: print discovered groups
-borgmatic-manager generate -output D      # one-shot: write configs to D
+borgmatic-manager generate --output D     # one-shot: write configs to D
 borgmatic-manager borgmatic <group> ...   # run borgmatic against a group
 borgmatic-manager version
 ```
