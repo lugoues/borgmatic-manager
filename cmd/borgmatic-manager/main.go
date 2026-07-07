@@ -154,6 +154,7 @@ func runDaemon() int {
 		"version", version,
 		"period", e.cfg.Manager.Period,
 		"config_dir", e.configDir,
+		"socket", e.rt.SocketPath(),
 		"borgmatic", pf.borgmaticPath,
 		"borgmatic_version", pf.borgmaticVersion,
 	)
@@ -285,6 +286,10 @@ func runBorgmaticPassthrough(args []string) int {
 		return 2
 	}
 	group := args[0]
+	if strings.HasPrefix(group, "-") {
+		fmt.Fprintf(os.Stderr, "error: the first argument must be a group name, got flag %q\nusage: borgmatic-manager borgmatic <group> [borgmatic args...]   e.g.: borgmatic-manager borgmatic myapp create --dry-run\nrun 'borgmatic-manager discover' to list groups\n", group)
+		return 2
+	}
 
 	logger := textLogger()
 	ctx := context.Background()

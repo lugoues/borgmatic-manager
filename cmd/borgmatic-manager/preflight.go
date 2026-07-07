@@ -52,7 +52,7 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	res.runTimeout = timeout
 
 	if _, err := e.rt.ListVolumes(ctx); err != nil {
-		return nil, fmt.Errorf("container runtime socket check failed: %w", err)
+		return nil, fmt.Errorf("container runtime socket check failed (socket %s; set CONTAINER_SOCKET to override): %w", e.rt.SocketPath(), err)
 	}
 
 	path, err := resolveBorgmatic(e.cfg)

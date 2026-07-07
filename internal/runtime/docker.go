@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
@@ -21,14 +22,12 @@ type DockerRuntime struct {
 	socketPath string
 }
 
-// NewDockerRuntime creates a new DockerRuntime connected to the container socket.
-// The socket path is read from the CONTAINER_SOCKET environment variable,
-// defaulting to /var/run/docker.sock if unset. This works identically for
-// Docker and Podman sockets.
+// NewDockerRuntime connects to $CONTAINER_SOCKET, or the first existing
+// well-known docker/podman socket.
 func NewDockerRuntime() (*DockerRuntime, error) {
-	socketPath := os.Getenv("CONTAINER_SOCKET")
-	if socketPath == "" {
-		socketPath = "/var/run/docker.sock"
+	socketPath, err := resolveSocketPath()
+	if err != nil {
+		return nil, err
 	}
 
 	cli, err := dockerclient.NewClientWithOpts(
@@ -40,6 +39,44 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 	}
 
 	return &DockerRuntime{client: cli, socketPath: socketPath}, nil
+}
+
+// SocketPath returns the socket this client talks to (for logs and errors).
+func (d *DockerRuntime) SocketPath() string {
+	return d.socketPath
+}
+
+// resolveSocketPath: an explicit $CONTAINER_SOCKET always wins even if absent
+// (the daemon may not be up yet); otherwise well-known paths are probed.
+func resolveSocketPath() (string, error) {
+	if p := os.Getenv("CONTAINER_SOCKET"); p != "" {
+		return p, nil
+	}
+
+	candidates := []string{
+		"/var/run/docker.sock",
+		"/run/podman/podman.sock",
+	}
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		candidates = append(candidates, filepath.Join(xdg, "podman", "podman.sock"))
+	}
+
+	if found := firstSocket(candidates); found != "" {
+		return found, nil
+	}
+	return "", fmt.Errorf("no container runtime socket found (checked %s); start docker, enable podman's API socket ('systemctl enable --now podman.socket'), or set CONTAINER_SOCKET",
+		strings.Join(candidates, ", "))
+}
+
+// firstSocket returns the first candidate that exists and is a unix socket.
+func firstSocket(candidates []string) string {
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.Mode()&os.ModeSocket != 0 { // #nosec G703 -- probing well-known runtime socket paths
+
+			return c
+		}
+	}
+	return ""
 }
 
 // Rootless reports whether the engine runs rootless. It checks the engine's

@@ -378,7 +378,7 @@ labels for overrides instead).
 | `CONFIG_DIR` | `/etc/borgmatic-manager` | manager.yaml + groups/ |
 | `RUNTIME_DIR` | `/run/borgmatic-manager` | generated configs, borgmatic runtime dir |
 | `STATE_DIR` | `/var/lib/borgmatic-manager` | borgmatic check-frequency state |
-| `CONTAINER_SOCKET` | `/var/run/docker.sock` | Docker/Podman socket |
+| `CONTAINER_SOCKET` | autodetected | Docker/Podman socket; probes `/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock` |
 | `BORGMATIC_PATH` | — | borgmatic binary override |
 
 ## Concurrency model

@@ -29,7 +29,7 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 
 	volumes, err := rt.ListVolumes(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing volumes: %w", err)
+		return nil, err // already wrapped with context by the runtime
 	}
 
 	// Index all volumes for skip checks and sqlite path resolution.
@@ -44,7 +44,7 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 
 	containers, err := rt.ListContainers(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing containers: %w", err)
+		return nil, err // already wrapped with context by the runtime
 	}
 
 	// Deterministic processing order for stable dedupe and config merging.

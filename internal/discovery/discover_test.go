@@ -433,7 +433,8 @@ func TestDiscoverVolumeListError(t *testing.T) {
 	state, err := discovery.Discover(context.Background(), rt, discardLogger())
 	assert.Nil(t, state)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "listing volumes")
+	assert.Contains(t, err.Error(), "socket unreachable",
+		"the runtime's error passes through (it already carries context)")
 
 	rt.AssertExpectations(t)
 }
@@ -446,7 +447,8 @@ func TestDiscoverContainerListError(t *testing.T) {
 	state, err := discovery.Discover(context.Background(), rt, discardLogger())
 	assert.Nil(t, state)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "listing containers")
+	assert.Contains(t, err.Error(), "permission denied",
+		"the runtime's error passes through (it already carries context)")
 
 	rt.AssertExpectations(t)
 }
