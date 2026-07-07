@@ -16,6 +16,11 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
+// hPad keeps output off the terminal edges.
+const hPad = 2
+
+var edgePad = strings.Repeat(" ", hPad)
+
 // lipgloss degrades to plain text on non-TTY output and honors NO_COLOR, so the
 // literal tokens stay stable and greppable.
 var (
@@ -30,6 +35,7 @@ var (
 // printGroups renders the discovered backup groups with their last-backup ages.
 func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
 	now := time.Now()
+	fmt.Println()
 	fmt.Println(spreadLine(styleTitle.Render("Discover"), styleDetail.Render(summaryCounts(bs))))
 	fmt.Println()
 
@@ -64,7 +70,7 @@ func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
 		fmt.Println(spreadLine(styleGroup.Render(name), styleDetail.Render(lastBackup)))
 
 		for _, v := range group.Volumes {
-			fmt.Printf("  %s  %s  %s\n",
+			fmt.Printf(edgePad+"  %s  %s  %s\n",
 				styleKind.Render(fmt.Sprintf("%-8s", "volume")),
 				styleName.Render(fmt.Sprintf("%-*s", nameWidth, v.Name)),
 				styleDetail.Render(v.HostPath),
@@ -80,7 +86,7 @@ func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
 			case db.Mode == "exec":
 				detail = "container=" + db.Container + " (exec)"
 			}
-			fmt.Printf("  %s  %s  %s\n",
+			fmt.Printf(edgePad+"  %s  %s  %s\n",
 				styleKind.Render(fmt.Sprintf("%-8s", "database")),
 				styleName.Render(fmt.Sprintf("%-*s", nameWidth, db.Type+"/"+db.Name)),
 				styleDetail.Render(detail),
@@ -106,11 +112,11 @@ func summaryCounts(bs *models.BackupState) string {
 func spreadLine(left, right string) string {
 	gap := 2
 	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
-		if g := width - lipgloss.Width(left) - lipgloss.Width(right); g > gap {
+		if g := width - 2*hPad - lipgloss.Width(left) - lipgloss.Width(right); g > gap {
 			gap = g
 		}
 	}
-	return left + strings.Repeat(" ", gap) + right
+	return edgePad + left + strings.Repeat(" ", gap) + right
 }
 
 // humanTime renders a short age for the recent past, an absolute date beyond a day.
@@ -135,6 +141,7 @@ func plural(n int, noun string) string {
 // when the next run is due, with the soonest next-run in the header blob.
 func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time.Duration) {
 	now := time.Now()
+	fmt.Println()
 
 	type row struct{ name, last, result, next string }
 	rows := make([]row, 0, len(bs.Groups))
@@ -223,15 +230,15 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 	for _, r := range rows {
 		tbl.Row(r.name, r.last, r.result, r.next)
 	}
-	fmt.Println(lipgloss.NewStyle().MarginLeft(2).Render(tbl.Render()))
+	fmt.Println(lipgloss.NewStyle().MarginLeft(hPad).Render(tbl.Render()))
 }
 
 // placeRight right-aligns a styled string on a TTY, plain-left when piped.
 func placeRight(s string) string {
-	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
-		return lipgloss.PlaceHorizontal(width, lipgloss.Right, s)
+	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 2*hPad {
+		return edgePad + lipgloss.PlaceHorizontal(width-2*hPad, lipgloss.Right, s)
 	}
-	return s
+	return edgePad + s
 }
 
 // shortDuration renders a duration compactly: 45s, 26m, 3h12m, 2d4h.
