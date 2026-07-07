@@ -143,7 +143,7 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 	now := time.Now()
 	fmt.Println()
 
-	type row struct{ name, last, result, next string }
+	type row struct{ name, last, result, files, size, next string }
 	rows := make([]row, 0, len(bs.Groups))
 	var soonest time.Duration = -1
 
@@ -159,7 +159,7 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 			continue
 		}
 
-		r := row{name: name, last: "never", result: "-", next: "due now"}
+		r := row{name: name, last: "never", result: "-", files: "-", size: "-", next: "due now"}
 		var wait time.Duration // 0 = due now
 
 		rec, ok := store.Record(name)
@@ -175,6 +175,13 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 				r.result = fmt.Sprintf("ok (%s)", detail)
 			} else if o.ExitCode != 0 {
 				r.result = fmt.Sprintf("%s (exit %d)", o.Result, o.ExitCode)
+			}
+			if o.Files > 0 || o.OriginalBytes > 0 {
+				r.files = fmt.Sprintf("%d", o.Files)
+				r.size = humanBytes(o.OriginalBytes)
+				if o.DeduplicatedBytes > 0 {
+					r.size += fmt.Sprintf(" (+%s)", humanBytes(o.DeduplicatedBytes))
+				}
 			}
 		}
 		switch {
@@ -221,14 +228,14 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 				if r.result != "-" {
 					return base.Inherit(styleBad)
 				}
-			case col == 3:
+			case col == 5:
 				return base.Inherit(styleDetail)
 			}
 			return base
 		}).
-		Headers("group", "last run", "result", "next run")
+		Headers("group", "last run", "result", "files", "size", "next run")
 	for _, r := range rows {
-		tbl.Row(r.name, r.last, r.result, r.next)
+		tbl.Row(r.name, r.last, r.result, r.files, r.size, r.next)
 	}
 	fmt.Println(lipgloss.NewStyle().MarginLeft(hPad).Render(tbl.Render()))
 }
@@ -239,6 +246,20 @@ func placeRight(s string) string {
 		return edgePad + lipgloss.PlaceHorizontal(width-2*hPad, lipgloss.Right, s)
 	}
 	return edgePad + s
+}
+
+// humanBytes renders a byte count in decimal units, like borg's output.
+func humanBytes(n int64) string {
+	const unit = 1000
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "kMGT"[exp])
 }
 
 // shortDuration renders a duration compactly: 45s, 26m, 3h12m, 2d4h.

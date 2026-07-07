@@ -20,6 +20,12 @@ type RunOutcome struct {
 	DurationSeconds int64     `json:"duration_seconds"`
 	// Archive is the archive name borg reported creating, when observed.
 	Archive string `json:"archive,omitempty"`
+	// Create stats from borgmatic's create --json result (zero when the
+	// run had no create action or no result was parsed).
+	Files             int64 `json:"files,omitempty"`
+	OriginalBytes     int64 `json:"original_bytes,omitempty"`
+	CompressedBytes   int64 `json:"compressed_bytes,omitempty"`
+	DeduplicatedBytes int64 `json:"deduplicated_bytes,omitempty"`
 }
 
 // GroupRecord is one group's persisted schedule state.

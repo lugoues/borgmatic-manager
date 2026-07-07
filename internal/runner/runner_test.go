@@ -110,7 +110,7 @@ func TestTryRunGroup_Success(t *testing.T) {
 	assert.Contains(t, run, "--config "+filepath.Join(r.configDir, "mygroup.yaml"))
 	assert.Contains(t, run, "--verbosity 1")
 	assert.Contains(t, run, "--log-json")
-	assert.Contains(t, run, "create prune compact check", "default actions apply retention, not just create")
+	assert.Contains(t, run, "create --json prune compact check", "default actions apply retention, not just create, and --json binds to create")
 }
 
 func TestTryRunGroup_CustomActions(t *testing.T) {
@@ -123,7 +123,7 @@ func TestTryRunGroup_CustomActions(t *testing.T) {
 	require.NoError(t, err)
 
 	run := strings.Join(fake.callArgs()[1], " ")
-	assert.True(t, strings.HasSuffix(run, "--log-json create"), "custom actions replace defaults: %s", run)
+	assert.True(t, strings.HasSuffix(run, "--log-json create --json"), "custom actions replace defaults: %s", run)
 }
 
 func TestTryRunGroup_ValidationGate(t *testing.T) {
@@ -428,7 +428,10 @@ func (r *recordingStore) RecordRun(group string, outcome state.RunOutcome) {
 
 func TestTryRunGroup_RecordsOutcome(t *testing.T) {
 	fake := newFakeExecutor()
-	fake.runScript = `echo '{"levelname":"INFO","message":"Creating archive at \"/repo::files-2026-07-07\"","name":"borg"}'; echo '{"levelname":"WARNING","message":"w","name":"borg"}' >&2; exit 0`
+	// The create --json result arrives on stdout concatenated with a log
+	// record on the same line (observed borgmatic behavior), parsing
+	// must not depend on line boundaries.
+	fake.runScript = `echo '{"levelname":"INFO","message":"Creating archive at \"/repo::files-old-name\"","name":"borg"}[{"archive":{"name":"files-2026-07-07","stats":{"nfiles":42,"original_size":1218,"compressed_size":1203,"deduplicated_size":97}}}]'; echo '{"levelname":"WARNING","message":"w","name":"borg"}' >&2; exit 0`
 	r := newTestRunner(t, fake, nil)
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
@@ -442,9 +445,24 @@ func TestTryRunGroup_RecordsOutcome(t *testing.T) {
 	o, ok := rec.outcomes["files"]
 	require.True(t, ok, "a completed run must record an outcome")
 	assert.Equal(t, "ok", o.Result)
-	assert.Equal(t, "files-2026-07-07", o.Archive, "archive name captured from borg's log line")
+	assert.Equal(t, "files-2026-07-07", o.Archive, "result archive name wins over the log-line capture")
 	assert.Equal(t, int64(1), o.Warnings)
+	assert.Equal(t, int64(42), o.Files)
+	assert.Equal(t, int64(1218), o.OriginalBytes)
+	assert.Equal(t, int64(97), o.DeduplicatedBytes)
 	assert.False(t, o.Finished.IsZero())
+}
+
+func TestTryRunGroup_JSONBoundToCreateOnly(t *testing.T) {
+	fake := newFakeExecutor()
+	r := newTestRunner(t, fake, nil)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.NoError(t, err)
+
+	run := strings.Join(fake.callArgs()[1], " ")
+	assert.Contains(t, run, "create --json prune", "--json must bind to the create action")
+	assert.Equal(t, 1, strings.Count(run, "--json"), "other actions must not get --json")
 }
 
 func TestTryRunGroup_RecordsFailureOutcome(t *testing.T) {

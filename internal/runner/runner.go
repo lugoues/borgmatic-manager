@@ -20,7 +20,11 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
-var defaultActions = []string{"create", "prune", "compact", "check"}
+// actionCreate is the borgmatic action that produces a --json result.
+// defaultActions include prune/compact/check: create alone would never prune.
+const actionCreate = "create"
+
+var defaultActions = []string{actionCreate, "prune", "compact", "check"}
 
 // defaultKillGrace is the SIGTERM-to-SIGKILL grace after a run timeout fires.
 const defaultKillGrace = 60 * time.Second
@@ -149,7 +153,14 @@ func (r *Runner) runGroup(ctx context.Context, groupName string) error {
 		return err
 	}
 
-	args := append([]string{"--config", configPath, "--verbosity", "1", "--log-json"}, r.actions...)
+	// create --json puts a machine-readable result on stdout without disturbing --log-json.
+	args := []string{"--config", configPath, "--verbosity", "1", "--log-json"}
+	for _, action := range r.actions {
+		args = append(args, action)
+		if action == actionCreate {
+			args = append(args, "--json")
+		}
+	}
 	cmd := r.execCommand(ctx, r.borgmaticPath, args...)
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -246,14 +257,22 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 		if r.recorder == nil {
 			return
 		}
-		r.recorder.RecordRun(groupName, state.RunOutcome{
+		outcome := state.RunOutcome{
 			Finished:        time.Now(),
 			Result:          result,
 			ExitCode:        exitCode,
 			Warnings:        warnings,
 			DurationSeconds: int64(duration.Seconds()),
 			Archive:         run.archiveName(),
-		})
+		}
+		if res := run.parseCreateResult(); res != nil {
+			outcome.Archive = res.Archive.Name
+			outcome.Files = res.Archive.Stats.NFiles
+			outcome.OriginalBytes = res.Archive.Stats.OriginalSize
+			outcome.CompressedBytes = res.Archive.Stats.CompressedSize
+			outcome.DeduplicatedBytes = res.Archive.Stats.DeduplicatedSize
+		}
+		r.recorder.RecordRun(groupName, outcome)
 	}
 
 	switch exitCode {
@@ -291,10 +310,57 @@ type runState struct {
 	warnings    atomic.Int64
 	repoMissing atomic.Bool
 
-	// archive holds the archive name borg reported creating; guarded
-	// because stdout and stderr consumers run concurrently.
+	// archive is the archive name borg reported; resultBuf accumulates non-log
+	// stdout (the create --json result). Both guarded.
 	archiveMu sync.Mutex
 	archive   string
+	resultBuf strings.Builder
+}
+
+// maxResultBuf bounds buffered non-log stdout; the create --json result is small.
+const maxResultBuf = 1 << 20
+
+func (rs *runState) bufferResult(line string) {
+	rs.archiveMu.Lock()
+	defer rs.archiveMu.Unlock()
+	if rs.resultBuf.Len()+len(line) <= maxResultBuf {
+		rs.resultBuf.WriteString(line)
+		rs.resultBuf.WriteByte('\n')
+	}
+}
+
+// createResult mirrors one repository entry of create --json output; the first
+// entry is representative across repositories.
+type createResult struct {
+	Archive struct {
+		Name  string `json:"name"`
+		Stats struct {
+			NFiles           int64 `json:"nfiles"`
+			OriginalSize     int64 `json:"original_size"`
+			CompressedSize   int64 `json:"compressed_size"`
+			DeduplicatedSize int64 `json:"deduplicated_size"`
+		} `json:"stats"`
+	} `json:"archive"`
+}
+
+// parseCreateResult stream-decodes buffered stdout (the result can arrive
+// concatenated with log records) and returns the first create result.
+func (rs *runState) parseCreateResult() *createResult {
+	rs.archiveMu.Lock()
+	raw := rs.resultBuf.String()
+	rs.archiveMu.Unlock()
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	for {
+		var doc json.RawMessage
+		if err := dec.Decode(&doc); err != nil {
+			return nil
+		}
+		var results []createResult
+		if err := json.Unmarshal(doc, &results); err == nil && len(results) > 0 && results[0].Archive.Name != "" {
+			return &results[0]
+		}
+	}
 }
 
 func (rs *runState) setArchive(name string) {
@@ -362,6 +428,11 @@ func (rs *runState) emit(line, stream string) {
 	if stream == "stderr" {
 		rs.warnings.Add(1)
 		rs.logger.Warn(line, "group", rs.group, "stream", stream)
+		return
+	}
+	// Non-log JSON on stdout is the create --json result: buffer it, don't echo to the journal.
+	if strings.HasPrefix(line, "{") || strings.HasPrefix(line, "[") {
+		rs.bufferResult(line)
 		return
 	}
 	rs.logger.Info(line, "group", rs.group, "stream", stream)
