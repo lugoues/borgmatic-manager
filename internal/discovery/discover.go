@@ -130,8 +130,8 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 			databases: spec.databases(c.Name, logger),
 			config:    spec.Config,
 		}
-		if spec.Volumes != nil {
-			intent.volumesFilter = *spec.Volumes
+		if len(spec.Volumes) > 0 {
+			intent.volumesFilter = spec.Volumes
 			intent.hasVolumesFilter = true
 		}
 		return intent, true, nil

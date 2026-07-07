@@ -19,9 +19,8 @@ type ContainerSpec struct {
 	Group string `json:"group"`
 	// Enable opts the container's named volumes into raw file backup.
 	Enable bool `json:"enable"`
-	// Volumes filters which volumes back up (names or in-container mount
-	// paths). Absent means all named volumes.
-	Volumes *[]string `json:"volumes"`
+	// Volumes filters backed-up volumes; absent or empty both mean all named volumes.
+	Volumes []string `json:"volumes"`
 	// Databases mirrors the db.{n}.* labels; the JSON field is "db".
 	Databases []SpecDatabase `json:"db"`
 	// Config is a borgmatic config fragment for the group, mirroring config.* labels.

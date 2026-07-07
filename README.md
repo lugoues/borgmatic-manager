@@ -113,7 +113,7 @@ immutable after creation, which made them a trap).
 |-------|-------------|
 | `borgmatic-manager.group` | Backup group. Required for a container to participate at all; containers sharing a group back up together. |
 | `borgmatic-manager.enable` | `"true"` to back up this container's named volumes. |
-| `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Default: all named volumes (anonymous volumes excluded). |
+| `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Omitted or empty: all named volumes (anonymous volumes excluded). |
 | `borgmatic-manager.db.{n}.*` | Database dump definitions (below). |
 | `borgmatic-manager.config.<option>` | Any borgmatic option for this group (below). |
 | `borgmatic-manager.spec` | The whole configuration as one JSON blob (below) — alternative to all of the above. |
@@ -218,7 +218,7 @@ labels:
 ```
 
 Fields mirror the flat labels exactly: `group` (required), `enable`,
-`volumes` (filter; omit for all named volumes), `db` (a list with the same
+`volumes` (filter; omit or leave empty for all named volumes), `db` (a list with the same
 fields as `db.{n}.*`), `config` (same as `config.*`, arbitrarily nested).
 
 The value is strict JSON. In quadlet `Label=` lines, wrap the whole

@@ -704,3 +704,36 @@ func TestDiscoverCollectsAllSpecErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "broken-one", "every broken spec is reported so one pass fixes them all")
 	assert.Contains(t, err.Error(), "broken-two")
 }
+
+func TestDiscoverEmptyVolumesFilterMeansAll(t *testing.T) {
+	stubProbes(t)
+	// Template-generated specs emit every field; "volumes": [] must behave
+	// like an absent filter, not one that matches nothing.
+	spec := `{"group": "myapp", "enable": true, "volumes": [], "db": [], "config": {}}`
+	c := runtime.ContainerInfo{
+		ID:     "id-web",
+		Name:   "web",
+		Labels: map[string]string{"borgmatic-manager.spec": spec},
+		Mounts: []runtime.VolumeMount{mountFixture("app-data", "/data")},
+	}
+
+	rt := mockLists([]runtime.VolumeInfo{volumeFixture("app-data")}, []runtime.ContainerInfo{c})
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+
+	require.Contains(t, state.Groups, "myapp")
+	assert.Len(t, state.Groups["myapp"].Volumes, 1, "empty volumes filter must mean all named volumes")
+}
+
+func TestDiscoverEmptyVolumesLabelMeansAll(t *testing.T) {
+	stubProbes(t)
+	c := backupContainer("web", "myapp", mountFixture("app-data", "/data"))
+	c.Labels["borgmatic-manager.volumes"] = "  " // set but empty
+
+	rt := mockLists([]runtime.VolumeInfo{volumeFixture("app-data")}, []runtime.ContainerInfo{c})
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+	assert.Len(t, state.Groups["myapp"].Volumes, 1, "an empty flat volumes label must mean all named volumes")
+}

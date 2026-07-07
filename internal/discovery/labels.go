@@ -38,9 +38,8 @@ func IsEnabled(labels map[string]string) bool {
 	return labels[labelEnable] == "true"
 }
 
-// VolumesFilter returns the parsed borgmatic-manager.volumes label (a
-// comma-separated list of volume names or in-container mount destinations)
-// and whether the label is present. Absent means "all named volumes".
+// VolumesFilter parses the comma-separated volumes label. Absent or empty both
+// mean all named volumes: an empty filter matching nothing would shrink the set.
 func VolumesFilter(labels map[string]string) ([]string, bool) {
 	raw, ok := labels[labelVolumes]
 	if !ok {
@@ -52,7 +51,7 @@ func VolumesFilter(labels map[string]string) ([]string, bool) {
 			out = append(out, trimmed)
 		}
 	}
-	return out, true
+	return out, len(out) > 0
 }
 
 // GetGroup returns the borgmatic-manager.group label value, or empty string if absent.
