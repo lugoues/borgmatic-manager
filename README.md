@@ -204,8 +204,16 @@ labels:
 
 Fields mirror the flat labels exactly: `group` (required), `backup`,
 `volumes` (filter; omit for all named volumes), `databases` (same fields as
-`db.{n}.*`), `config` (same as `config.*`, arbitrarily nested). Parsing is
-strict — an unknown or misspelled field rejects the whole spec with a
+`db.{n}.*`), `config` (same as `config.*`, arbitrarily nested).
+
+Quoting-averse contexts like quadlet `Label=` lines can use unquoted YAML
+flow instead of JSON — a space after each colon is required:
+
+```
+Label=borgmatic-manager.spec={group: myapp, backup: true, volumes: [app-data]}
+```
+
+Parsing is strict — an unknown or misspelled field rejects the whole spec with a
 warning rather than silently dropping it, and database entries get the same
 per-type validation as flat labels. If `spec` is present, any other
 `borgmatic-manager.*` labels on that container are ignored (with a warning

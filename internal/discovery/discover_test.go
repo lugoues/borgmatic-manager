@@ -571,6 +571,7 @@ func TestDiscoverSpecInvalidJSONSkipsContainer(t *testing.T) {
 
 	assert.Empty(t, state.Groups, "an invalid spec must not half-apply")
 	assert.Contains(t, buf.String(), "invalid borgmatic-manager.spec")
+	assert.Contains(t, buf.String(), "YAML flow", "the warning must teach the accepted syntaxes")
 }
 
 func TestDiscoverSpecUnknownFieldRejected(t *testing.T) {
@@ -631,4 +632,28 @@ func TestDiscoverSpecDatabaseValidationShared(t *testing.T) {
 	require.Len(t, dbs, 1)
 	assert.Empty(t, dbs[0].Mode, "exec falls back to helper for mariadb")
 	assert.Contains(t, buf.String(), "exec mode is only supported for postgresql")
+}
+
+func TestDiscoverSpecAcceptsYAMLFlowWithoutQuotes(t *testing.T) {
+	stubProbes(t)
+	// Quadlet Label= lines make JSON quoting painful; unquoted YAML flow
+	// (spaces after colons) must work. This is a real user label, corrected.
+	c := runtime.ContainerInfo{
+		ID:   "id-ha-pg",
+		Name: "systemd-home-assistant-postgresql",
+		Labels: map[string]string{
+			"borgmatic-manager.spec": "{group: home-assistant, backup: true, volumes: [systemd-home-assistant-postgresql]}",
+		},
+		Mounts: []runtime.VolumeMount{mountFixture("systemd-home-assistant-postgresql", "/var/lib/postgresql/data")},
+	}
+
+	rt := mockLists([]runtime.VolumeInfo{volumeFixture("systemd-home-assistant-postgresql")}, []runtime.ContainerInfo{c})
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+
+	require.Contains(t, state.Groups, "home-assistant")
+	vols := state.Groups["home-assistant"].Volumes
+	require.Len(t, vols, 1)
+	assert.Equal(t, "systemd-home-assistant-postgresql", vols[0].Name)
 }

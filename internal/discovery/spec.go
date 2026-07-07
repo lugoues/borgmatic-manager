@@ -67,7 +67,8 @@ func ParseSpecLabel(labels map[string]string, containerName string, logger *slog
 	var spec ContainerSpec
 	if err := dec.Decode(&spec); err != nil {
 		logger.Warn("invalid borgmatic-manager.spec label; container skipped",
-			"container", containerName, "error", err)
+			"container", containerName, "error", err,
+			"hint", `write JSON ({"group": "x", "backup": true}) or YAML flow ({group: x, backup: true}, a space after each colon is required); fields: group, backup, volumes, databases, config`)
 		return nil, true
 	}
 
