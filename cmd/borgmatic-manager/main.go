@@ -96,8 +96,7 @@ func runStatus(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("parsing manager.period: %w", err)
 	}
-	store := state.LoadSchedule(e.stateDir, logger)
-	printStatus(backupState, store, period)
+	printStatus(backupState, stateStore(e, logger), period)
 	return nil
 }
 
@@ -259,8 +258,13 @@ func runDiscover() error {
 		return fmt.Errorf("no backup groups discovered, check your labels (warnings above, if any, explain near-misses)")
 	}
 
-	printGroups(state)
+	printGroups(state, stateStore(e, logger))
 	return nil
+}
+
+// stateStore loads the persisted schedule for one-shot display commands.
+func stateStore(e *env, logger *slog.Logger) *state.ScheduleStore {
+	return state.LoadSchedule(e.stateDir, logger)
 }
 
 func runGenerate(output string) error {

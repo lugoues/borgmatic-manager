@@ -24,16 +24,17 @@ var (
 	styleName   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	styleDetail = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleBad    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("5")).Padding(0, 1)
 )
 
-// printGroups renders the discovered backup groups, headed by a dim summary
-// aligned to the terminal's right edge (plain and left-aligned when piped).
-func printGroups(state *models.BackupState) {
-	fmt.Println(summaryLine(state))
+// printGroups renders the discovered backup groups with their last-backup ages.
+func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
+	now := time.Now()
+	fmt.Println(spreadLine(styleTitle.Render("Discover"), styleDetail.Render(summaryCounts(bs))))
 	fmt.Println()
 
-	names := make([]string, 0, len(state.Groups))
-	for name := range state.Groups {
+	names := make([]string, 0, len(bs.Groups))
+	for name := range bs.Groups {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -41,7 +42,7 @@ func printGroups(state *models.BackupState) {
 	// One name-column width across all groups. Pad before styling: ANSI codes
 	// would throw off printf width math.
 	nameWidth := 0
-	for _, group := range state.Groups {
+	for _, group := range bs.Groups {
 		for _, v := range group.Volumes {
 			nameWidth = max(nameWidth, len(v.Name))
 		}
@@ -54,8 +55,13 @@ func printGroups(state *models.BackupState) {
 		if i > 0 {
 			fmt.Println()
 		}
-		group := state.Groups[name]
-		fmt.Println(styleGroup.Render("group " + name))
+		group := bs.Groups[name]
+
+		lastBackup := "no backups yet"
+		if rec, ok := store.Record(name); ok && !rec.LastSuccess.IsZero() {
+			lastBackup = "last backup " + humanTime(rec.LastSuccess, now)
+		}
+		fmt.Println(spreadLine(styleGroup.Render(name), styleDetail.Render(lastBackup)))
 
 		for _, v := range group.Volumes {
 			fmt.Printf("  %s  %s  %s\n",
@@ -83,17 +89,39 @@ func printGroups(state *models.BackupState) {
 	}
 }
 
-// summaryLine renders "N groups · N volumes · N databases", right-aligned
-// on a TTY.
-func summaryLine(state *models.BackupState) string {
-	groups, volumes, databases := len(state.Groups), 0, 0
-	for _, g := range state.Groups {
+// summaryCounts renders "N groups · N volumes · N databases".
+func summaryCounts(bs *models.BackupState) string {
+	groups, volumes, databases := len(bs.Groups), 0, 0
+	for _, g := range bs.Groups {
 		volumes += len(g.Volumes)
 		databases += len(g.Databases)
 	}
 
-	return placeRight(styleDetail.Render(fmt.Sprintf("%s · %s · %s",
-		plural(groups, "group"), plural(volumes, "volume"), plural(databases, "database"))))
+	return fmt.Sprintf("%s · %s · %s",
+		plural(groups, "group"), plural(volumes, "volume"), plural(databases, "database"))
+}
+
+// spreadLine joins a left and right fragment on one line, pushing the right one
+// to the terminal's right edge (two spaces apart when the width is unknown).
+func spreadLine(left, right string) string {
+	gap := 2
+	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
+		if g := width - lipgloss.Width(left) - lipgloss.Width(right); g > gap {
+			gap = g
+		}
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// humanTime renders a short age for the recent past, an absolute date beyond a day.
+func humanTime(t, now time.Time) string {
+	if d := now.Sub(t); d >= 0 && d < 24*time.Hour {
+		if d < time.Minute {
+			return "just now"
+		}
+		return shortDuration(d) + " ago"
+	}
+	return t.Local().Format("Jan 2 2006 @ 15:04")
 }
 
 func plural(n int, noun string) string {

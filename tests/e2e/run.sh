@@ -186,7 +186,7 @@ MARIA_MARKER=$(compose exec -T mariadb mariadb -uroot -pe2esecret e2edb -N -B -e
 
 log "discover and generate one-shots"
 DISCOVER_OUT=$(manager discover)
-for expected in "group files" "group db" "e2e-data-a"; do
+for expected in "^files" "^db" "e2e-data-a"; do
   echo "$DISCOVER_OUT" | grep -q "$expected" || fail "discover output missing '$expected': $DISCOVER_OUT"
 done
 manager generate --output "$WORK/generate-out" >/dev/null
