@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/lipgloss/table"
 	"golang.org/x/term"
 
 	"github.com/lugoues/borgmatic-manager/internal/models"
@@ -21,6 +23,7 @@ var (
 	styleKind   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleName   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	styleDetail = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleBad    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
 
 // printGroups renders the discovered backup groups, headed by a dim summary
@@ -165,24 +168,34 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 	fmt.Println(placeRight(styleDetail.Render(header)))
 	fmt.Println()
 
-	nameW, lastW, resultW := len("group"), len("last run"), len("result")
+	tbl := table.New().
+		BorderTop(false).BorderBottom(false).BorderLeft(false).BorderRight(false).
+		BorderColumn(false).BorderHeader(false).BorderRow(false).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			base := lipgloss.NewStyle().PaddingRight(2)
+			switch {
+			case row == table.HeaderRow:
+				return base.Inherit(styleKind)
+			case col == 0:
+				return base.Inherit(styleName)
+			case col == 2:
+				r := rows[row]
+				if strings.HasPrefix(r.result, "ok") {
+					return base.Inherit(styleName)
+				}
+				if r.result != "-" {
+					return base.Inherit(styleBad)
+				}
+			case col == 3:
+				return base.Inherit(styleDetail)
+			}
+			return base
+		}).
+		Headers("group", "last run", "result", "next run")
 	for _, r := range rows {
-		nameW, lastW, resultW = max(nameW, len(r.name)), max(lastW, len(r.last)), max(resultW, len(r.result))
+		tbl.Row(r.name, r.last, r.result, r.next)
 	}
-	fmt.Printf("  %s  %s  %s  %s\n",
-		styleKind.Render(fmt.Sprintf("%-*s", nameW, "group")),
-		styleKind.Render(fmt.Sprintf("%-*s", lastW, "last run")),
-		styleKind.Render(fmt.Sprintf("%-*s", resultW, "result")),
-		styleKind.Render("next run"),
-	)
-	for _, r := range rows {
-		fmt.Printf("  %s  %s  %s  %s\n",
-			styleName.Render(fmt.Sprintf("%-*s", nameW, r.name)),
-			fmt.Sprintf("%-*s", lastW, r.last),
-			fmt.Sprintf("%-*s", resultW, r.result),
-			styleDetail.Render(r.next),
-		)
-	}
+	fmt.Println(lipgloss.NewStyle().MarginLeft(2).Render(tbl.Render()))
 }
 
 // placeRight right-aligns a styled string on a TTY, plain-left when piped.
