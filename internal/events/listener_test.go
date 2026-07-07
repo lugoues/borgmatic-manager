@@ -223,3 +223,33 @@ func TestListener_PendingDebounceFiresOnDisconnect(t *testing.T) {
 		t.Fatal("expected trigger on disconnect with pending debounce, got timeout")
 	}
 }
+
+func TestListener_ReconnectTriggersRediscovery(t *testing.T) {
+	m := &runtime.MockRuntime{}
+	// First stream dies immediately (error channel closes); the second
+	// stays silent. The reconnect alone must fire one trigger: events
+	// during the gap were unobservable.
+	_, errCh1 := setupMockStream(m)
+	setupMockStream(m)
+
+	l := &Listener{
+		rt:               m,
+		logger:           slog.Default(),
+		debounceDuration: testDebounce,
+		backoffDuration:  10 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	triggerCh := l.Listen(ctx)
+	close(errCh1)
+
+	select {
+	case _, ok := <-triggerCh:
+		assert.True(t, ok, "expected a live trigger, not channel close")
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected an unconditional trigger after reconnect")
+	}
+
+	m.AssertExpectations(t)
+}

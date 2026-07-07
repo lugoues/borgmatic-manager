@@ -282,6 +282,14 @@ func (rs *runState) consume(stream io.Reader, name string) {
 		}
 		rs.emit(line, name)
 	}
+	if err := scanner.Err(); err != nil {
+		// Keep draining to EOF on scanner errors: a full pipe would block
+		// borgmatic, which would hold its repo locks forever.
+		rs.warnings.Add(1)
+		rs.logger.Warn("borgmatic output overflowed the line scanner; draining remaining output unparsed",
+			"group", rs.group, "stream", name, "error", err)
+		_, _ = io.Copy(io.Discard, stream)
+	}
 }
 
 func (rs *runState) emit(line, stream string) {

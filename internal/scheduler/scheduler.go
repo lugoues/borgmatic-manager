@@ -142,6 +142,13 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 			s.logger.Debug("skipping group with no volumes or databases", "group", name)
 			continue
 		}
+
+		// Refused by generation (no config, no lock keys): skip it and prune its schedule record.
+		m, ok := meta[name]
+		if !ok {
+			s.logger.Debug("skipping group without a generated config", "group", name)
+			continue
+		}
 		live[name] = struct{}{}
 
 		fingerprint := groupFingerprint(group)
@@ -171,7 +178,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 			if s.store != nil {
 				s.store.MarkSuccess(groupName, fingerprint, now)
 			}
-		}(name, fingerprint, meta[name])
+		}(name, fingerprint, m)
 	}
 
 	if s.store != nil {

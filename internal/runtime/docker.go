@@ -79,23 +79,6 @@ func firstSocket(candidates []string) string {
 	return ""
 }
 
-// Rootless reports whether the engine runs rootless. It checks the engine's
-// reported security options, falling back to a socket-path heuristic when the
-// info call fails. Rootless engines use userspace networking, which breaks
-// container-IP database connections.
-func (d *DockerRuntime) Rootless(ctx context.Context) bool {
-	info, err := d.client.Info(ctx)
-	if err == nil {
-		for _, opt := range info.SecurityOptions {
-			if strings.Contains(opt, "rootless") {
-				return true
-			}
-		}
-		return false
-	}
-	return strings.Contains(d.socketPath, "/run/user/")
-}
-
 // ListVolumes returns all volumes. Filtering is client-side so near-miss labels
 // warn and unlabeled volumes stay referenceable (sqlite).
 func (d *DockerRuntime) ListVolumes(ctx context.Context) ([]VolumeInfo, error) {

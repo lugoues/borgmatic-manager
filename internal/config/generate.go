@@ -307,6 +307,7 @@ func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseCo
 		switch {
 		case db.Type == dbTypeSQLite:
 			entry["path"] = db.Path
+			g.warnIfMissing(groupName, db.Type, engineClients[db.Type]...)
 
 		case db.Hostname != "":
 			entry["hostname"] = db.Hostname

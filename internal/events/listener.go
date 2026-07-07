@@ -53,12 +53,23 @@ func (l *Listener) Listen(ctx context.Context) <-chan struct{} {
 // reconnectLoop repeatedly connects to the event stream and processes events.
 // On disconnect or error it waits backoffDuration before reconnecting.
 func (l *Listener) reconnectLoop(ctx context.Context, triggerCh chan struct{}) {
+	reconnected := false
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
 		eventCh, errCh := l.rt.EventStream(ctx)
+		if reconnected {
+			// Events during the disconnect were unobservable; one unconditional
+			// trigger closes the gap.
+			l.logger.Info("event stream reconnected; triggering re-discovery to cover the gap")
+			select {
+			case triggerCh <- struct{}{}:
+			default:
+			}
+		}
+		reconnected = true
 		l.processStream(ctx, eventCh, errCh, triggerCh)
 
 		// If context is done, exit without backoff.

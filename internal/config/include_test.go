@@ -217,3 +217,17 @@ func TestConfDMissingIsFine(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "1h", cfg.Manager.Period)
 }
+
+func TestYmlExtensionAccepted(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"manager.yaml":    "manager:\n    period: \"1h\"\nborgmatic:\n    keep_daily: 7\n",
+		"conf.d/10-x.yml": "borgmatic:\n    keep_daily: 14\n",
+		"groups/app.yml":  "keep_monthly: 6\n",
+	})
+
+	cfg, overrides, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+	require.NoError(t, err)
+	assert.Equal(t, 14, cfg.Borgmatic["keep_daily"], ".yml drop-ins must load")
+	require.Contains(t, overrides, "app", ".yml group files must load")
+	assert.Equal(t, 6, overrides["app"]["keep_monthly"])
+}

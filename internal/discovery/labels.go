@@ -243,10 +243,19 @@ func setDBField(cfg *models.DatabaseConfig, field, value string, logger *slog.Lo
 func ParseConfigLabels(labels map[string]string, logger *slog.Logger) map[string]interface{} {
 	var result map[string]interface{}
 
-	for key, value := range labels {
-		if !strings.HasPrefix(key, configPrefix) {
-			continue
+	// Sorted iteration: with conflicting paths (config.a and config.a.b)
+	// the outcome must not depend on map order, sorting makes the
+	// deeper path win consistently, and the conflict is warned below.
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		if strings.HasPrefix(key, configPrefix) {
+			keys = append(keys, key)
 		}
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		value := labels[key]
 		path := strings.TrimPrefix(key, configPrefix)
 		if path == "" {
 			logger.Warn("malformed config label: empty option path", "label", key)
@@ -271,6 +280,10 @@ func ParseConfigLabels(labels map[string]string, logger *slog.Logger) map[string
 			}
 			child, ok := node[part].(map[string]interface{})
 			if !ok {
+				if _, conflict := node[part]; conflict {
+					logger.Warn("conflicting config labels: a nested option overrides a value set by a shorter label path",
+						"label", key, "overridden_path", strings.Join(parts[:i+1], "."))
+				}
 				child = make(map[string]interface{})
 				node[part] = child
 			}

@@ -30,6 +30,10 @@ type ManagerSettings struct {
 	// RunTimeout bounds a single group's borgmatic run (Go duration format).
 	// Empty or "0" means no timeout.
 	RunTimeout string `yaml:"run_timeout"`
+	// ContainerCLI overrides the CLI used in generated database dump
+	// commands ("docker" or "podman"). Empty means derive it from the
+	// socket the manager is connected to, then PATH.
+	ContainerCLI string `yaml:"container_cli"`
 }
 
 // LoadConfig reads the manager config, deep-merges conf.d/*.yaml drop-ins
@@ -72,11 +76,11 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasSuffix(name, ".yaml") {
+		if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
 			continue
 		}
 
-		groupName := strings.TrimSuffix(name, ".yaml")
+		groupName := strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml")
 		groupPath := filepath.Join(groupsDir, name)
 
 		raw, err := loadYAMLWithIncludes(groupPath)
@@ -110,7 +114,7 @@ func mergeConfD(base map[string]interface{}, confDir string) (map[string]interfa
 
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".yaml") && !strings.HasSuffix(entry.Name(), ".yml")) {
 			continue
 		}
 		names = append(names, entry.Name())

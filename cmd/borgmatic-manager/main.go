@@ -157,7 +157,7 @@ func (e *env) newGenerator(outputDir string, logger *slog.Logger) *config.Genera
 	return config.NewGenerator(e.cfg, e.groupOverrides, outputDir, config.GeneratorOptions{
 		RuntimeDir:   e.runtimeDir,
 		StateDir:     e.stateDir,
-		ContainerCLI: detectContainerCLI(),
+		ContainerCLI: detectContainerCLI(e.cfg, e.rt.SocketPath()),
 	}, logger)
 }
 

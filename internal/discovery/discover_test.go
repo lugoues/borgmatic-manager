@@ -737,3 +737,18 @@ func TestDiscoverEmptyVolumesLabelMeansAll(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, state.Groups["myapp"].Volumes, 1, "an empty flat volumes label must mean all named volumes")
 }
+
+func TestParseConfigLabelsConflictIsDeterministic(t *testing.T) {
+	labels := map[string]string{
+		"borgmatic-manager.config.a":   "1",
+		"borgmatic-manager.config.a.b": "2",
+	}
+	// Conflicting paths must resolve the same way every cycle (map
+	// iteration order used to decide), with the deeper path winning.
+	for i := 0; i < 20; i++ {
+		got := discovery.ParseConfigLabels(labels, discardLogger())
+		a, ok := got["a"].(map[string]interface{})
+		require.True(t, ok, "nested option must win deterministically, got %#v", got["a"])
+		assert.Equal(t, 2, a["b"])
+	}
+}

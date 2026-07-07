@@ -4,6 +4,10 @@ manager:
   # How often to run backup cycles (Go duration format: 30m, 1h, 24h)
   period: "1h"
 
+  # CLI used in generated database dump commands. Default: derived from
+  # the container socket the manager is connected to (docker or podman).
+  #container_cli: podman
+
   # Path to the host borgmatic binary. Defaults to searching PATH, then
   # /root/.local/bin (where 'uv tool install' / pipx put it).
   # borgmatic_path: /root/.local/bin/borgmatic

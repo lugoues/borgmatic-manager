@@ -66,7 +66,7 @@ func TestRunAllGroups_Parallel(t *testing.T) {
 	state.AddVolume("group-b", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 	state.AddVolume("group-c", models.VolumeInfo{Name: "vol3", HostPath: "/mnt/vol3"})
 
-	s.RunAllGroups(context.Background(), state, nil)
+	s.RunAllGroups(context.Background(), state, metaFor(state))
 
 	calls := runner.getCalls()
 	expected := []string{"group-a", "group-b", "group-c"}
@@ -94,7 +94,7 @@ func TestRunAllGroups_SkipEmptyGroups(t *testing.T) {
 	// "empty-group" has no volumes (only databases or nothing)
 	state.Groups["empty-group"] = &models.VolumeGroup{}
 
-	s.RunAllGroups(context.Background(), state, nil)
+	s.RunAllGroups(context.Background(), state, metaFor(state))
 
 	calls := runner.getCalls()
 	if len(calls) != 1 {
@@ -120,7 +120,7 @@ func TestRunAllGroups_MutexSkip(t *testing.T) {
 	state.AddVolume("busy-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
 	state.AddVolume("free-group", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 
-	s.RunAllGroups(context.Background(), state, nil)
+	s.RunAllGroups(context.Background(), state, metaFor(state))
 
 	calls := runner.getCalls()
 	if len(calls) != 2 {
@@ -146,7 +146,7 @@ func TestRunAllGroups_ErrorContinues(t *testing.T) {
 	state.AddVolume("ok-group", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 
 	// Should not panic or abort; both groups should be attempted.
-	s.RunAllGroups(context.Background(), state, nil)
+	s.RunAllGroups(context.Background(), state, metaFor(state))
 
 	calls := runner.getCalls()
 	if len(calls) != 2 {
@@ -176,7 +176,7 @@ func TestRunCycle_DiscoverAndGenerate(t *testing.T) {
 	}
 	s.generateFunc = func(st *models.BackupState) (map[string]config.GroupRunMeta, error) {
 		generateCalled = true
-		return nil, nil
+		return metaFor(st), nil
 	}
 
 	err := s.RunCycle(context.Background())
@@ -278,21 +278,21 @@ func TestDueGating_RecentSuccessSkipsUntilPeriodElapses(t *testing.T) {
 	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
 
 	s := dueTestScheduler(runner, store, t0)
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 	if len(runner.getCalls()) != 1 {
 		t.Fatalf("first cycle must run the group, got %v", runner.getCalls())
 	}
 
 	// 10 minutes later (restart, event, early tick): not due, no run.
 	s.now = func() time.Time { return t0.Add(10 * time.Minute) }
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 	if len(runner.getCalls()) != 1 {
 		t.Fatalf("group ran again before its period elapsed: %v", runner.getCalls())
 	}
 
 	// Past the period: due again.
 	s.now = func() time.Time { return t0.Add(61 * time.Minute) }
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 	if len(runner.getCalls()) != 2 {
 		t.Fatalf("group must be due after its period, got %v", runner.getCalls())
 	}
@@ -305,12 +305,12 @@ func TestDueGating_SurvivesRestart(t *testing.T) {
 	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
 
 	s1 := dueTestScheduler(runner, state.LoadSchedule(dir, logger), t0)
-	s1.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s1.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 
 	// New store + new scheduler = daemon restart. Same membership, 10
 	// minutes later: the startup cycle must not re-run the group.
 	s2 := dueTestScheduler(runner, state.LoadSchedule(dir, logger), t0.Add(10*time.Minute))
-	s2.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s2.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 
 	if calls := runner.getCalls(); len(calls) != 1 {
 		t.Fatalf("restart must resume the schedule, not re-run backups: %v", calls)
@@ -323,14 +323,14 @@ func TestDueGating_MembershipChangeRunsImmediately(t *testing.T) {
 	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
 
 	s := dueTestScheduler(runner, store, t0)
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 
 	// A new volume joins the group 5 minutes later (new container started):
 	// the group must be due immediately, not after the period.
 	grown := singleGroupState()
 	grown.AddVolume("app", models.VolumeInfo{Name: "vol2", HostPath: "/mnt/vol2"})
 	s.now = func() time.Time { return t0.Add(5 * time.Minute) }
-	s.RunAllGroups(context.Background(), grown, nil)
+	s.RunAllGroups(context.Background(), grown, metaFor(grown))
 
 	if calls := runner.getCalls(); len(calls) != 2 {
 		t.Fatalf("membership change must trigger an immediate run: %v", calls)
@@ -344,9 +344,9 @@ func TestDueGating_FailureIsNotMarkedSuccess(t *testing.T) {
 	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
 
 	s := dueTestScheduler(runner, store, t0)
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 	s.now = func() time.Time { return t0.Add(1 * time.Minute) }
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 
 	if calls := runner.getCalls(); len(calls) != 2 {
 		t.Fatalf("a failed group must stay due: %v", calls)
@@ -366,7 +366,7 @@ func TestNextWake(t *testing.T) {
 	}
 
 	// After a success at t0, at t0+50m the next wake is the 10m remainder.
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 	s.now = func() time.Time { return t0.Add(50 * time.Minute) }
 	if got := s.NextWake(); got != 10*time.Minute {
 		t.Fatalf("expected 10m remainder wake, got %v", got)
@@ -385,16 +385,41 @@ func TestDueGating_VanishedGroupIsForgotten(t *testing.T) {
 	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
 
 	s := dueTestScheduler(runner, store, t0)
-	s.RunAllGroups(context.Background(), singleGroupState(), nil)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 
 	// Group disappears (container unlabeled): its record must not linger
 	// and pin NextWake to its stale due time.
 	s.now = func() time.Time { return t0.Add(2 * time.Hour) }
-	s.RunAllGroups(context.Background(), models.NewBackupState(), nil)
+	s.RunAllGroups(context.Background(), models.NewBackupState(), map[string]config.GroupRunMeta{})
 	if got := s.NextWake(); got != time.Hour {
 		t.Fatalf("vanished group must not distort next wake, got %v", got)
 	}
 	if _, ok := store.Record("app"); ok {
 		t.Fatal("vanished group record must be pruned")
+	}
+}
+
+// metaFor builds run metadata for every group in the state, as Generate
+// would for groups that pass its safety checks.
+func metaFor(bs *models.BackupState) map[string]config.GroupRunMeta {
+	m := make(map[string]config.GroupRunMeta, len(bs.Groups))
+	for name := range bs.Groups {
+		m[name] = config.GroupRunMeta{}
+	}
+	return m
+}
+
+func TestRunAllGroups_SkipsGroupsAbsentFromMeta(t *testing.T) {
+	runner := newMockGroupRunner()
+	cfg := &config.ManagerConfig{Manager: config.ManagerSettings{Period: "1h"}}
+	s := NewScheduler(runner, nil, slog.Default(), cfg, nil, nil)
+
+	// Generation refused this group (e.g. shared-repo guard): it has
+	// volumes but no meta entry, and must not run with zero-value meta
+	// (no lock keys, config file deleted).
+	s.RunAllGroups(context.Background(), singleGroupState(), map[string]config.GroupRunMeta{})
+
+	if calls := runner.getCalls(); len(calls) != 0 {
+		t.Fatalf("groups without generated configs must not run, got %v", calls)
 	}
 }

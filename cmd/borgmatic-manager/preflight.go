@@ -79,7 +79,7 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 			return nil, fmt.Errorf("borg not found on PATH but snapshot hooks are configured")
 		}
 		slog.Warn("borg not found on PATH; borgmatic will fail until it is installed")
-	} else if out, err := commandOutput(ctx, borgPath, "--version"); err == nil {
+	} else if out, err := commandOutput(ctx, borgPath, "--version"); err == nil && len(strings.Fields(out)) > 0 {
 		// "borg 1.4.4"
 		fields := strings.Fields(out)
 		borgVersion := fields[len(fields)-1]
@@ -94,17 +94,27 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 
 	// docker/podman CLI: generated helper/exec dump commands invoke it.
 	// Generation warns per group; this is the generic heads-up.
-	if detectContainerCLI() == "" {
+	if detectContainerCLI(e.cfg, e.rt.SocketPath()) == "" {
 		slog.Warn("neither docker nor podman CLI found on PATH; database dump commands will fail")
 	}
 
 	return res, nil
 }
 
-// detectContainerCLI picks the container CLI used in generated dump
-// commands: docker if present, else podman, else empty (docker assumed).
-func detectContainerCLI() string {
-	for _, cli := range []string{"docker", "podman"} {
+// detectContainerCLI picks the CLI for generated dump commands: explicit config
+// wins; a podman socket implies podman (the docker CLI would target the wrong
+// daemon); otherwise the first of docker/podman on PATH, else empty.
+func detectContainerCLI(cfg *config.ManagerConfig, socketPath string) string {
+	const docker, podman = "docker", "podman"
+	if cli := cfg.Manager.ContainerCLI; cli != "" {
+		return cli
+	}
+	if strings.Contains(socketPath, podman) {
+		if _, err := exec.LookPath(podman); err == nil {
+			return podman
+		}
+	}
+	for _, cli := range []string{docker, podman} {
 		if _, err := exec.LookPath(cli); err == nil {
 			return cli
 		}
