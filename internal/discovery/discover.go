@@ -71,7 +71,11 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			discoverContainerVolumes(state, c, intent, volumesByName, seenVolumes, logger)
 		}
 
-		dbs := finalizeDatabases(intent.databases, c, volumesByName, logger)
+		dbs, err := finalizeDatabases(intent.databases, c, volumesByName)
+		if err != nil {
+			specErrs = append(specErrs, err)
+			continue
+		}
 		if len(dbs) > 0 {
 			state.AddDatabases(intent.group, dbs)
 		}
@@ -87,7 +91,7 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	}
 
 	if len(specErrs) > 0 {
-		return nil, fmt.Errorf("refusing to run with invalid spec labels (a broken spec silently shrinks the backup set): %w", errors.Join(specErrs...))
+		return nil, fmt.Errorf("refusing to run with invalid backup labels (a broken label silently shrinks the backup set): %w", errors.Join(specErrs...))
 	}
 
 	totalVols := countVolumes(state)
@@ -123,11 +127,18 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 		if err != nil {
 			return containerIntent{}, false, err
 		}
+		if err := validateGroupName(spec.Group, c.Name); err != nil {
+			return containerIntent{}, false, err
+		}
 		warnIgnoredFlatLabels(c.Labels, c.Name, logger)
+		dbs, err := spec.databases(c.Name, logger)
+		if err != nil {
+			return containerIntent{}, false, err
+		}
 		intent := containerIntent{
 			group:     spec.Group,
 			enabled:   spec.Enable,
-			databases: spec.databases(c.Name, logger),
+			databases: dbs,
 			config:    spec.Config,
 		}
 		if len(spec.Volumes) > 0 {
@@ -144,6 +155,9 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 		}
 		return containerIntent{}, false, nil
 	}
+	if err := validateGroupName(group, c.Name); err != nil {
+		return containerIntent{}, false, err
+	}
 
 	if c.Labels[labelEnableRenamed] != "" {
 		logger.Warn("the borgmatic-manager.backup label was renamed: use borgmatic-manager.enable",
@@ -154,17 +168,35 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 			"container", c.Name, "enable_label", c.Labels[labelEnable])
 	}
 
+	dbs, err := ParseDatabaseLabels(c.Labels, logger)
+	if err != nil {
+		return containerIntent{}, false, fmt.Errorf("container %s: %w", c.Name, err)
+	}
 	intent := containerIntent{
 		group:     group,
 		enabled:   IsEnabled(c.Labels),
-		databases: ParseDatabaseLabels(c.Labels, logger),
+		databases: dbs,
 		config:    ParseConfigLabels(c.Labels, logger),
 	}
 	intent.volumesFilter, intent.hasVolumesFilter = VolumesFilter(c.Labels)
 	return intent, true, nil
 }
 
+// validateGroupName rejects names unsafe as a config filename: the label is
+// attacker-influenced and flows into a root-owned file path.
+func validateGroupName(group, containerName string) error {
+	if !validGroupName.MatchString(group) {
+		return fmt.Errorf("container %s: invalid group name %q: must match %s (it becomes a config filename)",
+			containerName, group, validGroupName.String())
+	}
+	return nil
+}
+
 var anonymousVolumeName = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// validGroupName: the group becomes a root-owned config filename, so no path
+// separators or leading dot may reach filepath.Join.
+var validGroupName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // discoverContainerVolumes adds the container's named volumes to its group.
 // Anonymous volumes are excluded unless the filter names them (usually caches, not data).
@@ -246,10 +278,9 @@ func shouldSkipVolume(v runtime.VolumeInfo) (bool, string) {
 	return false, ""
 }
 
-// finalizeDatabases attaches the source container to each parsed database
-// config and resolves sqlite volume-relative paths to absolute host paths.
-// Entries referencing unknown volumes are warned about and dropped.
-func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, volumesByName map[string]runtime.VolumeInfo, logger *slog.Logger) []models.DatabaseConfig {
+// finalizeDatabases attaches the source container and resolves sqlite paths.
+// Unknown volumes and escaping paths are errors: attacker-influenced input read by root.
+func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, volumesByName map[string]runtime.VolumeInfo) ([]models.DatabaseConfig, error) {
 	result := dbs[:0]
 	for _, db := range dbs {
 		db.Container = c.Name
@@ -258,19 +289,22 @@ func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, vol
 		if db.Type == dbTypeSQLite {
 			vol, ok := volumesByName[db.Volume]
 			if !ok {
-				logger.Warn("sqlite database references unknown volume, skipping",
-					"container", c.Name, "database", db.Name, "volume", db.Volume)
-				continue
+				return nil, fmt.Errorf("container %s: sqlite database %q references unknown volume %q", c.Name, db.Name, db.Volume)
 			}
-			db.Path = filepath.Join(vol.Mountpoint, db.Path)
+			joined := filepath.Join(vol.Mountpoint, db.Path)
+			rel, err := filepath.Rel(vol.Mountpoint, joined)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("container %s: sqlite database %q path %q escapes volume %q", c.Name, db.Name, db.Path, db.Volume)
+			}
+			db.Path = joined
 		}
 
 		result = append(result, db)
 	}
 	if len(result) == 0 {
-		return nil
+		return nil, nil
 	}
-	return result
+	return result, nil
 }
 
 // defaultIsMountPoint checks /proc/self/mountinfo.

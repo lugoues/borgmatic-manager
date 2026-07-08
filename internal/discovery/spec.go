@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -72,9 +73,10 @@ func ParseSpecLabel(labels map[string]string, containerName string) (*ContainerS
 	return &spec, true, nil
 }
 
-// databases converts and validates the spec's database entries using the
-// same per-type rules as the flat db.{n}.* labels.
-func (s *ContainerSpec) databases(containerName string, logger *slog.Logger) []models.DatabaseConfig {
+// databases validates spec entries under the same rules as the flat db.{n}.*
+// labels; broken entries fail the cycle.
+func (s *ContainerSpec) databases(containerName string, logger *slog.Logger) ([]models.DatabaseConfig, error) {
+	var errs []error
 	var result []models.DatabaseConfig
 	for i, sdb := range s.Databases {
 		cfg := models.DatabaseConfig{
@@ -90,15 +92,19 @@ func (s *ContainerSpec) databases(containerName string, logger *slog.Logger) []m
 			Options:  sdb.Options,
 		}
 		ref := fmt.Sprintf("%s spec db[%d]", containerName, i)
-		if !validateDatabase(&cfg, ref, logger) {
+		if err := validateDatabase(&cfg, ref, logger); err != nil {
+			errs = append(errs, err)
 			continue
 		}
 		result = append(result, cfg)
 	}
-	if len(result) == 0 {
-		return nil
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
 	}
-	return result
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
 }
 
 // warnIgnoredFlatLabels logs flat borgmatic-manager.* labels shadowed by a spec label.

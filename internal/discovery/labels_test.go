@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/models"
@@ -94,9 +95,10 @@ func TestGetGroup(t *testing.T) {
 
 func TestParseDatabaseLabels(t *testing.T) {
 	tests := []struct {
-		name   string
-		labels map[string]string
-		want   []models.DatabaseConfig
+		name    string
+		labels  map[string]string
+		want    []models.DatabaseConfig
+		wantErr bool
 	}{
 		{
 			name:   "empty labels returns nil",
@@ -189,7 +191,7 @@ func TestParseDatabaseLabels(t *testing.T) {
 			},
 		},
 		{
-			name: "missing required field skips entry",
+			name: "missing required field fails (a skipped entry would shrink the backup set)",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.name":     "noType",
 				"borgmatic-manager.db.0.username": "user",
@@ -197,39 +199,35 @@ func TestParseDatabaseLabels(t *testing.T) {
 				"borgmatic-manager.db.1.name":     "gooddb",
 				"borgmatic-manager.db.1.username": "gooduser",
 			},
-			want: []models.DatabaseConfig{
-				{Type: "postgresql", Name: "gooddb", Username: "gooduser"},
-			},
+			wantErr: true,
 		},
 		{
-			name: "unknown db type skips entry",
+			name: "unknown db type fails",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type":     "redis",
 				"borgmatic-manager.db.0.name":     "cache",
 				"borgmatic-manager.db.0.username": "user",
 			},
-			want: nil,
+			wantErr: true,
 		},
 		{
-			name: "non-integer index skips label",
+			name: "non-integer index fails",
 			labels: map[string]string{
 				"borgmatic-manager.db.abc.type":     "postgresql",
 				"borgmatic-manager.db.abc.name":     "db",
 				"borgmatic-manager.db.abc.username": "user",
 			},
-			want: nil,
+			wantErr: true,
 		},
 		{
-			name: "invalid port value keeps port at 0",
+			name: "invalid port value fails",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type":     "postgresql",
 				"borgmatic-manager.db.0.name":     "db",
 				"borgmatic-manager.db.0.username": "user",
 				"borgmatic-manager.db.0.port":     "notanumber",
 			},
-			want: []models.DatabaseConfig{
-				{Type: "postgresql", Name: "db", Username: "user", Port: 0},
-			},
+			wantErr: true,
 		},
 		{
 			name: "non-borgmatic labels are ignored",
@@ -256,22 +254,22 @@ func TestParseDatabaseLabels(t *testing.T) {
 			},
 		},
 		{
-			name: "sqlite missing volume skips entry",
+			name: "sqlite missing volume fails",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type": "sqlite",
 				"borgmatic-manager.db.0.name": "app",
 				"borgmatic-manager.db.0.path": "app.sqlite3",
 			},
-			want: nil,
+			wantErr: true,
 		},
 		{
-			name: "sqlite missing path skips entry",
+			name: "sqlite missing path fails",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type":   "sqlite",
 				"borgmatic-manager.db.0.name":   "app",
 				"borgmatic-manager.db.0.volume": "app-data",
 			},
-			want: nil,
+			wantErr: true,
 		},
 		{
 			name: "sqlite does not require username and clears credentials",
@@ -288,24 +286,22 @@ func TestParseDatabaseLabels(t *testing.T) {
 			},
 		},
 		{
-			name: "unknown borgmatic db fields are ignored silently",
+			name: "unknown db field name fails (typos must not be silent)",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type":        "mariadb",
 				"borgmatic-manager.db.0.name":        "db",
 				"borgmatic-manager.db.0.username":    "user",
 				"borgmatic-manager.db.0.futureField": "value",
 			},
-			want: []models.DatabaseConfig{
-				{Type: "mariadb", Name: "db", Username: "user"},
-			},
+			wantErr: true,
 		},
 		{
-			name: "missing username skips entry",
+			name: "missing username fails",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type": "postgresql",
 				"borgmatic-manager.db.0.name": "db",
 			},
-			want: nil,
+			wantErr: true,
 		},
 		{
 			name: "unknown type is rejected before other required-field checks",
@@ -313,21 +309,26 @@ func TestParseDatabaseLabels(t *testing.T) {
 				"borgmatic-manager.db.0.type": "redis",
 				"borgmatic-manager.db.0.name": "cache",
 			},
-			want: nil,
+			wantErr: true,
 		},
 		{
-			name: "missing name skips entry",
+			name: "missing name fails",
 			labels: map[string]string{
 				"borgmatic-manager.db.0.type":     "postgresql",
 				"borgmatic-manager.db.0.username": "user",
 			},
-			want: nil,
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := discovery.ParseDatabaseLabels(tt.labels, discardLogger())
+			got, err := discovery.ParseDatabaseLabels(tt.labels, discardLogger())
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}

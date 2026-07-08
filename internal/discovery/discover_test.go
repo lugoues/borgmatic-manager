@@ -388,10 +388,8 @@ func TestDiscoverSQLitePathResolution(t *testing.T) {
 	assert.Equal(t, "/var/lib/docker/volumes/app-data/_data/db/app.sqlite3", dbs[0].Path)
 }
 
-func TestDiscoverSQLiteUnknownVolumeSkipped(t *testing.T) {
+func TestDiscoverSQLiteUnknownVolumeFailsDiscovery(t *testing.T) {
 	stubProbes(t)
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
 	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
 		{
@@ -407,11 +405,48 @@ func TestDiscoverSQLiteUnknownVolumeSkipped(t *testing.T) {
 		},
 	})
 
-	state, err := discovery.Discover(context.Background(), rt, logger)
-	require.NoError(t, err)
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err, "a database entry pointing at a missing volume must fail the cycle, not shrink the backup set")
+	assert.Contains(t, err.Error(), "unknown volume")
+}
 
-	assert.Empty(t, state.Groups)
-	assert.Contains(t, buf.String(), "unknown volume")
+func TestDiscoverSQLitePathEscapeFailsDiscovery(t *testing.T) {
+	stubProbes(t)
+
+	rt := mockLists([]runtime.VolumeInfo{volumeFixture("app-data")}, []runtime.ContainerInfo{
+		{
+			ID:   "c1",
+			Name: "app",
+			Labels: map[string]string{
+				"borgmatic-manager.group":       "myapp",
+				"borgmatic-manager.db.0.type":   "sqlite",
+				"borgmatic-manager.db.0.name":   "app",
+				"borgmatic-manager.db.0.volume": "app-data",
+				"borgmatic-manager.db.0.path":   "../../../../etc/shadow",
+			},
+		},
+	})
+
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err, "a path traversing out of its volume must fail discovery")
+	assert.Contains(t, err.Error(), "escapes volume")
+}
+
+func TestDiscoverInvalidGroupNameFailsDiscovery(t *testing.T) {
+	stubProbes(t)
+
+	for _, group := range []string{"../../../etc/cron.d/x", ".hidden", "a/b", ""} {
+		c := backupContainer("web", group, mountFixture("app-data", "/data"))
+		rt := mockLists([]runtime.VolumeInfo{volumeFixture("app-data")}, []runtime.ContainerInfo{c})
+
+		_, err := discovery.Discover(context.Background(), rt, discardLogger())
+		if group == "" {
+			// No group at all is a warn-and-ignore, not an error.
+			require.NoError(t, err)
+			continue
+		}
+		require.Error(t, err, "group %q must be rejected (it becomes a root-owned filename)", group)
+	}
 }
 
 func TestDiscoverNearMissContainerWarns(t *testing.T) {

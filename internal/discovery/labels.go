@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -70,19 +71,16 @@ func HasManagerLabels(labels map[string]string) bool {
 	return false
 }
 
-// ParseDatabaseLabels extracts indexed borgmatic-manager.db.{n}.* labels
-// into a sorted slice of DatabaseConfig structs. Entries missing required
-// fields or having an unknown type are warned about and skipped. Required
-// fields are per-type: postgresql/mysql/mariadb need type, name, and
-// username; sqlite needs type, name, volume, and path (and takes no
-// credentials or address, sqlite has no authentication).
-func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models.DatabaseConfig {
+// ParseDatabaseLabels parses indexed borgmatic-manager.db.{n}.* labels. Malformed
+// or invalid entries are errors: skipping one silently shrinks the backup set.
+func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) ([]models.DatabaseConfig, error) {
 	if len(labels) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	configs := make(map[int]*models.DatabaseConfig)
 
+	var errs []error
 	for key, value := range labels {
 		if !strings.HasPrefix(key, dbPrefix) {
 			continue
@@ -92,13 +90,13 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 		suffix := strings.TrimPrefix(key, dbPrefix)
 		parts := strings.SplitN(suffix, ".", 2)
 		if len(parts) != 2 {
-			logger.Warn("malformed db label: missing field name", "label", key)
+			errs = append(errs, fmt.Errorf("malformed db label %q: missing field name", key))
 			continue
 		}
 
 		index, err := strconv.Atoi(parts[0])
 		if err != nil {
-			logger.Warn(fmt.Sprintf("non-integer db index %q, skipping label", parts[0]), "label", key)
+			errs = append(errs, fmt.Errorf("db label %q has a non-integer index %q", key, parts[0]))
 			continue
 		}
 
@@ -108,11 +106,16 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 			configs[index] = &models.DatabaseConfig{}
 		}
 
-		setDBField(configs[index], field, value, logger)
+		if err := setDBField(configs[index], field, value, logger); err != nil {
+			errs = append(errs, fmt.Errorf("db label %q: %w", key, err))
+		}
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
 	}
 
 	if len(configs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Sort indices for deterministic output.
@@ -125,43 +128,42 @@ func ParseDatabaseLabels(labels map[string]string, logger *slog.Logger) []models
 	var result []models.DatabaseConfig
 	for _, idx := range indices {
 		cfg := configs[idx]
-		if !validateDatabase(cfg, fmt.Sprintf("db.%d", idx), logger) {
+		if err := validateDatabase(cfg, fmt.Sprintf("db.%d", idx), logger); err != nil {
+			errs = append(errs, err)
 			continue
 		}
 		result = append(result, *cfg)
 	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
 
 	if len(result) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	return result
+	return result, nil
 }
 
-// validateDatabase enforces per-type field rules for a database definition,
-// regardless of whether it came from flat db.{n}.* labels or a spec blob.
-// ref names the source in warnings (e.g. "db.0", "web spec databases[1]").
-func validateDatabase(cfg *models.DatabaseConfig, ref string, logger *slog.Logger) bool {
+// validateDatabase enforces per-type field rules (ref names the source). Broken
+// entries are errors (silent shrink); lossless fix-ups stay warnings.
+func validateDatabase(cfg *models.DatabaseConfig, ref string, logger *slog.Logger) error {
 	if cfg.Type == "" {
-		logger.Warn(fmt.Sprintf("%s missing required field 'type', skipping", ref))
-		return false
+		return fmt.Errorf("%s is missing the required field 'type'", ref)
 	}
 	if !validDBTypes[cfg.Type] {
-		logger.Warn(fmt.Sprintf("%s has unknown type %q, skipping", ref, cfg.Type))
-		return false
+		return fmt.Errorf("%s has unknown type %q", ref, cfg.Type)
 	}
 	if cfg.Name == "" {
-		logger.Warn(fmt.Sprintf("%s missing required field 'name', skipping", ref))
-		return false
+		return fmt.Errorf("%s is missing the required field 'name'", ref)
 	}
 
 	if cfg.Type == dbTypeSQLite {
-		if !validateSQLite(cfg, ref, logger) {
-			return false
+		if err := validateSQLite(cfg, ref, logger); err != nil {
+			return err
 		}
 	} else if cfg.Username == "" {
-		logger.Warn(fmt.Sprintf("%s missing required field 'username', skipping", ref))
-		return false
+		return fmt.Errorf("%s is missing the required field 'username'", ref)
 	}
 
 	switch cfg.Mode {
@@ -177,19 +179,17 @@ func validateDatabase(cfg *models.DatabaseConfig, ref string, logger *slog.Logge
 		cfg.Mode = ""
 	}
 
-	return true
+	return nil
 }
 
 // validateSQLite requires volume and path; credentials and addresses are
 // meaningless for sqlite and cleared with a warning.
-func validateSQLite(cfg *models.DatabaseConfig, ref string, logger *slog.Logger) bool {
+func validateSQLite(cfg *models.DatabaseConfig, ref string, logger *slog.Logger) error {
 	if cfg.Volume == "" {
-		logger.Warn(fmt.Sprintf("%s (sqlite) missing required field 'volume', skipping", ref))
-		return false
+		return fmt.Errorf("%s (sqlite) is missing the required field 'volume'", ref)
 	}
 	if cfg.Path == "" {
-		logger.Warn(fmt.Sprintf("%s (sqlite) missing required field 'path', skipping", ref))
-		return false
+		return fmt.Errorf("%s (sqlite) is missing the required field 'path'", ref)
 	}
 	if cfg.Username != "" || cfg.Password != "" || cfg.Hostname != "" || cfg.Port != 0 {
 		logger.Warn(fmt.Sprintf("%s (sqlite) ignoring username/password/hostname/port: sqlite has no authentication", ref))
@@ -198,12 +198,18 @@ func validateSQLite(cfg *models.DatabaseConfig, ref string, logger *slog.Logger)
 		cfg.Hostname = ""
 		cfg.Port = 0
 	}
-	return true
+	// sqlite entries have no dump command; stray options would fail borgmatic's
+	// schema validation every cycle, so clear them.
+	if cfg.Options != "" {
+		logger.Warn(fmt.Sprintf("%s (sqlite) ignoring 'options': sqlite entries take no dump options", ref))
+		cfg.Options = ""
+	}
+	return nil
 }
 
-// setDBField maps a field name to the corresponding DatabaseConfig struct field.
-// Unknown fields are silently ignored for forward compatibility.
-func setDBField(cfg *models.DatabaseConfig, field, value string, logger *slog.Logger) {
+// setDBField maps a label field onto DatabaseConfig. Unknown fields and bad
+// values are errors: a typo would silently change what gets backed up.
+func setDBField(cfg *models.DatabaseConfig, field, value string, logger *slog.Logger) error {
 	switch field {
 	case "type":
 		cfg.Type = value
@@ -218,8 +224,7 @@ func setDBField(cfg *models.DatabaseConfig, field, value string, logger *slog.Lo
 	case "port":
 		port, err := strconv.Atoi(value)
 		if err != nil {
-			logger.Warn(fmt.Sprintf("invalid port value %q, using 0", value))
-			return
+			return fmt.Errorf("invalid port value %q", value)
 		}
 		cfg.Port = port
 	case "volume":
@@ -234,8 +239,9 @@ func setDBField(cfg *models.DatabaseConfig, field, value string, logger *slog.Lo
 		// v1 label; host-run borgmatic connects via container IP or 'hostname' instead.
 		logger.Warn("the 'network' db label is deprecated and ignored: host-run borgmatic connects via the container's IP (default) or the 'hostname' label")
 	default:
-		// Unknown fields ignored silently (forward-compatible).
+		return fmt.Errorf("unknown field %q (valid: type, name, username, password, hostname, port, volume, path, options, mode)", field)
 	}
+	return nil
 }
 
 // ParseConfigLabels builds a nested config fragment from config.* labels. Values
