@@ -66,6 +66,7 @@ manager() { "$WORK/borgmatic-manager" "$@"; }
 cleanup() {
   [ -n "$MANAGER_PID" ] && kill -TERM "$MANAGER_PID" 2>/dev/null || true
   compose --profile late down -v --remove-orphans >/dev/null 2>&1 || true
+  docker rm -f e2e-orphan-helper >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -123,12 +124,35 @@ stack_up
 
 # --- phase 1: manager up, guided bootstrap ---------------------------------
 
+# Simulate a dump helper orphaned by a crashed manager: a labeled
+# container plus its pending-run record. Startup reconciliation must
+# reap it (a hung mariadb-dump ignores SIGTERM as PID 1, so a crashed
+# manager otherwise leaks it forever).
+log "planting an orphaned dump helper for startup reconciliation"
+docker run -d --name e2e-orphan-helper \
+  --label borgmatic-manager.helper=db \
+  --label borgmatic-manager.run=e2e-orphan-run \
+  alpine sleep 600 >/dev/null
+mkdir -p "$STATE_DIR"
+cat > "$STATE_DIR/schedule.json" <<'ORPHAN'
+{"version":1,"groups":{},"pending_runs":{"e2e-orphan-run":{"group":"db","started":"2026-01-01T00:00:00Z"}}}
+ORPHAN
+
 log "starting manager"
 # Invoked directly (not via the manager() helper): a backgrounded function
 # runs in a subshell, so $! would be the subshell's PID and SIGTERM would
 # never reach the daemon.
 "$WORK/borgmatic-manager" run > "$LOG_FILE" 2>&1 &
 MANAGER_PID=$!
+
+log "startup reconciliation reaps the orphaned helper"
+for _ in $(seq 1 40); do
+  docker inspect e2e-orphan-helper >/dev/null 2>&1 || break
+  sleep 0.5
+done
+docker inspect e2e-orphan-helper >/dev/null 2>&1 && fail "startup reconciliation did not reap the orphaned helper"
+grep -q "pending_runs" "$STATE_DIR/schedule.json" && grep -q "e2e-orphan-run" "$STATE_DIR/schedule.json" \
+  && fail "pending run record not cleared after reap"
 
 log "expecting the guided repo-create bootstrap error"
 wait_for_log "repo-create" 60

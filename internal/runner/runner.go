@@ -55,6 +55,10 @@ type Runner struct {
 
 	// recorder, when set, receives every run's outcome for status display.
 	recorder Recorder
+
+	// pending + reap, when set, implement dump-helper cleanup: record before spawn, reap and clear after exit.
+	pending PendingTracker
+	reap    ReapFunc
 }
 
 // Recorder persists run outcomes; *state.ScheduleStore implements it.
@@ -62,9 +66,45 @@ type Recorder interface {
 	RecordRun(group string, outcome state.RunOutcome)
 }
 
+// PendingTracker persists in-flight run IDs so a crashed manager's orphaned
+// dump helpers can be reaped at startup. *state.ScheduleStore implements it.
+type PendingTracker interface {
+	RecordPending(runID, group string, started time.Time)
+	ClearPending(runID string)
+}
+
+// ReapFunc force-removes the dump helper containers of one run.
+type ReapFunc func(ctx context.Context, runID string) ([]string, error)
+
+// reapHelpers force-removes dump helpers still wearing this run's label (orphans
+// once borgmatic exits). Fresh context: this runs on cancelled shutdown paths.
+func (r *Runner) reapHelpers(groupName, runID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	names, err := r.reap(ctx, runID)
+	if err != nil {
+		// Keep the pending record: startup reconciliation retries.
+		r.logger.Warn("failed to reap dump helper containers; will retry at next startup",
+			"group", groupName, "run_id", runID, "error", err)
+		return
+	}
+	if len(names) > 0 {
+		r.logger.Warn("reaped orphaned dump helper containers",
+			"group", groupName, "run_id", runID, "containers", strings.Join(names, ","))
+	}
+	r.pending.ClearPending(runID)
+}
+
 // SetRecorder wires run-outcome persistence (nil disables it).
 func (r *Runner) SetRecorder(rec Recorder) {
 	r.recorder = rec
+}
+
+// SetHelperReaper wires dump-helper cleanup (nil disables it).
+func (r *Runner) SetHelperReaper(pending PendingTracker, reap ReapFunc) {
+	r.pending = pending
+	r.reap = reap
 }
 
 // NewRunner creates a Runner. borgmaticPath must be a resolved binary path;
@@ -143,15 +183,21 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 	}
 	defer release()
 
-	return true, r.runGroup(ctx, groupName)
+	return true, r.runGroup(ctx, groupName, meta.RunID)
 }
 
 // runGroup validates the group's generated config, then executes borgmatic.
-func (r *Runner) runGroup(ctx context.Context, groupName string) error {
+func (r *Runner) runGroup(ctx context.Context, groupName, runID string) error {
 	configPath := filepath.Join(r.configDir, groupName+".yaml")
 
 	if err := r.validateConfig(ctx, groupName, configPath); err != nil {
 		return err
+	}
+
+	// Record pending BEFORE spawning so a crash mid-run is reaped by ID at startup.
+	if r.pending != nil && r.reap != nil && runID != "" {
+		r.pending.RecordPending(runID, groupName, time.Now())
+		defer r.reapHelpers(groupName, runID)
 	}
 
 	// create --json puts a machine-readable result on stdout without disturbing --log-json.

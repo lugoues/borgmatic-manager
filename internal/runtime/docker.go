@@ -155,14 +155,31 @@ var relevantActions = map[string]bool{
 	"remove":  true,
 }
 
-// EventStream returns channels for container runtime events, filtered to
-// container/volume create and removal actions. The event channel closes when
-// the context is cancelled or the underlying stream ends; the error channel
-// receives at most one error.
-//
-// The Docker SDK never closes its message channel, so the forwarding goroutine
-// holds a per-connection child context and cancels it on every exit path,
-// releasing the SDK's producer goroutine and preventing a leak per reconnect.
+// RemoveContainersByLabel force-removes containers (and anonymous volumes)
+// carrying key=value; a leaked helper otherwise pins its image's declared VOLUME.
+func (d *DockerRuntime) RemoveContainersByLabel(ctx context.Context, key, value string) ([]string, error) {
+	list, err := d.client.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", key+"="+value)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing containers by label %s=%s: %w", key, value, err)
+	}
+
+	var removed []string
+	for _, c := range list {
+		if err := d.client.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
+			return removed, fmt.Errorf("removing container %s: %w", c.ID[:12], err)
+		}
+		name := c.ID[:12]
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		removed = append(removed, name)
+	}
+	return removed, nil
+}
+
 // EventStream cancels a child context on every exit path: the Docker SDK never
 // closes its Events channel, so the SDK goroutine would otherwise leak per reconnect.
 func (d *DockerRuntime) EventStream(ctx context.Context) (<-chan Event, <-chan error) {

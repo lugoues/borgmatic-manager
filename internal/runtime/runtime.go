@@ -12,6 +12,10 @@ type ContainerRuntime interface {
 	ListContainers(ctx context.Context) ([]ContainerInfo, error)
 
 	EventStream(ctx context.Context) (<-chan Event, <-chan error)
+
+	// RemoveContainersByLabel force-removes containers (and their anonymous
+	// volumes) carrying key=value; used to reap orphaned dump helpers.
+	RemoveContainersByLabel(ctx context.Context, key, value string) ([]string, error)
 }
 
 // VolumeInfo describes a container volume discovered by the runtime.

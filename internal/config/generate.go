@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -33,6 +35,9 @@ type GroupRunMeta struct {
 	Repos []string
 	// SnapshotHooks is true when the config enables btrfs/zfs/lvm hooks.
 	SnapshotHooks bool
+	// RunID is minted fresh each generation and stamped onto dump helper
+	// containers so the runner reaps only this run's orphans.
+	RunID string
 }
 
 // GeneratorOptions carries host-environment facts the generator needs.
@@ -181,11 +186,13 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 			base = DeepMerge(base, labelCfg)
 		}
 
-		// 3. Build discovered data from volumes and databases. Volume-named
-		// archive paths (the /./ marker) are disabled when snapshot hooks
-		// are enabled: the hooks construct their own /./ rewrites and borg
-		// allows only one marker per path.
-		discovered := g.buildDiscoveredData(groupName, group, !hasSnapshotHooks(base))
+		// 3. Build discovered data. Volume-named /./ paths are disabled when
+		// snapshot hooks are enabled: borg allows only one /./ marker per path.
+		runID, err := newRunID()
+		if err != nil {
+			return nil, nil, fmt.Errorf("minting run id for group %s: %w", groupName, err)
+		}
+		discovered := g.buildDiscoveredData(groupName, group, !hasSnapshotHooks(base), runID)
 
 		// 4. Merge discovered data on top (discovered wins).
 		final := DeepMerge(base, discovered)
@@ -204,6 +211,7 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 			meta: GroupRunMeta{
 				Repos:         extractRepoKeys(final),
 				SnapshotHooks: hasSnapshotHooks(final),
+				RunID:         runID,
 			},
 		})
 	}
@@ -307,9 +315,16 @@ func hasGeneratedHeader(path string) bool {
 	return string(buf[:n]) == headerComment
 }
 
-// buildDiscoveredData constructs a map of configuration values discovered from
-// the group's volumes and databases.
-func (g *Generator) buildDiscoveredData(groupName string, group *models.VolumeGroup, volumeNamedPaths bool) map[string]interface{} {
+// newRunID mints a random 16-hex-char run identifier from crypto/rand.
+func newRunID() (string, error) {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func (g *Generator) buildDiscoveredData(groupName string, group *models.VolumeGroup, volumeNamedPaths bool, runID string) map[string]interface{} {
 	data := map[string]interface{}{}
 
 	// Pin borgmatic's runtime/state dirs to the manager's own; user config can override.
@@ -334,7 +349,7 @@ func (g *Generator) buildDiscoveredData(groupName string, group *models.VolumeGr
 		data["source_directories"] = dirs
 	}
 
-	dbHooks := g.buildDatabaseHooks(groupName, group.Databases)
+	dbHooks := g.buildDatabaseHooks(groupName, group.Databases, runID)
 	for k, v := range dbHooks {
 		data[k] = v
 	}
@@ -371,7 +386,7 @@ var engineKey = map[string]string{
 
 // buildDatabaseHooks emits borgmatic database hook entries: helper container
 // (default), hostname (host client), exec (postgresql only), or sqlite (host path).
-func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseConfig) map[string]interface{} {
+func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseConfig, runID string) map[string]interface{} {
 	if len(dbs) == 0 {
 		return nil
 	}
@@ -400,7 +415,7 @@ func (g *Generator) buildDatabaseHooks(groupName string, dbs []models.DatabaseCo
 			g.warnIfMissing(groupName, db.Type, engineClients[db.Type]...)
 
 		default:
-			g.buildContainerClientEntry(entry, db)
+			g.buildContainerClientEntry(entry, db, groupName, runID)
 			g.warnIfMissing(groupName, db.Type, g.containerCLI())
 		}
 
@@ -445,7 +460,7 @@ var clientBinaries = map[string]struct{ dump, restore, interact string }{
 // buildContainerClientEntry fills an entry whose client runs in a container
 // (helper in the database container's netns, or exec into it). The target is
 // always 127.0.0.1; the container name doubles as the borgmatic label.
-func (g *Generator) buildContainerClientEntry(entry map[string]interface{}, db models.DatabaseConfig) {
+func (g *Generator) buildContainerClientEntry(entry map[string]interface{}, db models.DatabaseConfig, groupName, runID string) {
 	cli := g.containerCLI()
 	bins := clientBinaries[db.Type]
 
@@ -454,7 +469,10 @@ func (g *Generator) buildContainerClientEntry(entry map[string]interface{}, db m
 		base = fmt.Sprintf("%s exec --env PGPASSWORD %s", cli, db.Container)
 		interactive = fmt.Sprintf("%s exec -i --env PGPASSWORD %s", cli, db.Container)
 	} else {
-		run := fmt.Sprintf("%s run --rm", cli)
+		// --init: a FIFO-blocked dump client as PID 1 ignores SIGTERM and leaks
+		// the container. Labels scope orphan reaping to exactly this group and run.
+		run := fmt.Sprintf("%s run --rm --init --label %s=%s --label %s=%s",
+			cli, models.HelperGroupLabel, groupName, models.HelperRunLabel, runID)
 		if db.Type == dbTypeMySQL || db.Type == dbTypeMariaDB {
 			// Mount the runtime dir at the identical path so the client reaches borgmatic's dump FIFO.
 			run += fmt.Sprintf(" -v %s:%s", g.opts.RuntimeDir, g.opts.RuntimeDir)

@@ -522,3 +522,75 @@ func TestValidateConfig_FailureRecordedForStatus(t *testing.T) {
 	defer rec.mu.Unlock()
 	assert.Equal(t, "config-invalid", rec.outcomes["bad"].Result)
 }
+
+// helperReapHarness fakes the pending tracker and reap func, recording the
+// order of lifecycle events.
+type helperReapHarness struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (h *helperReapHarness) RecordPending(runID, group string, started time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.events = append(h.events, "pending:"+group+":"+runID)
+}
+
+func (h *helperReapHarness) ClearPending(runID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.events = append(h.events, "clear:"+runID)
+}
+
+func (h *helperReapHarness) reap(_ context.Context, runID string) ([]string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.events = append(h.events, "reap:"+runID)
+	return []string{"stray-helper"}, nil
+}
+
+func TestHelperReapLifecycle(t *testing.T) {
+	fake := newFakeExecutor()
+	r := newTestRunner(t, fake, nil)
+	h := &helperReapHarness{}
+	r.SetHelperReaper(h, h.reap)
+
+	ran, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-1"})
+	require.NoError(t, err)
+	require.True(t, ran)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	require.Equal(t, []string{"pending:db:run-1", "reap:run-1", "clear:run-1"}, h.events,
+		"pending before spawn, reap after exit, clear after reap")
+}
+
+func TestHelperReapRunsOnFailureToo(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.runScript = "exit 2" // the repo-missing first run is the classic leak path
+	r := newTestRunner(t, fake, nil)
+	h := &helperReapHarness{}
+	r.SetHelperReaper(h, h.reap)
+
+	_, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-2"})
+	require.Error(t, err)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	assert.Contains(t, h.events, "reap:run-2", "failed runs are exactly when helpers orphan")
+	assert.Contains(t, h.events, "clear:run-2")
+}
+
+func TestHelperReapSkippedWithoutRunID(t *testing.T) {
+	fake := newFakeExecutor()
+	r := newTestRunner(t, fake, nil)
+	h := &helperReapHarness{}
+	r.SetHelperReaper(h, h.reap)
+
+	_, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{})
+	require.NoError(t, err)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	assert.Empty(t, h.events, "no run id (legacy meta) means no reap bookkeeping")
+}

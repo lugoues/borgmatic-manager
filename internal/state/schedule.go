@@ -44,9 +44,17 @@ type GroupRecord struct {
 	MissingCycles int `json:"missing_cycles,omitempty"`
 }
 
+// PendingRun records a spawned run whose dump helpers may still exist: written
+// before spawn, cleared after reap, so a crash leaves evidence to reap orphans.
+type PendingRun struct {
+	Group   string    `json:"group"`
+	Started time.Time `json:"started"`
+}
+
 type scheduleFile struct {
 	Version int                    `json:"version"`
 	Groups  map[string]GroupRecord `json:"groups"`
+	Pending map[string]PendingRun  `json:"pending_runs,omitempty"`
 }
 
 // ScheduleStore holds per-group schedule records, persisted as JSON in the
@@ -57,17 +65,19 @@ type ScheduleStore struct {
 	path   string
 	logger *slog.Logger
 
-	mu     sync.Mutex
-	groups map[string]GroupRecord
+	mu      sync.Mutex
+	groups  map[string]GroupRecord
+	pending map[string]PendingRun
 }
 
 // LoadSchedule reads the schedule state from stateDir, returning an empty
 // (everything-due) store when the file is missing or unreadable.
 func LoadSchedule(stateDir string, logger *slog.Logger) *ScheduleStore {
 	s := &ScheduleStore{
-		path:   filepath.Join(stateDir, "schedule.json"),
-		logger: logger,
-		groups: map[string]GroupRecord{},
+		path:    filepath.Join(stateDir, "schedule.json"),
+		logger:  logger,
+		groups:  map[string]GroupRecord{},
+		pending: map[string]PendingRun{},
 	}
 
 	data, err := os.ReadFile(s.path)
@@ -87,7 +97,40 @@ func LoadSchedule(stateDir string, logger *slog.Logger) *ScheduleStore {
 	if f.Groups != nil {
 		s.groups = f.Groups
 	}
+	if f.Pending != nil {
+		s.pending = f.Pending
+	}
 	return s
+}
+
+// RecordPending persists that a run (and possibly its dump helpers) is in
+// flight, keyed by run ID.
+func (s *ScheduleStore) RecordPending(runID, group string, started time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pending[runID] = PendingRun{Group: group, Started: started}
+	s.save()
+}
+
+// ClearPending removes a pending-run record after its helpers are reaped.
+func (s *ScheduleStore) ClearPending(runID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.pending[runID]; ok {
+		delete(s.pending, runID)
+		s.save()
+	}
+}
+
+// PendingSnapshot returns a copy of the pending-run records.
+func (s *ScheduleStore) PendingSnapshot() map[string]PendingRun {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]PendingRun, len(s.pending))
+	for id, p := range s.pending {
+		out[id] = p
+	}
+	return out
 }
 
 // Record returns the stored record for a group.
@@ -168,7 +211,7 @@ func (s *ScheduleStore) save() {
 		s.logger.Warn("cannot create state directory; schedule will not survive restarts", "path", s.path, "error", err)
 		return
 	}
-	data, err := json.MarshalIndent(scheduleFile{Version: 1, Groups: s.groups}, "", "  ")
+	data, err := json.MarshalIndent(scheduleFile{Version: 1, Groups: s.groups, Pending: s.pending}, "", "  ")
 	if err != nil {
 		s.logger.Warn("cannot encode schedule state", "error", err)
 		return

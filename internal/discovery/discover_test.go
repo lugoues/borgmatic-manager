@@ -787,3 +787,22 @@ func TestParseConfigLabelsConflictIsDeterministic(t *testing.T) {
 		assert.Equal(t, 2, a["b"])
 	}
 }
+
+func TestDiscoverIgnoresManagerHelperContainers(t *testing.T) {
+	stubProbes(t)
+	// A dump helper carries manager labels but is never a backup source;
+	// it must not create groups, warnings, or errors.
+	helper := runtime.ContainerInfo{
+		ID:   "h1",
+		Name: "helper",
+		Labels: map[string]string{
+			"borgmatic-manager.helper": "db",
+			"borgmatic-manager.run":    "abc123",
+		},
+	}
+	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{helper})
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+	assert.Empty(t, state.Groups)
+}

@@ -127,3 +127,22 @@ func TestRecordRunPreservedAcrossMarkSuccess(t *testing.T) {
 	assert.Equal(t, "failed", rec.LastRun.Result)
 	assert.False(t, rec.LastSuccess.IsZero())
 }
+
+func TestPendingRunsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, discardLogger())
+	started := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+
+	s.RecordPending("run-abc", "db", started)
+
+	// A fresh load (daemon crashed and restarted) still sees it.
+	reloaded := state.LoadSchedule(dir, discardLogger())
+	pending := reloaded.PendingSnapshot()
+	require.Len(t, pending, 1)
+	assert.Equal(t, "db", pending["run-abc"].Group)
+	assert.True(t, pending["run-abc"].Started.Equal(started))
+
+	reloaded.ClearPending("run-abc")
+	assert.Empty(t, reloaded.PendingSnapshot())
+	assert.Empty(t, state.LoadSchedule(dir, discardLogger()).PendingSnapshot(), "clear must persist")
+}

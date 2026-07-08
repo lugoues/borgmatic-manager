@@ -150,26 +150,38 @@ func TestGenerateHelperModeDatabases(t *testing.T) {
 		RuntimeDir:   "/run/borgmatic-manager",
 		ContainerCLI: "docker",
 	})
-	_, err := g.Generate(state)
+	meta, err := g.Generate(state)
 	require.NoError(t, err)
+
+	runID := meta["db-group"].RunID
+	require.NotEmpty(t, runID, "generation must mint a run id for helper attribution")
+	// --init: a PID-1 dump client would ignore SIGTERM and leak forever;
+	// the labels let the runner reap exactly this run's orphans.
+	helper := "docker run --rm --init --label borgmatic-manager.helper=db-group --label borgmatic-manager.run=" + runID
 
 	parsed := readGenerated(t, outDir, "db-group")
 
 	pg := parsed["postgresql_databases"].([]interface{})[0].(map[string]interface{})
 	assert.Equal(t, "127.0.0.1", pg["hostname"], "helper joins the DB netns; localhost is the DB")
 	assert.Equal(t, "pg-svc", pg["label"], "container name keeps archive dump paths unique")
-	assert.Equal(t, "docker run --rm --network container:pg-svc --env PGPASSWORD postgres:17-alpine pg_dump", pg["pg_dump_command"],
+	assert.Equal(t, helper+" --network container:pg-svc --env PGPASSWORD postgres:17-alpine pg_dump", pg["pg_dump_command"],
 		"helper uses the DB container's own image so client always matches server")
-	assert.Equal(t, "docker run --rm -i --network container:pg-svc --env PGPASSWORD postgres:17-alpine pg_restore", pg["pg_restore_command"])
-	assert.Equal(t, "docker run --rm -i --network container:pg-svc --env PGPASSWORD postgres:17-alpine psql", pg["psql_command"])
+	assert.Equal(t, helper+" -i --network container:pg-svc --env PGPASSWORD postgres:17-alpine pg_restore", pg["pg_restore_command"])
+	assert.Equal(t, helper+" -i --network container:pg-svc --env PGPASSWORD postgres:17-alpine psql", pg["psql_command"])
 	assert.NotContains(t, pg, "container", "the bridge-IP container: option is retired")
 
 	maria := parsed["mariadb_databases"].([]interface{})[0].(map[string]interface{})
 	assert.Equal(t, "environment", maria["password_transport"],
 		"a defaults-file pipe cannot cross the container boundary")
-	assert.Equal(t, "docker run --rm -v /run/borgmatic-manager:/run/borgmatic-manager --network container:maria-svc --env MYSQL_PWD mariadb:11 mariadb-dump", maria["mariadb_dump_command"],
+	assert.Equal(t, helper+" -v /run/borgmatic-manager:/run/borgmatic-manager --network container:maria-svc --env MYSQL_PWD mariadb:11 mariadb-dump", maria["mariadb_dump_command"],
 		"the runtime dir mount lets the client reach borgmatic's dump FIFO")
 	assert.Equal(t, 3306, maria["port"])
+
+	// A fresh generation mints a fresh id: reaping one run's orphans can
+	// never touch another run's helpers.
+	meta2, err := g.Generate(state)
+	require.NoError(t, err)
+	assert.NotEqual(t, runID, meta2["db-group"].RunID)
 }
 
 func TestGenerateHelperModeUsesPodmanCLI(t *testing.T) {

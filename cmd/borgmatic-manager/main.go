@@ -202,6 +202,27 @@ func (e *env) newGenerator(outputDir string, logger *slog.Logger) *config.Genera
 	}, logger)
 }
 
+// reapStalePendingRuns removes dump helpers left behind by a previous
+// manager process that died mid-run. At startup nothing can legitimately
+// be in flight, so every persisted pending run is an orphan by definition.
+// Manual passthrough runs never record pending IDs and are never touched.
+func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, reap func(context.Context, string) ([]string, error)) {
+	for runID, p := range store.PendingSnapshot() {
+		names, err := reap(ctx, runID)
+		if err != nil {
+			slog.Warn("cannot reap stale dump helpers; will retry next startup",
+				"group", p.Group, "run_id", runID, "error", err)
+			continue
+		}
+		if len(names) > 0 {
+			slog.Warn("reaped dump helpers orphaned by a previous manager process",
+				"group", p.Group, "run_id", runID, "started", p.Started.Format(time.RFC3339),
+				"containers", strings.Join(names, ","))
+		}
+		store.ClearPending(runID)
+	}
+}
+
 func runDaemon() error {
 	// Structured JSON logging to stdout (journald captures it).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -226,6 +247,11 @@ func runDaemon() error {
 	r := runner.NewRunner(slog.Default(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
 	store := state.LoadSchedule(e.stateDir, slog.Default())
 	r.SetRecorder(store)
+	reap := func(ctx context.Context, runID string) ([]string, error) {
+		return e.rt.RemoveContainersByLabel(ctx, models.HelperRunLabel, runID)
+	}
+	r.SetHelperReaper(store, reap)
+	reapStalePendingRuns(ctx, store, reap)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
 	l := events.NewListener(e.rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())

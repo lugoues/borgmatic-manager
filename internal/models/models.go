@@ -1,5 +1,14 @@
 package models
 
+// Helper-container labels: the generator stamps them on dump helpers, the
+// runner reaps orphans by run ID, discovery skips anything carrying them.
+const (
+	// HelperGroupLabel carries the owning group's name.
+	HelperGroupLabel = "borgmatic-manager.helper"
+	// HelperRunLabel carries the per-run ID minted at config generation.
+	HelperRunLabel = "borgmatic-manager.run"
+)
+
 // BackupState is the discovered backup configuration, keyed by group name.
 type BackupState struct {
 	Groups map[string]*VolumeGroup

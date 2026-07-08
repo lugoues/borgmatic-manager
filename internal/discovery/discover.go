@@ -123,6 +123,12 @@ type containerIntent struct {
 // containerIntentFor builds the container's intent; a spec label shadows all flat
 // labels. ok=false means nothing parseable; a structurally invalid spec is an error.
 func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (containerIntent, bool, error) {
+	// Skip manager-owned dump helpers: never backup sources, they would warn every cycle.
+	if c.Labels[models.HelperRunLabel] != "" {
+		logger.Debug("skipping manager-owned helper container", "container", c.Name)
+		return containerIntent{}, false, nil
+	}
+
 	if spec, present, err := ParseSpecLabel(c.Labels, c.Name); present || err != nil {
 		if err != nil {
 			return containerIntent{}, false, err

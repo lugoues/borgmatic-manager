@@ -177,6 +177,17 @@ joined to its network namespace (`--network container:<name>`):
   the same image)
 - zero database client tools on the host
 
+Helper lifecycle: helpers run with `--rm --init` and carry
+`borgmatic-manager.helper=<group>` and `borgmatic-manager.run=<id>` labels,
+where the run ID is minted fresh each cycle. The manager records the ID
+before spawning borgmatic and, when borgmatic exits, force-removes any
+helper still wearing it (a mariadb-dump blocked on its dump FIFO ignores
+SIGTERM as PID 1 and would otherwise run forever, pinning a volume). IDs
+pending from a crashed manager are reaped at the next startup. Manual
+`borgmatic-manager borgmatic <group>` runs mint their own IDs but bypass
+the daemon, so their cleanup is not guaranteed — find strays with
+`docker ps --filter label=borgmatic-manager.helper`.
+
 You never write these commands; `borgmatic-manager generate` shows what is
 produced. Setting `db.{n}.hostname` switches that database to a plain
 host-side connection instead (requires `pg_dump`/`mariadb-dump`/`mysqldump`

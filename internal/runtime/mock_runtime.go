@@ -26,3 +26,12 @@ func (m *MockRuntime) EventStream(ctx context.Context) (<-chan Event, <-chan err
 	args := m.Called(ctx)
 	return args.Get(0).(<-chan Event), args.Get(1).(<-chan error)
 }
+
+func (m *MockRuntime) RemoveContainersByLabel(ctx context.Context, key, value string) ([]string, error) {
+	args := m.Called(ctx, key, value)
+	var names []string
+	if v := args.Get(0); v != nil {
+		names = v.([]string)
+	}
+	return names, args.Error(1)
+}
