@@ -52,10 +52,10 @@ run = "bash tests/e2e/dind.sh"
 description = "Install binary, systemd unit, and default config (uses sudo)"
 depends = ["build"]
 run = '''
-sudo install -D -m 0755 bin/borgmatic-manager /usr/local/bin/borgmatic-manager
+sudo install -D -m 0755 bin/borgmatic-manager /usr/bin/borgmatic-manager
 sudo install -D -m 0644 deploy/systemd/borgmatic-manager.service /etc/systemd/system/borgmatic-manager.service
 if [ ! -f /etc/borgmatic-manager/manager.yaml ]; then
-  sudo install -D -m 0644 config/manager.yaml /etc/borgmatic-manager/manager.yaml
+  sudo install -D -m 0600 config/manager.yaml /etc/borgmatic-manager/manager.yaml
 else
   echo "keeping existing /etc/borgmatic-manager/manager.yaml"
 fi
@@ -65,7 +65,7 @@ echo "installed. next: edit /etc/borgmatic-manager/manager.yaml, then 'sudo syst
 [tasks.uninstall]
 description = "Remove installed binary and unit (config is kept)"
 run = '''
-sudo rm -f /usr/local/bin/borgmatic-manager /etc/systemd/system/borgmatic-manager.service
+sudo rm -f /usr/bin/borgmatic-manager /usr/local/bin/borgmatic-manager /etc/systemd/system/borgmatic-manager.service
 '''
 
 [tasks.package]

@@ -15,7 +15,9 @@ esac
 
 mkdir -p /etc/borgmatic-manager/conf.d /etc/borgmatic-manager/groups
 if [ ! -e /etc/borgmatic-manager/manager.yaml ]; then
+    # 0600: operators put encryption_passphrase in this file.
     cp /usr/share/borgmatic-manager/manager.yaml /etc/borgmatic-manager/manager.yaml
+    chmod 0600 /etc/borgmatic-manager/manager.yaml
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
