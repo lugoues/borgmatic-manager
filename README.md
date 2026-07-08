@@ -241,42 +241,6 @@ monitoring within one period. If `spec` is present, any other
 `borgmatic-manager.*` labels on that container are ignored (with a warning
 listing them): pick one style per container.
 
-## Filesystem snapshots (btrfs / zfs / LVM)
-
-Enable in `manager.yaml` (applies to all groups) or per group:
-
-```yaml
-borgmatic:
-  btrfs:      # or zfs: / lvm:
-```
-
-borgmatic snapshots the subvolume/dataset **containing** each source
-directory and cleans up afterward; archives record the original paths (needs
-borg ≥ 1.4). Groups with snapshot hooks serialize with each other — borgmatic
-snapshot cleanup is not concurrency-safe.
-
-**Granularity matters.** Docker/Podman create volumes as plain directories,
-so the snapshot unit is whatever subvolume/dataset contains
-`/var/lib/docker/volumes`. On many hosts that's the root filesystem — the
-manager warns when the volumes directory is not its own boundary. Dedicated
-setup (greenfield):
-
-```bash
-# btrfs (before the first volume is created)
-btrfs subvolume create /var/lib/docker/volumes
-# zfs
-zfs create -o mountpoint=/var/lib/docker/volumes pool/docker-volumes
-```
-
-**Migrating existing data:** stop the daemon, move the data aside, create the
-subvolume/dataset at the path, copy back (`cp -a --reflink=auto`), start the
-daemon.
-
-Note: btrfs snapshots are created *inside* the source subvolume as
-`.borgmatic-snapshot-*`; if the daemon restarts mid-backup Docker may list a
-phantom volume by that name until it's removed. Harmless, but don't prune it
-mid-backup.
-
 ## Secrets
 
 - **Labels are visible** to anyone with socket access (`docker inspect`).
@@ -292,18 +256,6 @@ mid-backup.
 - Generated configs (which may contain credentials) are 0600 in a 0700 tmpfs
   directory, removed on service stop, and reconciled every cycle.
 
-## Remote repositories (SSH)
-
-The service runs as root; borg connects as root. One-time setup:
-
-```bash
-sudo ssh-keygen -t ed25519           # if root has no key
-sudo ssh-copy-id borg@backup-host    # or install the key manually
-sudo ssh-keyscan backup-host | sudo tee -a /root/.ssh/known_hosts
-```
-
-Or set `ssh_command: ssh -o StrictHostKeyChecking=accept-new` in the
-`borgmatic:` map instead of pre-seeding known_hosts.
 
 ## Restoring
 
@@ -313,6 +265,9 @@ after a reboot cleared the runtime directory:
 
 ```bash
 sudo borgmatic-manager borgmatic myapp list
+# or
+sudo borgmatic-manager borgmatic myapp browse
+
 sudo borgmatic-manager borgmatic myapp extract --archive latest
 sudo borgmatic-manager borgmatic myapp restore --archive latest   # databases
 ```
@@ -342,8 +297,35 @@ Backup completion/warning counts are also in the JSON logs
 
 ## Rootless Podman
 
-Supported via the user unit
-([deploy/systemd/borgmatic-manager.user.service](deploy/systemd/borgmatic-manager.user.service)):
+Two deployment modes. **Recommended: rootless containers, root manager** —
+the containers stay unprivileged, but the manager runs as the normal system
+unit and watches the user's podman socket:
+
+```bash
+# as the container user: API socket + keep it alive at boot
+systemctl --user enable --now podman.socket
+loginctl enable-linger $USER
+
+# in the system unit (systemctl edit borgmatic-manager), point both the
+# manager and the generated dump commands at that user's socket:
+[Service]
+Environment=CONTAINER_SOCKET=/run/user/1000/podman/podman.sock
+Environment=CONTAINER_HOST=unix:///run/user/1000/podman/podman.sock
+```
+
+(`CONTAINER_SOCKET` is the manager's discovery/event connection;
+`CONTAINER_HOST` is inherited by the `podman` CLI inside generated database
+dump commands, so helper containers are created in the *user's* podman, not
+root's.) This mode has no rootless limitations: snapshot hooks work, files
+owned by subordinate UIDs are readable, and restores put the original
+(subuid) owners back so applications can read their restored data — an
+unprivileged borg cannot chown, so user-mode restores hand everything to
+the user. One boundary to be conscious of: the container user's labels now
+program a root process (see [Security model](#security-model)) — fine when
+that user is you, a real escalation in multi-tenant setups.
+
+**Fully rootless (user unit)** — zero root anywhere, via
+[deploy/systemd/borgmatic-manager.user.service](deploy/systemd/borgmatic-manager.user.service):
 
 ```bash
 systemctl --user enable --now podman.socket
@@ -354,11 +336,17 @@ systemctl --user daemon-reload && systemctl --user enable --now borgmatic-manage
 loginctl enable-linger $USER
 ```
 
-Limitations: no snapshot hooks (except btrfs's documented non-root path);
-volume files owned by subordinate UIDs are skipped with a warning (fix
-ownership with `podman unshare chown`). Database dumps work normally — the
-helper container joins the DB container's network namespace, which needs no
-routable container IP.
+This mode is only clean when your containers write volume data as
+container root (which maps to your user). Anything running as a non-root
+user in-container — databases especially — writes files owned by
+subordinate UIDs that your user cannot read: those volumes are skipped
+with a warning, and restores can't recreate subuid ownership. The often
+suggested `podman unshare chown` fix only suits container-root data
+(chowning a database's files breaks the database). Databases are still
+fine via dumps (the helper joins the DB container's network namespace, no
+routable IP needed) — exclude their volumes with a `volumes` filter and
+rely on the dump. Snapshot hooks don't work except btrfs's documented
+non-root path.
 
 ## CLI
 
@@ -491,6 +479,59 @@ config).
 - database dumps fail — is the DB container running? (helper containers join
   its network namespace, so it must be up); in hostname mode, is the client
   tool on the host and the address reachable?
+
+
+# General Borgmatic
+## Filesystem snapshots (btrfs / zfs / LVM)
+
+Enable in `manager.yaml` (applies to all groups) or per group:
+
+```yaml
+borgmatic:
+  btrfs:      # or zfs: / lvm:
+```
+
+borgmatic snapshots the subvolume/dataset **containing** each source
+directory and cleans up afterward; archives record the original paths (needs
+borg ≥ 1.4). Groups with snapshot hooks serialize with each other — borgmatic
+snapshot cleanup is not concurrency-safe.
+
+**Granularity matters.** Docker/Podman create volumes as plain directories,
+so the snapshot unit is whatever subvolume/dataset contains
+`/var/lib/docker/volumes`. On many hosts that's the root filesystem — the
+manager warns when the volumes directory is not its own boundary. Dedicated
+setup (greenfield):
+
+```bash
+# btrfs (before the first volume is created)
+btrfs subvolume create /var/lib/docker/volumes
+# zfs
+zfs create -o mountpoint=/var/lib/docker/volumes pool/docker-volumes
+```
+
+**Migrating existing data:** stop the daemon, move the data aside, create the
+subvolume/dataset at the path, copy back (`cp -a --reflink=auto`), start the
+daemon.
+
+Note: btrfs snapshots are created *inside* the source subvolume as
+`.borgmatic-snapshot-*`; if the daemon restarts mid-backup Docker may list a
+phantom volume by that name until it's removed. Harmless, but don't prune it
+mid-backup.
+
+## Remote repositories (SSH)
+
+The service runs as root; borg connects as root. One-time setup:
+
+```bash
+sudo ssh-keygen -t ed25519           # if root has no key
+sudo ssh-copy-id borg@backup-host    # or install the key manually
+sudo ssh-keyscan backup-host | sudo tee -a /root/.ssh/known_hosts
+```
+
+Or set `ssh_command: ssh -o StrictHostKeyChecking=accept-new` in the
+`borgmatic:` map instead of pre-seeding known_hosts.
+
+
 
 ## Development
 

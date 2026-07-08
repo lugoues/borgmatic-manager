@@ -38,6 +38,13 @@ StateDirectoryMode=0700
 #   systemctl enable --now podman.socket
 #Environment=CONTAINER_SOCKET=/run/podman/podman.sock
 
+# Rootless containers, root manager: watch a user's rootless podman socket
+# (their labels then program a root process, see the README's Security
+# model). CONTAINER_HOST makes the podman CLI in generated dump commands
+# target the same user instance. Needs 'loginctl enable-linger <user>'.
+#Environment=CONTAINER_SOCKET=/run/user/1000/podman/podman.sock
+#Environment=CONTAINER_HOST=unix:///run/user/1000/podman/podman.sock
+
 # Repository passphrase without plaintext in config files:
 #   systemd-creds encrypt --name=borgmatic.pw secret.txt /etc/credstore.encrypted/borgmatic.pw
 # then set: encryption_passphrase: "{credential systemd borgmatic.pw}"
