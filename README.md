@@ -316,13 +316,16 @@ Environment=CONTAINER_HOST=unix:///run/user/1000/podman/podman.sock
 (`CONTAINER_SOCKET` is the manager's discovery/event connection;
 `CONTAINER_HOST` is inherited by the `podman` CLI inside generated database
 dump commands, so helper containers are created in the *user's* podman, not
-root's.) This mode has no rootless limitations: snapshot hooks work, files
-owned by subordinate UIDs are readable, and restores put the original
-(subuid) owners back so applications can read their restored data — an
-unprivileged borg cannot chown, so user-mode restores hand everything to
-the user. One boundary to be conscious of: the container user's labels now
-program a root process (see [Security model](#security-model)) — fine when
-that user is you, a real escalation in multi-tenant setups.
+root's.) Snapshot hooks work, files owned by subordinate UIDs are
+readable, and restores put the original (subuid) owners back so
+applications can read their restored data — an unprivileged borg cannot
+chown, so user-mode restores hand everything to the user. Two caveats:
+mysql/mariadb helper dumps don't work in this mode (their dump FIFO lives
+in the root-owned runtime dir, which the user-namespace helper can neither
+mount nor write; postgres and sqlite are unaffected — postgres streams
+over stdout). And the container user's labels now program a root process
+(see [Security model](#security-model)) — fine when that user is you, a
+real escalation in multi-tenant setups.
 
 **Fully rootless (user unit)** — zero root anywhere, via
 [deploy/systemd/borgmatic-manager.user.service](deploy/systemd/borgmatic-manager.user.service):
