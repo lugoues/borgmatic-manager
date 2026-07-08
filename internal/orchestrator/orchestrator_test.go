@@ -28,7 +28,12 @@ func (m *mockCycleRunner) RunCycle(ctx context.Context) error {
 
 func (m *mockCycleRunner) Start(ctx context.Context) error {
 	m.startCalled.Store(true)
-	<-m.startBlock // block until released
+	// Block until released or cancelled, like the real scheduler loop,
+	// shutdown joins this goroutine, so ignoring ctx would deadlock.
+	select {
+	case <-m.startBlock:
+	case <-ctx.Done():
+	}
 	return nil
 }
 

@@ -43,18 +43,26 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	triggerCh := o.listener.Listen(ctx)
 
-	// Start scheduler ticker in background goroutine.
+	// Shutdown must wait for the scheduler goroutine: abandoning a mid-backup
+	// cycle would cut borgmatic off instead of the clean SIGTERM-and-wait.
+	schedulerDone := make(chan struct{})
 	go func() {
+		defer close(schedulerDone)
 		if err := o.scheduler.Start(ctx); err != nil {
 			o.logger.Error("scheduler stopped with error", "error", err)
 		}
 	}()
+	joinScheduler := func() {
+		o.logger.Info("waiting for in-flight cycle to finish")
+		<-schedulerDone
+	}
 
 	for {
 		select {
 		case _, ok := <-triggerCh:
 			if !ok {
 				o.logger.Info("event listener stopped")
+				joinScheduler()
 				return nil
 			}
 			o.logger.Info("re-discovery triggered by event")
@@ -63,6 +71,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			}
 		case <-ctx.Done():
 			o.logger.Info("shutting down")
+			joinScheduler()
 			return nil
 		}
 	}

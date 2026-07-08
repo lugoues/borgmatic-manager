@@ -39,6 +39,9 @@ type GroupRecord struct {
 	// LastRun is the most recent run's outcome, including failures,
 	// scheduling only trusts LastSuccess, but status wants the truth.
 	LastRun *RunOutcome `json:"last_run,omitempty"`
+	// MissingCycles counts consecutive absent cycles; a record survives two
+	// before pruning so a redeploy blip doesn't wipe schedules.
+	MissingCycles int `json:"missing_cycles,omitempty"`
 }
 
 type scheduleFile struct {
@@ -114,6 +117,7 @@ func (s *ScheduleStore) MarkSuccess(name, fingerprint string, startedAt time.Tim
 	rec := s.groups[name]
 	rec.LastSuccess = startedAt
 	rec.Fingerprint = fingerprint
+	rec.MissingCycles = 0
 	s.groups[name] = rec
 	s.save()
 }
@@ -128,19 +132,30 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 	s.save()
 }
 
-// Retain drops records for groups that no longer exist, so stale entries
-// can't distort next-wake computations. Persists only if something changed.
+// Retain reconciles records against this cycle's groups: a vanished group
+// survives two absent cycles before pruning; presence resets the counter.
 func (s *ScheduleStore) Retain(names map[string]struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pruned := false
-	for name := range s.groups {
-		if _, ok := names[name]; !ok {
-			delete(s.groups, name)
-			pruned = true
+	changed := false
+	for name, rec := range s.groups {
+		if _, ok := names[name]; ok {
+			if rec.MissingCycles != 0 {
+				rec.MissingCycles = 0
+				s.groups[name] = rec
+				changed = true
+			}
+			continue
 		}
+		if rec.MissingCycles >= 2 {
+			delete(s.groups, name)
+		} else {
+			rec.MissingCycles++
+			s.groups[name] = rec
+		}
+		changed = true
 	}
-	if pruned {
+	if changed {
 		s.save()
 	}
 }

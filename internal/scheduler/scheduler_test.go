@@ -387,15 +387,44 @@ func TestDueGating_VanishedGroupIsForgotten(t *testing.T) {
 	s := dueTestScheduler(runner, store, t0)
 	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
 
-	// Group disappears (container unlabeled): its record must not linger
-	// and pin NextWake to its stale due time.
+	// Group disappears (container unlabeled). The record survives a
+	// two-cycle grace (redeploy blips) but must not pin NextWake to its
+	// stale due time even while it lingers; the lastAttempt entry is
+	// dropped immediately.
 	s.now = func() time.Time { return t0.Add(2 * time.Hour) }
-	s.RunAllGroups(context.Background(), models.NewBackupState(), map[string]config.GroupRunMeta{})
+	empty := models.NewBackupState()
+	s.RunAllGroups(context.Background(), empty, map[string]config.GroupRunMeta{})
 	if got := s.NextWake(); got != time.Hour {
-		t.Fatalf("vanished group must not distort next wake, got %v", got)
+		t.Fatalf("absent group must not distort next wake, got %v", got)
 	}
+	if _, ok := store.Record("app"); !ok {
+		t.Fatal("record must survive the grace period")
+	}
+
+	s.RunAllGroups(context.Background(), empty, map[string]config.GroupRunMeta{})
+	s.RunAllGroups(context.Background(), empty, map[string]config.GroupRunMeta{})
 	if _, ok := store.Record("app"); ok {
-		t.Fatal("vanished group record must be pruned")
+		t.Fatal("vanished group record must be pruned after the grace period")
+	}
+}
+
+func TestDueGating_SkippedAttemptDoesNotDelayWake(t *testing.T) {
+	runner := newMockGroupRunner()
+	runner.results["app"] = tryRunResult{acquired: false, err: nil} // lock held: prior run in flight
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+
+	// A prior success two hours ago makes the group overdue at t0.
+	store.MarkSuccess("app", "old-fingerprint", t0.Add(-2*time.Hour))
+
+	s := dueTestScheduler(runner, store, t0)
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
+
+	// The skipped attempt must not count as a run: NextWake would
+	// otherwise sleep a full period while the overdue group (possibly
+	// with changed membership) waits.
+	if got := s.NextWake(); got != minWake {
+		t.Fatalf("a lock-skipped group must stay due, got wake %v", got)
 	}
 }
 

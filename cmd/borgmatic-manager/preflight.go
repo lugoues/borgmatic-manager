@@ -39,10 +39,13 @@ type preflightResult struct {
 func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	res := &preflightResult{}
 
-	// manager.period must parse, a typo would otherwise silently disable
-	// periodic backups (the scheduler goroutine would just exit).
-	if _, err := time.ParseDuration(e.cfg.Manager.Period); err != nil {
+	// manager.period must parse to a positive duration, a typo would
+	// otherwise silently disable periodic backups, and zero/negative
+	// values would hot-loop the cycle timer.
+	if p, err := time.ParseDuration(e.cfg.Manager.Period); err != nil {
 		return nil, fmt.Errorf("invalid manager.period %q: %w", e.cfg.Manager.Period, err)
+	} else if p <= 0 {
+		return nil, fmt.Errorf("invalid manager.period %q: must be positive", e.cfg.Manager.Period)
 	}
 
 	timeout, timeoutErr := runTimeoutFromConfig(e.cfg)

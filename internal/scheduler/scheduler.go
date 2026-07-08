@@ -40,6 +40,10 @@ type Scheduler struct {
 	store  *state.ScheduleStore
 	period time.Duration
 
+	// cycleMu makes cycles mutually exclusive: reconcile in one cycle could
+	// otherwise delete what a concurrent cycle just wrote.
+	cycleMu sync.Mutex
+
 	// lastAttempt (in-memory only) marks run starts so next-wake retries failures
 	// after a period instead of hot-looping; a restart makes them due again.
 	mu          sync.Mutex
@@ -157,27 +161,37 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 			continue
 		}
 
+		// Optimistic attempt mark keeps NextWake from hot-looping; restored below
+		// if the run lock was held.
 		s.mu.Lock()
+		prevAttempt, hadAttempt := s.lastAttempt[name]
 		s.lastAttempt[name] = now
 		s.mu.Unlock()
 
 		wg.Add(1)
-		go func(groupName, fingerprint string, m config.GroupRunMeta) {
+		go func(groupName, fingerprint string, m config.GroupRunMeta, prevAttempt time.Time, hadAttempt bool) {
 			defer wg.Done()
 
 			acquired, err := s.runner.TryRunGroup(ctx, groupName, m)
-			if err != nil {
-				s.logger.Warn("group backup error", "group", groupName, "error", err)
+			if !acquired && err == nil {
+				s.logger.Debug("skipping group, already running", "group", groupName)
+				s.mu.Lock()
+				if hadAttempt {
+					s.lastAttempt[groupName] = prevAttempt
+				} else {
+					delete(s.lastAttempt, groupName)
+				}
+				s.mu.Unlock()
 				return
 			}
-			if !acquired {
-				s.logger.Debug("skipping group, already running", "group", groupName)
+			if err != nil {
+				s.logger.Warn("group backup error", "group", groupName, "error", err)
 				return
 			}
 			if s.store != nil {
 				s.store.MarkSuccess(groupName, fingerprint, now)
 			}
-		}(name, fingerprint, m)
+		}(name, fingerprint, m, prevAttempt, hadAttempt)
 	}
 
 	if s.store != nil {
@@ -200,8 +214,12 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 	wg.Wait()
 }
 
-// RunCycle performs a full discover -> generate -> run cycle.
+// RunCycle performs a full discover -> generate -> run cycle. Cycles are
+// mutually exclusive: an event trigger arriving mid-periodic-cycle waits.
 func (s *Scheduler) RunCycle(ctx context.Context) error {
+	s.cycleMu.Lock()
+	defer s.cycleMu.Unlock()
+
 	s.logger.Info("starting backup cycle")
 
 	backupState, err := s.discoverFunc(ctx)
@@ -240,6 +258,9 @@ func (s *Scheduler) NextWake() time.Duration {
 	s.mu.Unlock()
 
 	for _, rec := range records {
+		if rec.MissingCycles > 0 {
+			continue // absent groups don't drive the wake timer
+		}
 		if d := rec.LastSuccess.Add(s.period).Sub(now); d < wake {
 			wake = d
 		}
@@ -255,13 +276,13 @@ func (s *Scheduler) NextWake() time.Duration {
 // cancelled. The orchestrator owns the startup cycle, so the first wake is
 // never immediate.
 func (s *Scheduler) Start(ctx context.Context) error {
-	period, err := time.ParseDuration(s.cfg.Manager.Period)
-	if err != nil {
-		return fmt.Errorf("parsing manager.period: %w", err)
+	// period is immutable after construction (groupDue reads it concurrently);
+	// this guard covers non-daemon constructions that skip preflight.
+	if s.period <= 0 {
+		return fmt.Errorf("invalid manager.period %q: must be a positive duration", s.cfg.Manager.Period)
 	}
-	s.period = period
 
-	s.logger.Info("scheduler starting", "period", period)
+	s.logger.Info("scheduler starting", "period", s.period)
 
 	timer := time.NewTimer(s.NextWake())
 	defer timer.Stop()

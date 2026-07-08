@@ -54,21 +54,44 @@ func TestScheduleCorruptFileDegradesToEmpty(t *testing.T) {
 	assert.True(t, ok)
 }
 
-func TestScheduleRetainPrunesVanishedGroups(t *testing.T) {
+func TestScheduleRetainGraceThenPrune(t *testing.T) {
 	dir := t.TempDir()
 	s := state.LoadSchedule(dir, discardLogger())
 	s.MarkSuccess("keep", "fp", time.Now())
 	s.MarkSuccess("gone", "fp", time.Now())
 
+	// Two absent cycles: the record survives (redeploy blips must not
+	// wipe schedules and trigger a backup storm on reappearance).
 	s.Retain(map[string]struct{}{"keep": {}})
+	rec, ok := s.Record("gone")
+	require.True(t, ok, "one absent cycle must not prune")
+	assert.Equal(t, 1, rec.MissingCycles)
+	s.Retain(map[string]struct{}{"keep": {}})
+	_, ok = s.Record("gone")
+	require.True(t, ok, "two absent cycles must not prune")
 
-	_, ok := s.Record("gone")
+	// Third consecutive absence prunes, and it persists.
+	s.Retain(map[string]struct{}{"keep": {}})
+	_, ok = s.Record("gone")
 	assert.False(t, ok)
 	reloaded := state.LoadSchedule(dir, discardLogger())
 	_, ok = reloaded.Record("gone")
 	assert.False(t, ok, "pruning must persist")
 	_, ok = reloaded.Record("keep")
 	assert.True(t, ok)
+}
+
+func TestScheduleRetainReappearanceResetsGrace(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, discardLogger())
+	s.MarkSuccess("app", "fp", time.Now())
+
+	s.Retain(map[string]struct{}{})          // absent once
+	s.Retain(map[string]struct{}{"app": {}}) // back
+	rec, ok := s.Record("app")
+	require.True(t, ok)
+	assert.Equal(t, 0, rec.MissingCycles, "reappearance must reset the absence counter")
+	assert.False(t, rec.LastSuccess.IsZero(), "schedule must be intact after the blip")
 }
 
 func TestScheduleStateDirCreatedOnDemand(t *testing.T) {
