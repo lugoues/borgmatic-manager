@@ -145,6 +145,11 @@ manager borgmatic files repo-create --encryption none
 # --- phase 2: event-driven cycle, content validation ------------------------
 
 log "starting app-b (spec label; its create event must trigger a cycle)"
+# Pre-seed app-b's marker file so the event-triggered cycle (create event
+# + 5s debounce) can never observe a half-initialized volume: with the
+# long period there is no second run to paper over a premature snapshot.
+docker volume create e2e-data-b >/dev/null
+docker run --rm -v e2e-data-b:/data alpine sh -c 'echo e2e-data-b > /data/file-b.txt'
 stack_up --profile late
 
 # The manager period is 30m, far above this phase's timeout: only the
