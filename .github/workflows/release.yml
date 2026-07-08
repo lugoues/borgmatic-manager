@@ -19,6 +19,10 @@ jobs:
           fetch-depth: 0
       - uses: jdx/mise-action@v2
       - uses: sigstore/cosign-installer@v3
+      - name: gate on lint and race-enabled tests
+        run: |
+          mise run lint
+          mise run race
       - name: verify packages before publishing (snapshot build + deb install/remove cycle)
         run: mise run package-verify
       - uses: goreleaser/goreleaser-action@v6

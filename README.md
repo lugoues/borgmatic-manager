@@ -120,9 +120,12 @@ immutable after creation, which made them a trap).
 
 Only `local`-driver volumes are supported; volumes with mount options
 (NFS/CIFS) are backed up only while mounted; other drivers are skipped with a
-warning. Anything carrying a `borgmatic-manager.*` label that doesn't parse
-produces a warning — typos are never silent (`borgmatic-manager discover`
-shows the result).
+warning. A `borgmatic-manager.*` label that doesn't parse or validate —
+unknown field names included — fails the cycle loudly rather than silently
+shrinking the backup set (`borgmatic-manager discover` shows the result).
+The one soft spot: `config.*` option names pass through to borgmatic, so a
+typo there surfaces one step later, as that group's per-cycle
+`borgmatic config validate` failure.
 
 ### Database labels
 
@@ -229,9 +232,12 @@ escaping (systemd word-splits unquoted values on spaces):
 Label='borgmatic-manager.spec={"group": "myapp", "enable": true, "volumes": ["app-data"]}'
 ```
 
-Parsing is strict — an unknown or misspelled field rejects the whole spec with a
-warning rather than silently dropping it, and database entries get the same
-per-type validation as flat labels. If `spec` is present, any other
+Parsing is strict, and deliberately drastic: an unknown or misspelled field,
+or a database entry failing per-type validation, is an **error that fails
+the entire discovery cycle** — no group backs up until the label is fixed.
+That blast radius is the point: a broken label that silently shrank the
+backup set would be worse, and a stopped cycle alerts through logs and
+monitoring within one period. If `spec` is present, any other
 `borgmatic-manager.*` labels on that container are ignored (with a warning
 listing them): pick one style per container.
 
@@ -341,6 +347,7 @@ Supported via the user unit
 
 ```bash
 systemctl --user enable --now podman.socket
+install -D -m 0755 bin/borgmatic-manager ~/.local/bin/borgmatic-manager  # the user unit execs from ~/.local/bin
 mkdir -p ~/.config/borgmatic-manager && cp config/manager.yaml ~/.config/borgmatic-manager/
 cp deploy/systemd/borgmatic-manager.user.service ~/.config/systemd/user/borgmatic-manager.service
 systemctl --user daemon-reload && systemctl --user enable --now borgmatic-manager
@@ -369,7 +376,7 @@ borgmatic-manager version
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `manager.period` | `"1h"` | Backup cycle interval (Go duration). Creation cadence and retention are independent: without `keep_hourly`, hourly archives collapse to one per day at prune time |
+| `manager.period` | required (shipped config: `"1h"`) | Backup cycle interval (positive Go duration). Creation cadence and retention are independent: without `keep_hourly`, hourly archives collapse to one per day at prune time |
 | `manager.borgmatic_path` | auto | borgmatic binary (PATH, then `/root/.local/bin`) |
 | `manager.actions` | `[create, prune, compact, check]` | borgmatic actions per cycle, in order |
 | `manager.container_cli` | derived from socket | CLI for generated dump commands (`docker`/`podman`); default follows the connected socket |
@@ -434,22 +441,43 @@ Consequences:
   failure direction is an extra backup, never a skipped one.
 
 `borgmatic-manager status` shows the resulting schedule: each group's last
-run, its outcome (duration, warnings, archive name, exit code, file count
-and sizes from borgmatic's create result — captured during the run, so no
-repository access is needed), and when the next run is due. For repository-level detail, use
-`borgmatic-manager borgmatic <group> info`.
+run, its outcome (duration, warnings, exit code, file count and sizes from
+borgmatic's create result — captured during the run, so no repository
+access is needed), and when the next run is due. Groups whose config
+generation was refused (shared-repo safety) show as `refused`, and groups
+failing the per-cycle config validation show `config-invalid`. For
+repository-level detail, use `borgmatic-manager borgmatic <group> info`.
 
 To force an immediate full run: `rm /var/lib/borgmatic-manager/schedule.json`
 and restart the service. Manual `borgmatic-manager borgmatic <group> create`
 runs bypass the schedule and don't update it.
+
+## Security model
+
+Labels are the manager's control surface, so **anyone who can create or
+label a container controls what the manager backs up — and, via
+`config.*`/`spec.config` command hooks, can run commands as the manager's
+user (root under the system unit)**. On most hosts that's no new privilege:
+whoever can label containers can reach the container socket, which is
+already root-equivalent. It matters when label-setting is delegated more
+broadly than root (a CI deploy identity, `docker`-group users, multi-tenant
+rootless setups) — in those environments, treat label write access as root
+on this host, and don't grant it more widely than you would sudo.
+
+What the manager enforces at the boundary: group names must be safe slugs
+(they become root-owned config filenames), sqlite paths must stay inside
+their volume, and label-sourced command hooks are loudly warned about in
+the journal every cycle. Generated configs and the seeded
+`/etc/borgmatic-manager/manager.yaml` are `0600`.
 
 ## Concurrency model
 
 Groups run in parallel **except**: groups sharing a repository serialize
 (Borg 1.x locks repositories exclusively), and snapshot-enabled groups
 serialize globally. Overlapping cycles of the same group are skipped, never
-queued. Generated configs set `lock_wait: 120` so a manually-run borgmatic
-doesn't instantly fail a cycle.
+queued. The shipped default config sets `lock_wait: 120` so a manually-run
+borgmatic doesn't instantly fail a cycle (keep it if you replace the
+config).
 
 ## Troubleshooting
 

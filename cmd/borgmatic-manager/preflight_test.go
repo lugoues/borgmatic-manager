@@ -53,3 +53,32 @@ func TestDetectContainerCLI(t *testing.T) {
 		t.Fatalf("no CLIs on PATH must yield empty, got %q", got)
 	}
 }
+
+func TestVersionAtLeast(t *testing.T) {
+	min := [3]int{2, 1, 0}
+	cases := []struct {
+		version string
+		want    bool
+	}{
+		{"2.1.0", true},
+		{"2.1.6", true},
+		{"2.2.0", true},
+		{"3.0.0", true},
+		{"2.0.9", false},
+		{"1.9.9", false},
+		{"2.1.0.dev0", true},
+		{"2.0.9rc1", false},
+		{"2.1", true},
+		{"2", false},
+		// Unparseable input passes open (preflight logs the raw string);
+		// pinned so a refactor doesn't silently flip it to fail-closed
+		// and brick working installs on odd version strings.
+		{"garbage", true},
+		{"", true},
+	}
+	for _, c := range cases {
+		if got := versionAtLeast(c.version, min); got != c.want {
+			t.Errorf("versionAtLeast(%q) = %v, want %v", c.version, got, c.want)
+		}
+	}
+}
