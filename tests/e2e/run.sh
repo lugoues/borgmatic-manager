@@ -147,7 +147,10 @@ manager borgmatic files repo-create --encryption none
 log "starting app-b (spec label; its create event must trigger a cycle)"
 stack_up --profile late
 
-log "waiting for a 'files' archive containing both volumes"
+# The manager period is 30m, far above this phase's timeout: only the
+# create *event* can land app-b's archive in time, so a broken
+# EventStream fails here instead of being masked by the periodic tick.
+log "waiting for a 'files' archive containing both volumes (event-driven)"
 FILES_ARCHIVE=$(wait_for_archive files "file-b.txt" 120)
 
 log "extracting and byte-comparing both files (volume-named archive paths)"

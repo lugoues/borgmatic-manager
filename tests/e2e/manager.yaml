@@ -2,7 +2,7 @@
 # common settings come from an !include to exercise borgmatic-style shared
 # config files.
 manager:
-  period: "15s"
+  period: "30m"
 borgmatic:
   <<: !include common.yaml
   repositories:

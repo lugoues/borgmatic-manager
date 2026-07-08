@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/runtime"
@@ -40,19 +41,47 @@ func NewListenerWithDebounce(rt runtime.ContainerRuntime, logger *slog.Logger, d
 // Listen returns a buffered(1) trigger channel (sends never block, extras
 // drop) that closes when the context is cancelled.
 func (l *Listener) Listen(ctx context.Context) <-chan struct{} {
-	triggerCh := make(chan struct{}, 1)
+	sender := &triggerSender{ch: make(chan struct{}, 1)}
 
 	go func() {
-		defer close(triggerCh)
-		l.reconnectLoop(ctx, triggerCh)
+		defer sender.close()
+		l.reconnectLoop(ctx, sender)
 	}()
 
-	return triggerCh
+	return sender.ch
+}
+
+// triggerSender serializes sends against close: a debounce timer firing at
+// shutdown must not send on the closed channel.
+type triggerSender struct {
+	mu     sync.Mutex
+	ch     chan struct{}
+	closed bool
+}
+
+// send delivers a trigger without blocking and without racing close.
+func (t *triggerSender) send() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	select {
+	case t.ch <- struct{}{}:
+	default:
+	}
+}
+
+func (t *triggerSender) close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	close(t.ch)
 }
 
 // reconnectLoop repeatedly connects to the event stream and processes events.
 // On disconnect or error it waits backoffDuration before reconnecting.
-func (l *Listener) reconnectLoop(ctx context.Context, triggerCh chan struct{}) {
+func (l *Listener) reconnectLoop(ctx context.Context, sender *triggerSender) {
 	reconnected := false
 	for {
 		if ctx.Err() != nil {
@@ -64,13 +93,10 @@ func (l *Listener) reconnectLoop(ctx context.Context, triggerCh chan struct{}) {
 			// Events during the disconnect were unobservable; one unconditional
 			// trigger closes the gap.
 			l.logger.Info("event stream reconnected; triggering re-discovery to cover the gap")
-			select {
-			case triggerCh <- struct{}{}:
-			default:
-			}
+			sender.send()
 		}
 		reconnected = true
-		l.processStream(ctx, eventCh, errCh, triggerCh)
+		l.processStream(ctx, eventCh, errCh, sender)
 
 		// If context is done, exit without backoff.
 		if ctx.Err() != nil {
@@ -88,7 +114,7 @@ func (l *Listener) reconnectLoop(ctx context.Context, triggerCh chan struct{}) {
 
 // processStream reads from the event and error channels until one of them
 // indicates a disconnect or the context is cancelled.
-func (l *Listener) processStream(ctx context.Context, eventCh <-chan runtime.Event, errCh <-chan error, triggerCh chan struct{}) {
+func (l *Listener) processStream(ctx context.Context, eventCh <-chan runtime.Event, errCh <-chan error, sender *triggerSender) {
 	var debounceTimer *time.Timer
 
 	// On stream disconnect a pending debounce must fire rather than be
@@ -99,10 +125,7 @@ func (l *Listener) processStream(ctx context.Context, eventCh <-chan runtime.Eve
 			return
 		}
 		if debounceTimer.Stop() && ctx.Err() == nil {
-			select {
-			case triggerCh <- struct{}{}:
-			default:
-			}
+			sender.send()
 		}
 	}
 	defer fireOrStopPending()
@@ -123,11 +146,8 @@ func (l *Listener) processStream(ctx context.Context, eventCh <-chan runtime.Eve
 				debounceTimer.Stop()
 			}
 			debounceTimer = time.AfterFunc(l.debounceDuration, func() {
-				// Non-blocking send: drop if trigger already pending.
-				select {
-				case triggerCh <- struct{}{}:
-				default:
-				}
+				// Non-blocking, close-safe send via the sender.
+				sender.send()
 			})
 
 		case err, ok := <-errCh:
