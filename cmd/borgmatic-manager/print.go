@@ -139,7 +139,9 @@ func plural(n int, noun string) string {
 
 // printStatus renders per-group schedule state: last run, its result, and
 // when the next run is due, with the soonest next-run in the header blob.
-func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time.Duration) {
+// Refused groups (generation safety checks) are marked as such instead of
+// showing as "due now" forever.
+func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time.Duration, refused map[string]string) {
 	now := time.Now()
 	fmt.Println()
 
@@ -185,6 +187,10 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 			}
 		}
 		switch {
+		case refused[name] != "":
+			r.next = "refused: " + refused[name]
+			rows = append(rows, r)
+			continue // a refused group never runs; keep it out of soonest
 		case !ok:
 			// r.next stays "due now"
 		case rec.Fingerprint != scheduler.GroupFingerprint(group):
@@ -229,6 +235,10 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 					return base.Inherit(styleBad)
 				}
 			case col == 5:
+				r := rows[row]
+				if strings.HasPrefix(r.next, "refused") {
+					return base.Inherit(styleBad)
+				}
 				return base.Inherit(styleDetail)
 			}
 			return base
@@ -242,16 +252,16 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time
 
 // humanBytes renders a byte count in decimal units, like borg's output.
 func humanBytes(n int64) string {
-	const unit = 1000
+	const unit, units = 1000, "kMGTPE"
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
 	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
+	for m := n / unit; m >= unit && exp < len(units)-1; m /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "kMGT"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), units[exp])
 }
 
 // shortDuration renders a duration compactly: 45s, 26m, 3h12m, 2d4h.

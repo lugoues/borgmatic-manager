@@ -22,6 +22,10 @@ import (
 // (e.g. one that keeps failing) can't spin the cycle loop hot.
 const minWake = 30 * time.Second
 
+// discoverTimeout bounds discovery + generation per cycle: a wedged daemon
+// socket would otherwise block RunCycle forever and stop all scheduling.
+const discoverTimeout = 2 * time.Minute
+
 // GroupRunner abstracts runner.Runner for testability.
 type GroupRunner interface {
 	TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, error)
@@ -222,7 +226,10 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 
 	s.logger.Info("starting backup cycle")
 
-	backupState, err := s.discoverFunc(ctx)
+	dctx, cancel := context.WithTimeout(ctx, discoverTimeout)
+	defer cancel()
+
+	backupState, err := s.discoverFunc(dctx)
 	if err != nil {
 		return err
 	}

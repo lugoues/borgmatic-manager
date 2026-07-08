@@ -96,7 +96,18 @@ func runStatus(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("parsing manager.period: %w", err)
 	}
-	printStatus(backupState, stateStore(e, logger), period)
+	// Plan (no writes) surfaces groups generation refuses, so status can
+	// say "refused" instead of a forever-"due now" that never runs.
+	_, refusals, err := e.newGenerator(e.configsDir, logger).Plan(backupState)
+	if err != nil {
+		return err
+	}
+	refused := make(map[string]string, len(refusals))
+	for _, r := range refusals {
+		refused[r.Group] = r.Reason
+	}
+
+	printStatus(backupState, stateStore(e, logger), period, refused)
 	return nil
 }
 

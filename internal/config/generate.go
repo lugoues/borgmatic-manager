@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -72,6 +73,12 @@ func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]map[string]inter
 	}
 }
 
+// Refusal names a group that generation refused, and why.
+type Refusal struct {
+	Group  string
+	Reason string
+}
+
 // Generate writes a borgmatic config per group and returns scheduling metadata.
 // The output directory is reconciled: configs for removed groups are deleted.
 func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta, error) {
@@ -86,12 +93,69 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 	}
 	sort.Strings(groupNames)
 
-	// Pass 1: build every group's final config in memory.
-	type pending struct {
-		name  string
-		final map[string]interface{}
-		meta  GroupRunMeta
+	entries, _, err := g.plan(state, groupNames)
+	if err != nil {
+		return nil, err
 	}
+
+	// Pass 3: write the surviving configs.
+	meta := make(map[string]GroupRunMeta, len(entries))
+	written := make([]string, 0, len(entries))
+	for _, e := range entries {
+		yamlData, err := yaml.Marshal(e.final)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling config for group %s: %w", e.name, err)
+		}
+		output := append([]byte(headerComment), yamlData...)
+
+		// 0600: generated configs carry credentials.
+		outPath := filepath.Join(g.outputDir, e.name+".yaml")
+		if err := writeFileAtomic(outPath, output, 0o600); err != nil {
+			return nil, fmt.Errorf("writing config for group %s: %w", e.name, err)
+		}
+
+		meta[e.name] = e.meta
+		written = append(written, e.name)
+	}
+
+	if err := g.reconcile(written); err != nil {
+		return nil, err
+	}
+
+	return meta, nil
+}
+
+// Plan runs generation's build and safety passes without writing anything,
+// returning scheduling metadata and refusals.
+func (g *Generator) Plan(state *models.BackupState) (map[string]GroupRunMeta, []Refusal, error) {
+	groupNames := make([]string, 0, len(state.Groups))
+	for name := range state.Groups {
+		groupNames = append(groupNames, name)
+	}
+	sort.Strings(groupNames)
+
+	entries, refusals, err := g.plan(state, groupNames)
+	if err != nil {
+		return nil, nil, err
+	}
+	meta := make(map[string]GroupRunMeta, len(entries))
+	for _, e := range entries {
+		meta[e.name] = e.meta
+	}
+	return meta, refusals, nil
+}
+
+// pending is one group's fully merged config awaiting the write pass.
+type pending struct {
+	name  string
+	final map[string]interface{}
+	meta  GroupRunMeta
+}
+
+// plan builds every group's final config in memory (pass 1) and applies
+// cross-group safety checks (pass 2), returning survivors and refusals.
+func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pending, []Refusal, error) {
+	// Pass 1: build every group's final config in memory.
 	entries := make([]*pending, 0, len(groupNames))
 
 	for _, groupName := range groupNames {
@@ -100,7 +164,7 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 		// 1. Deep copy global defaults via marshal/unmarshal.
 		base, err := deepCopyMap(g.cfg.Borgmatic)
 		if err != nil {
-			return nil, fmt.Errorf("copying defaults for group %s: %w", groupName, err)
+			return nil, nil, fmt.Errorf("copying defaults for group %s: %w", groupName, err)
 		}
 
 		// 2. Apply per-group overrides if present.
@@ -110,9 +174,10 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 			}
 		}
 
-		// 2b. Apply borgmatic-manager.config.* label fragments (labels win
-		// over files; discovered data still wins over both).
+		// 2b. Apply label config fragments: labels win over files, discovered
+		// data wins over both.
 		for _, labelCfg := range group.LabelConfigs {
+			warnLabelHooks(groupName, labelCfg, g.logger)
 			base = DeepMerge(base, labelCfg)
 		}
 
@@ -152,6 +217,7 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 		}
 	}
 
+	var refusals []Refusal
 	kept := entries[:0]
 	for _, e := range entries {
 		sharesRepo := false
@@ -165,6 +231,7 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 		if sharesRepo && !strings.Contains(format, e.name) {
 			g.logger.Error("archive_name_format must contain the group name (use the {group} token) when groups share a repository, retention for one group would otherwise prune the others' archives; skipping group",
 				"group", e.name, "archive_name_format", format)
+			refusals = append(refusals, Refusal{Group: e.name, Reason: "archive_name_format must contain the group name when groups share a repository"})
 			continue
 		}
 		kept = append(kept, e)
@@ -172,34 +239,33 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 
 	warnPrefixCollisions(repoGroups, g.logger)
 
-	// Pass 3: write the surviving configs.
-	meta := make(map[string]GroupRunMeta, len(kept))
-	written := make([]string, 0, len(kept))
-	for _, e := range kept {
-		yamlData, err := yaml.Marshal(e.final)
-		if err != nil {
-			return nil, fmt.Errorf("marshaling config for group %s: %w", e.name, err)
-		}
-		output := append([]byte(headerComment), yamlData...)
-
-		// 0600: generated configs carry credentials.
-		outPath := filepath.Join(g.outputDir, e.name+".yaml")
-		if err := writeFileAtomic(outPath, output, 0o600); err != nil {
-			return nil, fmt.Errorf("writing config for group %s: %w", e.name, err)
-		}
-
-		meta[e.name] = e.meta
-		written = append(written, e.name)
-	}
-
-	if err := g.reconcile(written); err != nil {
-		return nil, err
-	}
-
-	return meta, nil
+	return kept, refusals, nil
 }
 
-// reconcile removes generated configs whose groups no longer exist.
+// hookKeys are borgmatic options that execute shell commands as the user
+// running borgmatic (root under the system unit).
+var hookKeys = map[string]bool{
+	"commands": true, "before_actions": true, "after_actions": true,
+	"before_backup": true, "after_backup": true, "before_prune": true,
+	"after_prune": true, "before_check": true, "after_check": true,
+	"before_compact": true, "after_compact": true, "before_extract": true,
+	"after_extract": true, "on_error": true, "before_everything": true,
+	"after_everything": true,
+}
+
+// warnLabelHooks flags command hooks arriving via container labels: anyone who
+// can label a container makes borgmatic run them as root. Warns, never blocks.
+func warnLabelHooks(groupName string, labelCfg map[string]interface{}, logger *slog.Logger) {
+	for key := range labelCfg {
+		if hookKeys[key] {
+			logger.Warn("label-sourced config defines a command hook: it will run as the manager's user (root), anyone who can label a container controls it",
+				"group", groupName, "option", key)
+		}
+	}
+}
+
+// reconcile removes generated configs whose groups no longer exist. Only files
+// carrying the generated header are touched; operator YAML is left alone.
 func (g *Generator) reconcile(current []string) error {
 	keep := make(map[string]bool, len(current))
 	for _, name := range current {
@@ -215,13 +281,30 @@ func (g *Generator) reconcile(current []string) error {
 		if entry.IsDir() || !strings.HasSuffix(name, ".yaml") || keep[name] {
 			continue
 		}
-		if err := os.Remove(filepath.Join(g.outputDir, name)); err != nil {
+		path := filepath.Join(g.outputDir, name)
+		if !hasGeneratedHeader(path) {
+			g.logger.Warn("leaving non-generated yaml file alone in output directory", "file", name)
+			continue
+		}
+		if err := os.Remove(path); err != nil {
 			g.logger.Warn("failed to remove stale generated config", "file", name, "error", err)
 			continue
 		}
 		g.logger.Info("removed stale generated config", "file", name)
 	}
 	return nil
+}
+
+// hasGeneratedHeader reports whether the file begins with the generated header comment.
+func hasGeneratedHeader(path string) bool {
+	f, err := os.Open(path) // #nosec G304 -- manager-owned output directory listing
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, len(headerComment))
+	n, _ := io.ReadFull(f, buf)
+	return string(buf[:n]) == headerComment
 }
 
 // buildDiscoveredData constructs a map of configuration values discovered from

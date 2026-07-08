@@ -50,7 +50,8 @@ func (d *DockerRuntime) SocketPath() string {
 // (the daemon may not be up yet); otherwise well-known paths are probed.
 func resolveSocketPath() (string, error) {
 	if p := os.Getenv("CONTAINER_SOCKET"); p != "" {
-		return p, nil
+		// Tolerate a DOCKER_HOST-style value; unix:// is prepended later.
+		return strings.TrimPrefix(p, "unix://"), nil
 	}
 
 	candidates := []string{
