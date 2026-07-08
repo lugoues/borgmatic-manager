@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -226,18 +227,74 @@ func (r *Runner) runGroup(ctx context.Context, groupName string) error {
 	return r.interpretResult(groupName, configPath, waitErr, run, time.Since(start), timedOut.Load())
 }
 
-// validateConfig runs 'borgmatic config validate' as a per-cycle gate,
-// converting schema drift between the manager and borgmatic into a precise
-// failure instead of a broken backup run.
+// validateTimeout bounds 'borgmatic config validate', which runs while holding
+// every lock TryRunGroup acquired: a hang here must not stall the scheduler.
+const validateTimeout = 2 * time.Minute
+
+// validateConfig gates each cycle on 'borgmatic config validate', turning schema
+// drift into a precise, recorded failure instead of a broken backup run.
 func (r *Runner) validateConfig(ctx context.Context, groupName, configPath string) error {
 	cmd := r.execCommand(ctx, r.borgmaticPath, "--config", configPath, "config", "validate")
-	out, err := cmd.CombinedOutput()
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting config validation for group %s: %w", groupName, err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	timer := time.NewTimer(validateTimeout)
+	defer timer.Stop()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		r.logger.Info("shutdown: signalling config validation", "group", groupName)
+		err = r.terminateAndWait(cmd, done, groupName)
+	case <-timer.C:
+		r.logger.Error("config validation timed out: signalling borgmatic", "group", groupName, "timeout", validateTimeout)
+		err = r.terminateAndWait(cmd, done, groupName)
+	}
+
 	if err != nil {
 		r.logger.Error("generated config failed borgmatic validation; skipping group this cycle",
-			"group", groupName, "config", configPath, "output", strings.TrimSpace(string(out)))
+			"group", groupName, "config", configPath, "output", strings.TrimSpace(out.String()))
+		r.recordValidationFailure(groupName)
 		return fmt.Errorf("config validation failed for group %s", groupName)
 	}
 	return nil
+}
+
+// terminateAndWait SIGTERMs the command's process group, escalating to
+// SIGKILL after the kill grace, and returns its exit error.
+func (r *Runner) terminateAndWait(cmd *exec.Cmd, done <-chan error, groupName string) error {
+	signalGroup(cmd, syscall.SIGTERM)
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(r.killGrace):
+		r.logger.Error("process ignored SIGTERM: killing process group", "group", groupName)
+		signalGroup(cmd, syscall.SIGKILL)
+		return <-done
+	}
+}
+
+// recordValidationFailure surfaces validation failures in status instead of a stale green last run.
+func (r *Runner) recordValidationFailure(groupName string) {
+	if r.recorder == nil {
+		return
+	}
+	r.recorder.RecordRun(groupName, state.RunOutcome{
+		Finished: time.Now(),
+		Result:   "config-invalid",
+	})
 }
 
 // interpretResult turns exit state into logs and an error. borgmatic exits 0

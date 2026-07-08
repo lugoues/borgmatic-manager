@@ -482,3 +482,43 @@ func TestTryRunGroup_RecordsFailureOutcome(t *testing.T) {
 	assert.Equal(t, "failed", o.Result)
 	assert.Equal(t, 2, o.ExitCode)
 }
+
+func TestValidateConfig_TimeoutKillsAndFails(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.validateScript = "sleep 60"
+	r := newTestRunner(t, fake, nil)
+	r.killGrace = 50 * time.Millisecond
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	// Shrink the validate timeout via a cancelled context (the shutdown
+	// path exercises the same terminate-and-wait machinery).
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+
+	start := time.Now()
+	_, err := r.TryRunGroup(ctx, "wedged", config.GroupRunMeta{})
+	require.Error(t, err, "a hung validate must fail the group, not stall it")
+	assert.Less(t, time.Since(start), 10*time.Second, "validate must be interruptible while holding locks")
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o, ok := rec.outcomes["wedged"]
+	require.True(t, ok, "validation failures must reach status")
+	assert.Equal(t, "config-invalid", o.Result)
+}
+
+func TestValidateConfig_FailureRecordedForStatus(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.validateScript = "echo 'schema error' >&2; exit 1"
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "bad", config.GroupRunMeta{})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	assert.Equal(t, "config-invalid", rec.outcomes["bad"].Result)
+}
