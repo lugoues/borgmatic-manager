@@ -34,6 +34,8 @@ var (
 
 // printGroups renders the discovered backup groups with their last-backup ages.
 func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
+	// Trailing blank line keeps the block off the shell prompt.
+	defer fmt.Println()
 	now := time.Now()
 	fmt.Println()
 	fmt.Println(spreadLine(styleTitle.Render("Discover"), styleDetail.Render(summaryCounts(bs))))
@@ -142,6 +144,8 @@ func plural(n int, noun string) string {
 // Refused groups (generation safety checks) are marked as such instead of
 // showing as "due now" forever.
 func printStatus(bs *models.BackupState, store *state.ScheduleStore, period time.Duration, refused map[string]string) {
+	// Trailing blank line keeps the table off the shell prompt.
+	defer fmt.Println()
 	now := time.Now()
 	fmt.Println()
 
