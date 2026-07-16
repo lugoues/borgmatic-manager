@@ -545,6 +545,35 @@ exit 0`
 	assert.NotContains(t, joined, "noisy internal detail", "but drops DEBUG noise")
 }
 
+func TestTryRunGroup_SkipsWhenRepoLockedByAnotherProcess(t *testing.T) {
+	fake := newFakeExecutor()
+	r := newTestRunner(t, fake, nil)
+	lockDir := t.TempDir()
+	r.SetLockDir(lockDir)
+
+	// Stand in for another process (the daemon) holding this group's repo lock.
+	held, ok, err := tryCrossLock(lockDir, "repo:/repo/shared")
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer held.release()
+
+	ran, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/shared"}})
+	require.NoError(t, err, "a held cross-process lock is a skip, not an error")
+	assert.False(t, ran, "the group must be skipped while another process holds its repo lock")
+	assert.Empty(t, fake.callArgs(), "borgmatic must not run when the lock is held")
+}
+
+func TestTryRunGroup_RunsWhenLockFree(t *testing.T) {
+	fake := newFakeExecutor()
+	r := newTestRunner(t, fake, nil)
+	r.SetLockDir(t.TempDir())
+
+	ran, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/free"}})
+	require.NoError(t, err)
+	assert.True(t, ran, "with the lock free, the group runs")
+	assert.NotEmpty(t, fake.callArgs(), "borgmatic is invoked")
+}
+
 func TestValidateConfig_TimeoutKillsAndFails(t *testing.T) {
 	fake := newFakeExecutor()
 	fake.validateScript = "sleep 60"

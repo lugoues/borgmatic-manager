@@ -48,14 +48,31 @@ borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
 }
 
 func runCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "run",
-		Short: "Run the manager daemon",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runDaemon()
+	var scheduler bool
+	cmd := &cobra.Command{
+		Use:   "run [group...]",
+		Short: "Back up now: all groups, or the named ones; --scheduler runs the daemon",
+		Long: `Without --scheduler, run performs an immediate on-demand backup: discover,
+generate configs, and run borgmatic once for every group (or just the groups
+you name), then exit. This is the manual "back up now" path, and it records its
+results just like a scheduled run, so status and inspect see it.
+
+With --scheduler, run becomes the long-lived daemon the systemd unit starts: it
+backs up on manager.period and reacts to container events. It takes no group
+arguments.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.SilenceUsage = true
+			if scheduler {
+				if len(args) > 0 {
+					return fmt.Errorf("--scheduler runs the daemon and takes no group arguments")
+				}
+				return runDaemon()
+			}
+			return runAdhoc(cmd.Context(), args)
 		},
 	}
+	cmd.Flags().BoolVar(&scheduler, "scheduler", false, "run as the scheduling daemon (used by the systemd unit)")
+	return cmd
 }
 
 func discoverCmd() *cobra.Command {
@@ -214,7 +231,12 @@ it, the supported way to interact with a group's repository:
 
   borgmatic-manager borgmatic myapp repo-create --encryption repokey-blake2
   borgmatic-manager borgmatic myapp list
-  borgmatic-manager borgmatic myapp extract --archive latest`,
+  borgmatic-manager borgmatic myapp extract --archive latest
+
+Advanced/escape hatch: this runs borgmatic directly and BYPASSES the manager's
+cross-run locks. A passthrough that touches the repository or takes snapshots
+(e.g. create) can collide with a scheduled or ad-hoc run on the same repo. Use
+it for read/restore/bootstrap, and avoid mutating actions while backups run.`,
 		// Everything after the group belongs to borgmatic untouched.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -324,6 +346,7 @@ func runDaemon() error {
 
 	gen := e.newGenerator(e.configsDir, slog.Default())
 	r := runner.NewRunner(slog.Default(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
+	r.SetLockDir(filepath.Join(e.stateDir, "locks"))
 	store := state.LoadSchedule(e.stateDir, slog.Default())
 	r.SetRecorder(store)
 	reap := func(ctx context.Context, runID string) ([]string, error) {
@@ -354,6 +377,108 @@ func runDaemon() error {
 
 	slog.Info("borgmatic-manager stopped")
 	return nil
+}
+
+// runAdhoc backs up the target groups once and exits, recording outcomes to the
+// same schedule state as the daemon. It deliberately does NOT reap stale pending
+// helpers: a scheduler daemon may be legitimately mid-run.
+func runAdhoc(ctx context.Context, groups []string) error {
+	// Ctrl-C / SIGTERM cancels; the runner forwards it to the borgmatic process group.
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	logger := interactiveLogger() // quiet: warnings from discovery/generation
+	e, err := loadEnv()
+	if err != nil {
+		return err
+	}
+
+	pf, err := preflight(ctx, e)
+	if err != nil {
+		return err
+	}
+
+	backupState, err := discovery.Discover(ctx, e.rt, logger)
+	if err != nil {
+		return err
+	}
+
+	meta, err := e.newGenerator(e.configsDir, logger).Generate(backupState)
+	if err != nil {
+		return err
+	}
+
+	targets, err := resolveAdhocTargets(backupState, meta, groups)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no runnable groups, none discovered, or all were refused by generation (see warnings above)")
+	}
+
+	// A verbose logger so the user watches borgmatic progress live; outcomes
+	// still land in the shared schedule state.
+	store := state.LoadSchedule(e.stateDir, logger)
+	r := runner.NewRunner(progressLogger(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
+	r.SetLockDir(filepath.Join(e.stateDir, "locks"))
+	r.SetRecorder(store)
+	r.SetHelperReaper(store, func(ctx context.Context, runID string) ([]string, error) {
+		return e.rt.RemoveContainersByLabel(ctx, models.HelperRunLabel, runID)
+	})
+
+	now := time.Now()
+	var failed, locked []string
+	for _, name := range targets {
+		acquired, runErr := r.TryRunGroup(ctx, name, meta[name])
+		switch {
+		case runErr != nil:
+			failed = append(failed, name)
+		case !acquired:
+			// Another run (the daemon, or a concurrent ad-hoc) holds this
+			// group's repo/snapshot lock. Ad-hoc never queues: report and move
+			// on so the user can retry, rather than blocking on the backup.
+			locked = append(locked, name)
+		default:
+			store.MarkSuccess(name, scheduler.GroupFingerprint(backupState.Groups[name]), now)
+		}
+		if ctx.Err() != nil {
+			break // interrupted; stop launching further groups
+		}
+	}
+
+	printAdhocSummary(targets, failed, locked)
+	switch {
+	case len(failed) > 0:
+		return fmt.Errorf("%d of %d group(s) failed", len(failed), len(targets))
+	case len(locked) > 0:
+		return fmt.Errorf("%d group(s) are locked by a run already in progress, try again later", len(locked))
+	}
+	return nil
+}
+
+// resolveAdhocTargets returns the groups to back up: all that generated a config
+// when none are named, otherwise the named ones, validated against refusals.
+func resolveAdhocTargets(backupState *models.BackupState, meta map[string]config.GroupRunMeta, requested []string) ([]string, error) {
+	if len(requested) == 0 {
+		names := make([]string, 0, len(meta))
+		for name := range meta {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return names, nil
+	}
+
+	targets := make([]string, 0, len(requested))
+	for _, name := range requested {
+		if _, ok := backupState.Groups[name]; !ok {
+			return nil, fmt.Errorf("unknown group %q; %s", name, discoveredGroupList(backupState))
+		}
+		if _, ok := meta[name]; !ok {
+			return nil, fmt.Errorf("group %q was refused by generation (see warnings above) and cannot be run", name)
+		}
+		targets = append(targets, name)
+	}
+	return targets, nil
 }
 
 func runDiscover() error {
@@ -465,6 +590,9 @@ func runBorgmaticPassthrough(args []string) error {
 	configPath := filepath.Join(e.configsDir, group+".yaml")
 	argv := append([]string{borgmaticPath, "--config", configPath}, args[1:]...)
 
+	// exec cannot hold the manager's cross-run locks, so passthrough bypasses them; warn once.
+	fmt.Fprintln(os.Stderr, "note: passthrough bypasses borgmatic-manager's cross-run locks, avoid mutating actions (e.g. create) while a scheduled or ad-hoc backup may touch this repository")
+
 	// Replace the process: borgmatic owns the terminal from here.
 	// #nosec G702 G204 -- deliberately exec'ing the resolved borgmatic binary with the operator's own CLI arguments
 	if err := syscall.Exec(borgmaticPath, argv, os.Environ()); err != nil {
@@ -484,6 +612,17 @@ func interactiveLogger() *slog.Logger {
 	handler := charmlog.NewWithOptions(os.Stderr, charmlog.Options{
 		ReportTimestamp: false,
 		Level:           charmlog.WarnLevel,
+	})
+	return slog.New(handler)
+}
+
+// progressLogger renders INFO-and-up on stderr so the operator watches the
+// on-demand run live; stdout stays clean for the summary.
+func progressLogger() *slog.Logger {
+	handler := charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+		ReportTimestamp: true,
+		TimeFormat:      "15:04:05",
+		Level:           charmlog.InfoLevel,
 	})
 	return slog.New(handler)
 }

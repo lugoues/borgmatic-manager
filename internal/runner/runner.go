@@ -47,6 +47,9 @@ type Runner struct {
 	locks   map[string]chan struct{}
 	locksMu sync.Mutex
 
+	// lockDir, when set, enables cross-process flock coordination; empty (tests) leaves only in-process locks.
+	lockDir string
+
 	// bootstrapHinted dedupes the guided repo-create hint to once per group.
 	bootstrapHinted sync.Map
 
@@ -97,6 +100,11 @@ func (r *Runner) reapHelpers(groupName, runID string) {
 }
 
 // SetRecorder wires run-outcome persistence (nil disables it).
+// SetLockDir enables cross-process flock coordination; the daemon and ad-hoc runs share dir.
+func (r *Runner) SetLockDir(dir string) {
+	r.lockDir = dir
+}
+
 func (r *Runner) SetRecorder(rec Recorder) {
 	r.recorder = rec
 }
@@ -182,6 +190,29 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 		}
 	}
 	defer release()
+
+	// Cross-process layer: same keys as non-blocking flocks, taken with the
+	// in-process locks held. Held by another process means skip, never wait.
+	var heldLocks []*crossLock
+	releaseLocks := func() {
+		for i := len(heldLocks) - 1; i >= 0; i-- {
+			heldLocks[i].release()
+		}
+	}
+	for _, key := range keys {
+		lock, acquired, err := tryCrossLock(r.lockDir, key)
+		if err != nil {
+			releaseLocks()
+			return false, fmt.Errorf("acquiring cross-process lock %q for group %s: %w", key, groupName, err)
+		}
+		if !acquired {
+			releaseLocks()
+			r.logger.Info("skipping group: another process holds its lock", "group", groupName, "lock", key)
+			return false, nil
+		}
+		heldLocks = append(heldLocks, lock)
+	}
+	defer releaseLocks()
 
 	return true, r.runGroup(ctx, groupName, meta.RunID)
 }

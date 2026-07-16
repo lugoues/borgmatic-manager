@@ -16,7 +16,7 @@ After=podman.socket
 
 [Service]
 Type=notify
-ExecStart=%h/.local/bin/borgmatic-manager run
+ExecStart=%h/.local/bin/borgmatic-manager run --scheduler
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=900

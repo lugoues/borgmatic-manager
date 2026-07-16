@@ -559,6 +559,36 @@ func colorLogLine(line string) string {
 	return styleDetail.Render(line)
 }
 
+// printAdhocSummary reports the outcome of an on-demand `run` to stdout.
+// locked lists groups a concurrent run already holds a lock on (ad-hoc never
+// waits, the user retries).
+func printAdhocSummary(targets, failed, locked []string) {
+	fmt.Println()
+	if len(failed) == 0 && len(locked) == 0 {
+		fmt.Println(edgePad + styleName.Render(fmt.Sprintf("✓ backed up %s", plural(len(targets), "group"))))
+		fmt.Println()
+		return
+	}
+
+	okCount := len(targets) - len(failed) - len(locked)
+	fmt.Println(edgePad + styleTitle.Render("Run complete") +
+		styleDetail.Render(fmt.Sprintf("  %d ok · %d failed · %d locked", okCount, len(failed), len(locked))))
+	if len(failed) > 0 {
+		fmt.Println()
+		fmt.Println(edgePad + styleBad.Render("failed") + styleDetail.Render(": "+strings.Join(failed, ", ")))
+		fmt.Println(edgePad + styleDetail.Render("Run ") +
+			styleName.Render("borgmatic-manager inspect <group>") +
+			styleDetail.Render(" to see why."))
+	}
+	if len(locked) > 0 {
+		fmt.Println()
+		fmt.Println(edgePad + styleWarn.Render("locked") +
+			styleDetail.Render(" (a run is already in progress): "+strings.Join(locked, ", ")))
+		fmt.Println(edgePad + styleDetail.Render("Not queued. Try again once it finishes."))
+	}
+	fmt.Println()
+}
+
 // humanBytes renders a byte count in decimal units, like borg's output.
 func humanBytes(n int64) string {
 	const unit, units = 1000, "kMGTPE"

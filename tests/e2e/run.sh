@@ -142,7 +142,7 @@ log "starting manager"
 # Invoked directly (not via the manager() helper): a backgrounded function
 # runs in a subshell, so $! would be the subshell's PID and SIGTERM would
 # never reach the daemon.
-"$WORK/borgmatic-manager" run > "$LOG_FILE" 2>&1 &
+"$WORK/borgmatic-manager" run --scheduler > "$LOG_FILE" 2>&1 &
 MANAGER_PID=$!
 
 log "startup reconciliation reaps the orphaned helper"

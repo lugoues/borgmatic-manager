@@ -9,7 +9,7 @@ After=network-online.target docker.service podman.socket
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/borgmatic-manager run
+ExecStart=/usr/bin/borgmatic-manager run --scheduler
 Restart=on-failure
 RestartSec=10
 # Shutdown waits for in-flight backups (they get SIGTERM and exit cleanly);
