@@ -40,7 +40,7 @@ func main() {
 borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
 	}
 
-	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), borgmaticCmd(), versionCmd())
+	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), inspectCmd(), logsCmd(), borgmaticCmd(), versionCmd())
 
 	if err := fang.Execute(context.Background(), root, fang.WithVersion(version)); err != nil {
 		os.Exit(1)
@@ -107,8 +107,87 @@ func runStatus(ctx context.Context) error {
 		refused[r.Group] = r.Reason
 	}
 
-	printStatus(backupState, stateStore(e, logger), period, refused)
+	runTimeout, err := runTimeoutFromConfig(e.cfg)
+	if err != nil {
+		return err
+	}
+
+	printStatus(backupState, stateStore(e, logger), period, runTimeout, refused)
 	return nil
+}
+
+func inspectCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "inspect <group>",
+		Short: "Show a group's members, schedule, recent runs, size trend, last log, and config",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.SilenceUsage = true
+			return runInspect(cmd.Context(), args[0])
+		},
+	}
+}
+
+func runInspect(ctx context.Context, group string) error {
+	logger := interactiveLogger()
+	e, err := loadEnv()
+	if err != nil {
+		return err
+	}
+	backupState, err := discovery.Discover(ctx, e.rt, logger)
+	if err != nil {
+		return err
+	}
+	g, ok := backupState.Groups[group]
+	if !ok {
+		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(backupState))
+	}
+	period, err := time.ParseDuration(e.cfg.Manager.Period)
+	if err != nil {
+		return fmt.Errorf("parsing manager.period: %w", err)
+	}
+
+	rec, haveRec := stateStore(e, logger).Record(group)
+	configYAML, configNote := renderGroupConfig(backupState, e, logger, group)
+
+	printInspect(group, g, rec, haveRec, configYAML, configNote, period)
+	return nil
+}
+
+// renderGroupConfig compiles the group's borgmatic config into a scratch
+// directory and returns it, or a note explaining why it is unavailable (a
+// refused group, or a generation error). It never fails the command: inspect
+// is still useful without the config section.
+func renderGroupConfig(backupState *models.BackupState, e *env, logger *slog.Logger, group string) (yaml, note string) {
+	tmp, err := os.MkdirTemp("", "bm-inspect-*")
+	if err != nil {
+		return "", "could not render config: " + err.Error()
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+
+	if _, genErr := e.newGenerator(tmp, logger).Generate(backupState); genErr != nil {
+		return "", "config generation failed: " + genErr.Error()
+	}
+	// #nosec G304 -- group is a discovery-validated name and tmp is our own scratch dir
+	data, err := os.ReadFile(filepath.Join(tmp, group+".yaml"))
+	if err != nil {
+		return "", "no config generated for this group, it may be refused; run: borgmatic-manager generate"
+	}
+	// The on-disk config (0600) holds real secrets for borgmatic; the display
+	// copy must not leak them into the terminal or a screenshare.
+	return redactConfigSecrets(string(data)), ""
+}
+
+func discoveredGroupList(backupState *models.BackupState) string {
+	if len(backupState.Groups) == 0 {
+		return "no groups discovered, check your labels"
+	}
+	names := make([]string, 0, len(backupState.Groups))
+	for name := range backupState.Groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return "discovered groups: " + strings.Join(names, ", ")
 }
 
 func generateCmd() *cobra.Command {
