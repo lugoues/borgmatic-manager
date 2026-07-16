@@ -365,12 +365,34 @@ non-root path.
 ## CLI
 
 ```
-borgmatic-manager run                     # the daemon
+borgmatic-manager run                     # back up all groups now, then exit
+borgmatic-manager run <group>...          # back up only these groups now
+borgmatic-manager run --scheduler         # the daemon (what the systemd unit runs)
 borgmatic-manager discover                # one-shot: print discovered groups
+borgmatic-manager status                  # per-group last run, result, next due
+borgmatic-manager inspect <group>         # one group: schedule, runs, size trend, last log, config
+borgmatic-manager logs <group> [-n N] [-f] # that group's borgmatic output from the journal
 borgmatic-manager generate --output D     # one-shot: write configs to D
 borgmatic-manager borgmatic <group> ...   # run borgmatic against a group
 borgmatic-manager version
 ```
+
+`run` is the manual "back up now" path: it discovers, generates configs, and
+runs borgmatic once for every group (or just the ones you name), recording
+results into the same state `status`/`inspect` read. `run --scheduler` is the
+long-lived daemon that the systemd unit starts; it backs up on `manager.period`
+and reacts to container events. An ad-hoc `run` and the daemon can coexist
+(Borg's own repository lock serializes them); the ad-hoc path never disturbs the
+daemon's in-flight helper containers.
+
+`status` is the dashboard: last run, result, and next due per group, plus a
+live `running (Nm)` while a backup is in flight (`running?` past
+`run_timeout`, in case it is stuck). When a group shows `failed` it points you to
+`inspect <group>`, which shows the failure reason, a bounded tail of the last
+run's log, a size-over-time trend, recent runs, and the group's compiled
+config — all from persisted state, no journal needed. `logs <group>` reads the
+full output from the systemd journal (`journalctl -u borgmatic-manager`, or
+`--user` when not root; `-f` follows a run live).
 
 ## Configuration reference
 
@@ -441,6 +463,10 @@ Consequences:
   marks success.
 - Missing or corrupt schedule state degrades to "everything is due" — the
   failure direction is an extra backup, never a skipped one.
+- To back up now regardless of the schedule, run `borgmatic-manager run`
+  (all groups) or `borgmatic-manager run <group>` (just one). It records its
+  outcome and resets that group's period, so the daemon won't redundantly
+  re-run it right after.
 
 `borgmatic-manager status` shows the resulting schedule: each group's last
 run, its outcome (duration, warnings, exit code, file count and sizes from
@@ -474,20 +500,47 @@ the journal every cycle. Generated configs and the seeded
 
 ## Concurrency model
 
-Groups run in parallel **except**: groups sharing a repository serialize
-(Borg 1.x locks repositories exclusively), and snapshot-enabled groups
-serialize globally. Overlapping cycles of the same group are skipped, never
-queued. The shipped default config sets `lock_wait: 120` so a manually-run
-borgmatic doesn't instantly fail a cycle (keep it if you replace the
+**Within a process**, groups run in parallel **except**: groups sharing a
+repository serialize (Borg 1.x locks repositories exclusively), and
+snapshot-enabled groups serialize globally. Overlapping cycles of the same group
+are skipped, never queued.
+
+**Across processes** (the `--scheduler` daemon and an ad-hoc `run`), the same
+per-repository and snapshot locks are held as `flock`s in `$STATE_DIR/locks/`,
+wrapping the **entire** borgmatic run. This matters because borgmatic creates
+filesystem snapshots *before* it ever invokes Borg, so Borg's own repository
+lock (and `lock_wait`) can't protect the snapshot phase — two borgmatic
+processes snapshotting the same subvolume would collide on a fixed snapshot path
+and one's cleanup could delete the other's live snapshot. The flock closes that.
+`flock`s release automatically if a process dies, so a crash never strands one.
+
+Ad-hoc `run` **never queues**: if a group's lock is already held (by the daemon
+or another run), it reports the group as `locked` and exits non-zero — retry
+once the in-progress run finishes. The daemon treats a held lock like an
+already-running group: it skips that group for the cycle, and it stays due.
+
+The shipped default config sets `lock_wait: 120` so a manually-run borgmatic
+doesn't instantly fail on Borg's repository lock (keep it if you replace the
 config).
+
+**Escape hatch:** `borgmatic-manager borgmatic <group> ...` execs borgmatic
+directly and **bypasses these locks** (it can't hold one across the exec). It's
+safe for read/restore/bootstrap; avoid mutating actions (e.g. `create`) while a
+scheduled or ad-hoc backup may touch the same repository.
 
 ## Troubleshooting
 
 - `sudo borgmatic-manager status` — per-group last run, result (duration,
-  warnings, exit code), file count and archive size, and the next due time
+  warnings, exit code), file count and archive size, the next due time, and
+  `running` while a backup is in flight; failed groups point you to `inspect`
+- `sudo borgmatic-manager inspect <group>` — why a group failed (captured
+  reason + last-run log tail), its size trend and recent runs, and the compiled
+  config, all from persisted state
+- `sudo borgmatic-manager logs <group>` — that group's full borgmatic output
+  from the journal (`-f` to follow a run live)
 - `sudo borgmatic-manager discover` — did my labels work? (near-miss labels
   warn here and in the journal)
-- `journalctl -u borgmatic-manager` — JSON logs; per-group results include
+- `journalctl -u borgmatic-manager` — raw JSON logs; per-group results include
   `exit_code`, `warnings`, `duration`
 - "repository does not exist" — run the printed `repo-create` command (once)
 - database dumps fail — is the DB container running? (helper containers join
