@@ -368,6 +368,10 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 			DurationSeconds: int64(duration.Seconds()),
 			Archive:         run.archiveName(),
 		}
+		if result != state.ResultOK {
+			outcome.LastError = run.firstError()
+		}
+		outcome.LogTail = run.logSnapshot()
 		if res := run.parseCreateResult(); res != nil {
 			outcome.Archive = res.Archive.Name
 			outcome.Files = res.Archive.Stats.NFiles
@@ -380,19 +384,19 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 
 	switch exitCode {
 	case 0:
-		record("ok")
+		record(state.ResultOK)
 		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode,
 			"warnings", warnings, "duration", duration.Round(time.Second).String())
 		return nil
 
 	case 143, 130:
-		record("terminated")
+		record(state.ResultTerminated)
 		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
 			"timed_out", timedOut, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)
 
 	default:
-		record("failed")
+		record(state.ResultFailed)
 		if run.repoMissing.Load() {
 			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
 				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
@@ -412,6 +416,14 @@ type runState struct {
 	group       string
 	warnings    atomic.Int64
 	repoMissing atomic.Bool
+
+	// firstErr keeps the first CRITICAL/ERROR message (the cause); guarded, first wins.
+	errMu    sync.Mutex
+	firstErr string
+
+	// logTail is a bounded, oldest-first tail of log lines for inspect; guarded.
+	logMu   sync.Mutex
+	logTail []string
 
 	// archive is the archive name borg reported; resultBuf accumulates non-log
 	// stdout (the create --json result). Both guarded.
@@ -478,6 +490,64 @@ func (rs *runState) archiveName() string {
 	return rs.archive
 }
 
+// maxReasonLen bounds a stored failure reason; the full text stays in the journal.
+const maxReasonLen = 200
+
+// recordError keeps the first non-empty message: the first failure is the cause.
+func (rs *runState) recordError(msg string) {
+	msg = truncateReason(msg)
+	if msg == "" {
+		return
+	}
+	rs.errMu.Lock()
+	defer rs.errMu.Unlock()
+	if rs.firstErr == "" {
+		rs.firstErr = msg
+	}
+}
+
+func (rs *runState) firstError() string {
+	rs.errMu.Lock()
+	defer rs.errMu.Unlock()
+	return rs.firstErr
+}
+
+// maxLogTail bounds lines kept for inspect; the full log lives in the journal.
+const maxLogTail = 200
+
+func (rs *runState) recordLine(level, msg string) {
+	line := truncateReason(level + " " + msg)
+	if line == "" {
+		return
+	}
+	rs.logMu.Lock()
+	defer rs.logMu.Unlock()
+	rs.logTail = append(rs.logTail, line)
+	if len(rs.logTail) > maxLogTail {
+		rs.logTail = rs.logTail[len(rs.logTail)-maxLogTail:]
+	}
+}
+
+func (rs *runState) logSnapshot() []string {
+	rs.logMu.Lock()
+	defer rs.logMu.Unlock()
+	if len(rs.logTail) == 0 {
+		return nil
+	}
+	out := make([]string, len(rs.logTail))
+	copy(out, rs.logTail)
+	return out
+}
+
+// truncateReason collapses whitespace to one line and bounds length, rune-safely.
+func truncateReason(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > maxReasonLen {
+		return string(r[:maxReasonLen]) + "…"
+	}
+	return s
+}
+
 // borgmaticLogRecord is one --log-json line (borgmatic's own records and
 // Borg passthrough share this shape).
 type borgmaticLogRecord struct {
@@ -515,13 +585,18 @@ func (rs *runState) emit(line, stream string) {
 		rs.checkMessage(rec.Message)
 		switch rec.Levelname {
 		case "CRITICAL", "ERROR":
+			rs.recordError(rec.Message)
+			rs.recordLine(rec.Levelname, rec.Message)
 			rs.logger.Error(rec.Message, "group", rs.group, "source", rec.Name)
 		case "WARNING":
 			rs.warnings.Add(1)
+			rs.recordLine(rec.Levelname, rec.Message)
 			rs.logger.Warn(rec.Message, "group", rs.group, "source", rec.Name)
 		case "DEBUG":
+			// Debug is journal-only noise; the inspect tail skips it.
 			rs.logger.Debug(rec.Message, "group", rs.group, "source", rec.Name)
 		default:
+			rs.recordLine(rec.Levelname, rec.Message)
 			rs.logger.Info(rec.Message, "group", rs.group, "source", rec.Name)
 		}
 		return
@@ -530,6 +605,7 @@ func (rs *runState) emit(line, stream string) {
 	rs.checkMessage(line)
 	if stream == "stderr" {
 		rs.warnings.Add(1)
+		rs.recordLine("WARNING", line)
 		rs.logger.Warn(line, "group", rs.group, "stream", stream)
 		return
 	}

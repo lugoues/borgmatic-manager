@@ -10,14 +10,27 @@ import (
 	"time"
 )
 
+// Result values for RunOutcome.Result.
+const (
+	ResultOK         = "ok"
+	ResultFailed     = "failed"
+	ResultTerminated = "terminated"
+)
+
 // RunOutcome is the observed result of a group's most recent borgmatic
 // run, successful or not, captured from the runner for status display.
 type RunOutcome struct {
-	Finished        time.Time `json:"finished"`
-	Result          string    `json:"result"` // ok | failed | terminated
-	ExitCode        int       `json:"exit_code"`
-	Warnings        int64     `json:"warnings"`
-	DurationSeconds int64     `json:"duration_seconds"`
+	Finished time.Time `json:"finished"`
+	Result   string    `json:"result"` // ok | failed | terminated
+	ExitCode int       `json:"exit_code"`
+	// LastError is the first CRITICAL/ERROR message from a failed run, so
+	// status can show why without the journal.
+	LastError       string `json:"last_error,omitempty"`
+	Warnings        int64  `json:"warnings"`
+	DurationSeconds int64  `json:"duration_seconds"`
+	// LogTail is a bounded output tail kept only on the most recent run
+	// (history drops it) to bound state size.
+	LogTail []string `json:"log_tail,omitempty"`
 	// Archive is the archive name borg reported creating, when observed.
 	Archive string `json:"archive,omitempty"`
 	// Create stats from borgmatic's create --json result (zero when the
@@ -39,6 +52,9 @@ type GroupRecord struct {
 	// LastRun is the most recent run's outcome, including failures,
 	// scheduling only trusts LastSuccess, but status wants the truth.
 	LastRun *RunOutcome `json:"last_run,omitempty"`
+	// History is a bounded, oldest-first ring of past outcomes (log tails
+	// stripped) for inspect. Capped at maxHistory.
+	History []RunOutcome `json:"history,omitempty"`
 	// MissingCycles counts consecutive absent cycles; a record survives two
 	// before pruning so a redeploy blip doesn't wipe schedules.
 	MissingCycles int `json:"missing_cycles,omitempty"`
@@ -165,12 +181,25 @@ func (s *ScheduleStore) MarkSuccess(name, fingerprint string, startedAt time.Tim
 	s.save()
 }
 
-// RecordRun stores a run outcome without touching the schedule fields.
+// maxHistory bounds the per-group run history kept for `inspect`. Big enough
+// for a readable trend, small enough that state stays tiny.
+const maxHistory = 30
+
+// RecordRun stores a run outcome without touching schedule fields: the full
+// outcome becomes LastRun, a log-stripped copy joins the bounded History.
 func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec := s.groups[name]
 	rec.LastRun = &outcome
+
+	slim := outcome
+	slim.LogTail = nil // history keeps stats, not logs, only LastRun carries the tail
+	rec.History = append(rec.History, slim)
+	if len(rec.History) > maxHistory {
+		rec.History = rec.History[len(rec.History)-maxHistory:]
+	}
+
 	s.groups[name] = rec
 	s.save()
 }

@@ -483,6 +483,68 @@ func TestTryRunGroup_RecordsFailureOutcome(t *testing.T) {
 	assert.Equal(t, 2, o.ExitCode)
 }
 
+func TestTryRunGroup_RecordsFailureReason(t *testing.T) {
+	fake := newFakeExecutor()
+	// Two CRITICAL lines then a non-zero exit. Only the first is the cause;
+	// the second is fallout and must not overwrite it.
+	fake.runScript = `echo '{"type":"log_message","levelname":"CRITICAL","message":"Repository /mnt/repo does not exist.","name":"borg"}' >&2
+echo '{"type":"log_message","levelname":"CRITICAL","message":"terminating with error status.","name":"borgmatic"}' >&2
+exit 1`
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["files"]
+	assert.Equal(t, "failed", o.Result)
+	assert.Equal(t, "Repository /mnt/repo does not exist.", o.LastError,
+		"the first CRITICAL message is the cause; later ones must not overwrite it")
+}
+
+func TestTryRunGroup_SuccessHasNoReason(t *testing.T) {
+	fake := newFakeExecutor()
+	// A WARNING on a clean run must not be mistaken for a failure reason.
+	fake.runScript = `echo '{"type":"log_message","levelname":"WARNING","message":"file changed while we backed it up","name":"borg"}' >&2; exit 0`
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.NoError(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["files"]
+	assert.Equal(t, "ok", o.Result)
+	assert.Empty(t, o.LastError, "a successful run carries no failure reason")
+}
+
+func TestTryRunGroup_RecordsLogTail(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.runScript = `echo '{"type":"log_message","levelname":"INFO","message":"creating archive","name":"borgmatic"}'
+echo '{"type":"log_message","levelname":"WARNING","message":"file changed while we backed it up","name":"borg"}' >&2
+echo '{"type":"log_message","levelname":"DEBUG","message":"noisy internal detail","name":"borg"}' >&2
+exit 0`
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.NoError(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["files"]
+	joined := strings.Join(o.LogTail, "\n")
+	assert.Contains(t, joined, "creating archive", "the inspect tail keeps INFO lines")
+	assert.Contains(t, joined, "file changed while we backed it up", "and WARNING lines")
+	assert.NotContains(t, joined, "noisy internal detail", "but drops DEBUG noise")
+}
+
 func TestValidateConfig_TimeoutKillsAndFails(t *testing.T) {
 	fake := newFakeExecutor()
 	fake.validateScript = "sleep 60"

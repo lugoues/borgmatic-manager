@@ -1,6 +1,7 @@
 package state_test
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -126,6 +127,34 @@ func TestRecordRunPreservedAcrossMarkSuccess(t *testing.T) {
 	rec, _ = state.LoadSchedule(dir, discardLogger()).Record("files")
 	assert.Equal(t, "failed", rec.LastRun.Result)
 	assert.False(t, rec.LastSuccess.IsZero())
+}
+
+func TestRecordRunBuildsBoundedHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, discardLogger())
+
+	// Record more runs than the history cap; each carries a log tail.
+	for i := range 40 {
+		s.RecordRun("files", state.RunOutcome{
+			Result:        state.ResultOK,
+			OriginalBytes: int64(i),
+			LogTail:       []string{fmt.Sprintf("run %d line", i)},
+		})
+	}
+
+	rec, ok := state.LoadSchedule(dir, discardLogger()).Record("files")
+	require.True(t, ok)
+
+	assert.LessOrEqual(t, len(rec.History), 30, "history must be bounded")
+	assert.Equal(t, int64(39), rec.History[len(rec.History)-1].OriginalBytes, "newest run is last")
+	assert.Equal(t, int64(10), rec.History[0].OriginalBytes, "oldest kept run is run 10 (40 recorded, cap 30)")
+
+	// Only the last run keeps its log tail; history entries are stripped.
+	require.NotNil(t, rec.LastRun)
+	assert.Equal(t, []string{"run 39 line"}, rec.LastRun.LogTail)
+	for _, h := range rec.History {
+		assert.Nil(t, h.LogTail, "history entries must not carry log tails")
+	}
 }
 
 func TestPendingRunsRoundTrip(t *testing.T) {
