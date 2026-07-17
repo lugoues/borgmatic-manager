@@ -25,19 +25,19 @@ func TestTryCrossLock_ExclusiveThenReleased(t *testing.T) {
 	other, ok, err := tryCrossLock(dir, "repo:/repo/b")
 	require.NoError(t, err)
 	require.True(t, ok, "a different repo key is a separate lock")
-	other.release()
+	other.Release()
 
 	// Once released, the key is acquirable again.
-	first.release()
+	first.Release()
 	again, ok, err := tryCrossLock(dir, "repo:/repo/a")
 	require.NoError(t, err)
 	require.True(t, ok, "after release the lock is free")
-	again.release()
+	again.Release()
 }
 
 func TestTryCrossLock_EmptyDirDisables(t *testing.T) {
 	lock, ok, err := tryCrossLock("", "repo:/repo/a")
 	require.NoError(t, err)
 	assert.True(t, ok, "an empty lock dir disables cross-process locking")
-	lock.release() // must be a safe no-op on a nil lock
+	lock.Release() // must be a safe no-op on a nil lock
 }

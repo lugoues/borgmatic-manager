@@ -555,10 +555,11 @@ func TestTryRunGroup_SkipsWhenRepoLockedByAnotherProcess(t *testing.T) {
 	held, ok, err := tryCrossLock(lockDir, "repo:/repo/shared")
 	require.NoError(t, err)
 	require.True(t, ok)
-	defer held.release()
+	defer held.Release()
 
 	ran, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/shared"}})
-	require.NoError(t, err, "a held cross-process lock is a skip, not an error")
+	require.ErrorIs(t, err, ErrLockedByAnotherProcess,
+		"a held cross-process lock must be reported distinctly: the scheduler backs off on it, rather than re-attempting every minWake")
 	assert.False(t, ran, "the group must be skipped while another process holds its repo lock")
 	assert.Empty(t, fake.callArgs(), "borgmatic must not run when the lock is held")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/models"
+	"github.com/lugoues/borgmatic-manager/internal/runner"
 	"github.com/lugoues/borgmatic-manager/internal/runtime"
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
@@ -177,7 +179,19 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 			defer wg.Done()
 
 			acquired, err := s.runner.TryRunGroup(ctx, groupName, m)
-			if !acquired && err == nil {
+			switch {
+			case errors.Is(err, runner.ErrLockedByAnotherProcess):
+				// Another process is backing this group up right now, and will
+				// hold the lock for the length of its run. Keep the optimistic
+				// attempt mark: restoring it leaves the group overdue, so
+				// NextWake clamps to minWake and spins a full discover +
+				// generate cycle (rewriting every config with fresh run IDs)
+				// every 30s for that run's entire duration.
+				s.logger.Debug("skipping group, locked by another process", "group", groupName)
+
+			case !acquired && err == nil:
+				// An in-flight run in this process owns the attempt mark; restore ours
+				// so the skip doesn't push the next wake out a period.
 				s.logger.Debug("skipping group, already running", "group", groupName)
 				s.mu.Lock()
 				if hadAttempt {
@@ -186,14 +200,14 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 					delete(s.lastAttempt, groupName)
 				}
 				s.mu.Unlock()
-				return
-			}
-			if err != nil {
+
+			case err != nil:
 				s.logger.Warn("group backup error", "group", groupName, "error", err)
-				return
-			}
-			if s.store != nil {
-				s.store.MarkSuccess(groupName, fingerprint, now)
+
+			default:
+				if s.store != nil {
+					s.store.MarkSuccess(groupName, fingerprint, now)
+				}
 			}
 		}(name, fingerprint, m, prevAttempt, hadAttempt)
 	}
@@ -225,6 +239,12 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 	defer s.cycleMu.Unlock()
 
 	s.logger.Info("starting backup cycle")
+
+	// Pick up other processes' writes before deciding dueness: an ad-hoc run may
+	// have just recorded a success.
+	if s.store != nil {
+		s.store.Reload()
+	}
 
 	dctx, cancel := context.WithTimeout(ctx, discoverTimeout)
 	defer cancel()

@@ -523,8 +523,23 @@ and one's cleanup could delete the other's live snapshot. The flock closes that.
 
 Ad-hoc `run` **never queues**: if a group's lock is already held (by the daemon
 or another run), it reports the group as `locked` and exits non-zero — retry
-once the in-progress run finishes. The daemon treats a held lock like an
-already-running group: it skips that group for the cycle, and it stays due.
+once the in-progress run finishes. The daemon skips a group locked elsewhere and
+waits out a period before retrying, rather than re-attempting on every wake.
+
+Three further resources are shared between those processes, and each is handled
+by removing the sharing or coordinating it explicitly:
+
+- **Generated configs.** Every process except the daemon generates into its own
+  private directory. Sharing the daemon's would let one process's reconcile
+  delete a config mid-run, and — because borgmatic re-reads the config when it
+  spawns — hand a running backup a different run ID than its reaper looks for,
+  stranding dump helper containers.
+- **`schedule.json`.** Every write re-reads the file under an exclusive `flock`
+  and merges, so concurrent processes can't erase each other's history, success
+  marks, or pending records.
+- **Pending runs.** Each record carries its owning PID. Startup reconciliation
+  reaps a run's dump helpers only when that process is gone, so restarting the
+  daemon can't kill an ad-hoc run's helpers out from under it.
 
 The shipped default config sets `lock_wait: 120` so a manually-run borgmatic
 doesn't instantly fail on Borg's repository lock (keep it if you replace the

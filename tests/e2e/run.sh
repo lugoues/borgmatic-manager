@@ -128,6 +128,9 @@ stack_up
 # container plus its pending-run record. Startup reconciliation must
 # reap it (a hung mariadb-dump ignores SIGTERM as PID 1, so a crashed
 # manager otherwise leaks it forever).
+# The record deliberately carries no "pid": reconciliation only reaps runs
+# whose owning process is gone, and no owner reads as gone. A record with a
+# live pid (an ad-hoc run in flight) must survive instead.
 log "planting an orphaned dump helper for startup reconciliation"
 docker run -d --name e2e-orphan-helper \
   --label borgmatic-manager.helper=db \

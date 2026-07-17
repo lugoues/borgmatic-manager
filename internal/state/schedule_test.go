@@ -157,6 +157,44 @@ func TestRecordRunBuildsBoundedHistory(t *testing.T) {
 	}
 }
 
+// The daemon and an ad-hoc run each hold their own store over the same file.
+// Writes must merge: dumping an in-memory map would let whichever saved last
+// erase the other's success marks, history, and pending records.
+func TestConcurrentStoresDoNotEraseEachOther(t *testing.T) {
+	dir := t.TempDir()
+	daemon := state.LoadSchedule(dir, discardLogger())
+	adhoc := state.LoadSchedule(dir, discardLogger())
+
+	// Both loaded the same (empty) file, so each has a stale view of the other.
+	daemon.MarkSuccess("alpha", "fp-alpha", time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC))
+	adhoc.MarkSuccess("beta", "fp-beta", time.Date(2026, 7, 7, 4, 0, 0, 0, time.UTC))
+	daemon.RecordRun("alpha", state.RunOutcome{Result: state.ResultOK, OriginalBytes: 10})
+
+	// A third reader sees the union.
+	fresh := state.LoadSchedule(dir, discardLogger())
+	alpha, ok := fresh.Record("alpha")
+	require.True(t, ok, "the daemon's group survived")
+	beta, ok := fresh.Record("beta")
+	require.True(t, ok, "the ad-hoc run's group was not erased by the daemon's later write")
+	assert.Equal(t, "fp-alpha", alpha.Fingerprint)
+	assert.Equal(t, "fp-beta", beta.Fingerprint)
+	assert.False(t, beta.LastSuccess.IsZero(), "the ad-hoc run's success mark survived")
+	require.NotNil(t, alpha.LastRun)
+}
+
+// A pending record carries its owning PID so startup reconciliation can tell a
+// dead process's orphan from a live process's in-flight run.
+func TestRecordPendingStampsOwningProcess(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, discardLogger())
+
+	s.RecordPending("run-1", "files", time.Now())
+
+	p, ok := state.LoadSchedule(dir, discardLogger()).PendingSnapshot()["run-1"]
+	require.True(t, ok)
+	assert.Equal(t, os.Getpid(), p.PID, "the writer's PID identifies the owner")
+}
+
 func TestPendingRunsRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	s := state.LoadSchedule(dir, discardLogger())

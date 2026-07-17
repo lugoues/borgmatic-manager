@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
@@ -193,10 +194,10 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 
 	// Cross-process layer: same keys as non-blocking flocks, taken with the
 	// in-process locks held. Held by another process means skip, never wait.
-	var heldLocks []*crossLock
+	var heldLocks []*lockfile.Lock
 	releaseLocks := func() {
 		for i := len(heldLocks) - 1; i >= 0; i-- {
-			heldLocks[i].release()
+			heldLocks[i].Release()
 		}
 	}
 	for _, key := range keys {
@@ -208,7 +209,7 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 		if !acquired {
 			releaseLocks()
 			r.logger.Info("skipping group: another process holds its lock", "group", groupName, "lock", key)
-			return false, nil
+			return false, ErrLockedByAnotherProcess
 		}
 		heldLocks = append(heldLocks, lock)
 	}

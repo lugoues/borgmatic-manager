@@ -12,6 +12,7 @@ import (
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/models"
+	"github.com/lugoues/borgmatic-manager/internal/runner"
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
@@ -350,6 +351,52 @@ func TestDueGating_FailureIsNotMarkedSuccess(t *testing.T) {
 
 	if calls := runner.getCalls(); len(calls) != 2 {
 		t.Fatalf("a failed group must stay due: %v", calls)
+	}
+}
+
+// A group locked by another process (an ad-hoc run holding its repo flock) must
+// not spin the cycle loop. Restoring the attempt mark leaves the group overdue,
+// so NextWake clamps to minWake and the daemon re-runs a full discover +
+// generate, rewriting every config with fresh run IDs, which is what makes the
+// run-ID/helper-leak race likely, every 30s for that run's whole duration.
+func TestNextWake_BacksOffWhenGroupLockedByAnotherProcess(t *testing.T) {
+	mock := newMockGroupRunner()
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+	s := dueTestScheduler(mock, store, t0)
+	bs := singleGroupState()
+
+	// A success at t0 gives the group real history to go stale.
+	s.RunAllGroups(context.Background(), bs, metaFor(bs))
+
+	// Three hours on it is overdue, and another process now holds its lock for
+	// the length of its backup.
+	s.now = func() time.Time { return t0.Add(3 * time.Hour) }
+	mock.results["app"] = tryRunResult{acquired: false, err: runner.ErrLockedByAnotherProcess}
+	s.RunAllGroups(context.Background(), bs, metaFor(bs))
+
+	if got := s.NextWake(); got != time.Hour {
+		t.Fatalf("a group locked by another process must back off a full period, got %v; %v would re-run a full discover+generate cycle that often for the lock holder's whole run", got, minWake)
+	}
+}
+
+// An in-process skip is different: our own in-flight run will record its
+// success, so the attempt mark is dropped rather than pushing the wake out.
+func TestNextWake_InProcessSkipLeavesGroupDue(t *testing.T) {
+	mock := newMockGroupRunner()
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+	s := dueTestScheduler(mock, store, t0)
+	bs := singleGroupState()
+
+	s.RunAllGroups(context.Background(), bs, metaFor(bs))
+
+	s.now = func() time.Time { return t0.Add(3 * time.Hour) }
+	mock.results["app"] = tryRunResult{acquired: false, err: nil}
+	s.RunAllGroups(context.Background(), bs, metaFor(bs))
+
+	if got := s.NextWake(); got != minWake {
+		t.Fatalf("an in-process skip must leave the group due, got %v", got)
 	}
 }
 

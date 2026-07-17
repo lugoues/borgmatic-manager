@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -324,12 +325,24 @@ func (e *env) newGenerator(outputDir string, logger *slog.Logger) *config.Genera
 	}, logger)
 }
 
-// reapStalePendingRuns removes dump helpers left behind by a previous
-// manager process that died mid-run. At startup nothing can legitimately
-// be in flight, so every persisted pending run is an orphan by definition.
-// Manual passthrough runs never record pending IDs and are never touched.
+// reapStalePendingRuns removes dump helpers left behind by a manager process
+// that died mid-run.
+//
+// A pending record is an orphan only when its owning process is gone. "Nothing
+// can be in flight at startup" stopped being true once ad-hoc runs began
+// writing pending records to the same state file: reaping indiscriminately
+// would force-remove the dump helpers of a backup still running in another
+// process, failing it or archiving a truncated database dump. Records with no
+// owner recorded (written before the PID was tracked) keep the old behavior and
+// are treated as orphans. Manual passthrough runs never record pending IDs and
+// are never touched.
 func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, reap func(context.Context, string) ([]string, error)) {
 	for runID, p := range store.PendingSnapshot() {
+		if processAlive(p.PID) {
+			slog.Info("leaving pending run alone; its process is still running",
+				"group", p.Group, "run_id", runID, "pid", p.PID)
+			continue
+		}
 		names, err := reap(ctx, runID)
 		if err != nil {
 			slog.Warn("cannot reap stale dump helpers; will retry next startup",
@@ -337,12 +350,28 @@ func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, reap 
 			continue
 		}
 		if len(names) > 0 {
-			slog.Warn("reaped dump helpers orphaned by a previous manager process",
+			slog.Warn("reaped dump helpers orphaned by a dead manager process",
 				"group", p.Group, "run_id", runID, "started", p.Started.Format(time.RFC3339),
 				"containers", strings.Join(names, ","))
 		}
 		store.ClearPending(runID)
 	}
+}
+
+// processAlive reports whether pid is a live process. Signal 0 performs the
+// permission and existence checks without delivering anything; EPERM means the
+// process exists but belongs to another user, which still counts as alive.
+//
+// A pid of 0 means "no owner recorded", a legacy record, treated as dead.
+// PID reuse could in principle mistake an unrelated process for the owner and
+// skip a reap; the helper is then cleaned up at a later startup, which is the
+// safe direction (a stray container beats killing a live backup's).
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func runDaemon() error {
@@ -424,7 +453,20 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		return err
 	}
 
-	meta, err := e.newGenerator(e.configsDir, logger).Generate(backupState)
+	// Generate into a private directory, never the daemon's live configs dir.
+	// Sharing it would mean this process's reconcile could delete a config the
+	// daemon is about to spawn borgmatic against, and, worse, that borgmatic
+	// reads the on-disk config at spawn time, so a concurrent rewrite would give
+	// it a RunID different from the one our reaper looks for, leaking the dump
+	// helper containers. Owning our own copy removes the race instead of
+	// synchronizing it.
+	configsDir, err := os.MkdirTemp("", "bm-run-*")
+	if err != nil {
+		return fmt.Errorf("creating private config directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(configsDir) }()
+
+	meta, err := e.newGenerator(configsDir, logger).Generate(backupState)
 	if err != nil {
 		return err
 	}
@@ -440,7 +482,7 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	// A verbose logger so the user watches borgmatic progress live; outcomes
 	// still land in the shared schedule state.
 	store := state.LoadSchedule(e.stateDir, logger)
-	r := runner.NewRunner(progressLogger(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
+	r := runner.NewRunner(progressLogger(), configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
 	r.SetLockDir(filepath.Join(e.stateDir, "locks"))
 	r.SetRecorder(store)
 	r.SetHelperReaper(store, func(ctx context.Context, runID string) ([]string, error) {
@@ -452,12 +494,16 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	for _, name := range targets {
 		acquired, runErr := r.TryRunGroup(ctx, name, meta[name])
 		switch {
+		case errors.Is(runErr, runner.ErrLockedByAnotherProcess):
+			// The daemon, or a concurrent ad-hoc run, holds this group's
+			// repo/snapshot lock. Ad-hoc never queues: report and move on so
+			// the operator can retry, rather than blocking on someone's backup.
+			locked = append(locked, name)
 		case runErr != nil:
 			failed = append(failed, name)
 		case !acquired:
-			// Another run (the daemon, or a concurrent ad-hoc) holds this
-			// group's repo/snapshot lock. Ad-hoc never queues: report and move
-			// on so the user can retry, rather than blocking on the backup.
+			// Held in-process; can't happen in this sequential loop, but a
+			// silent "success" here would be a lie.
 			locked = append(locked, name)
 		default:
 			store.MarkSuccess(name, scheduler.GroupFingerprint(backupState.Groups[name]), now)
@@ -589,18 +635,24 @@ func runBorgmaticPassthrough(args []string) error {
 		return err
 	}
 
-	gen := e.newGenerator(e.configsDir, logger)
-	meta, err := gen.Generate(state)
+	// Generate into a private directory, never the daemon's live configs dir:
+	// rewriting that dir hands a running borgmatic a config carrying a
+	// different RunID (leaking its dump helpers), and this pass's reconcile
+	// could delete a config out from under an in-flight run. It lives under the
+	// runtime dir (tmpfs, 0600, cleared on reboot) rather than /tmp because the
+	// file holds credentials, and exec replaces this process, so there is no
+	// opportunity to clean it up on exit.
+	configsDir := filepath.Join(e.runtimeDir, "passthrough", strconv.Itoa(os.Getpid()))
+	if mkErr := os.MkdirAll(configsDir, 0o700); mkErr != nil {
+		return fmt.Errorf("creating private config directory: %w", mkErr)
+	}
+
+	meta, err := e.newGenerator(configsDir, logger).Generate(state)
 	if err != nil {
 		return err
 	}
 	if _, ok := meta[group]; !ok {
-		groups := make([]string, 0, len(meta))
-		for name := range meta {
-			groups = append(groups, name)
-		}
-		sort.Strings(groups)
-		return fmt.Errorf("unknown group %q; discovered groups: %s", group, strings.Join(groups, ", "))
+		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(state))
 	}
 
 	borgmaticPath, err := resolveBorgmatic(e.cfg)
@@ -608,7 +660,7 @@ func runBorgmaticPassthrough(args []string) error {
 		return err
 	}
 
-	configPath := filepath.Join(e.configsDir, group+".yaml")
+	configPath := filepath.Join(configsDir, group+".yaml")
 	argv := append([]string{borgmaticPath, "--config", configPath}, args[1:]...)
 
 	// exec cannot hold the manager's cross-run locks, so passthrough bypasses them; warn once.
