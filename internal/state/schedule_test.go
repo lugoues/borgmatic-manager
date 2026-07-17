@@ -1,6 +1,7 @@
 package state_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -220,6 +221,25 @@ func TestUpdateAbortsOnReadErrorInsteadOfWiping(t *testing.T) {
 	_, hasNewcomer := reloaded.Record("newcomer")
 	assert.True(t, hasKeeper, "the existing group must survive a read error during an update")
 	assert.False(t, hasNewcomer, "the update that could not read must not have persisted (it would have wiped keeper)")
+}
+
+// A corrupt state file must be healed even by a mutation that changes nothing
+// (e.g. a Retain in a cycle where no group is due): otherwise the corpse is
+// never rewritten and the "corrupt" warning repeats every cycle.
+func TestCorruptFileHealedByNoOpMutation(t *testing.T) {
+	dir := t.TempDir()
+	schedPath := filepath.Join(dir, "schedule.json")
+	require.NoError(t, os.WriteFile(schedPath, []byte("{not json"), 0o600))
+
+	s := state.LoadSchedule(dir, discardLogger())
+	// Retain over the (empty, corrupt-degraded) state changes nothing.
+	s.Retain(map[string]struct{}{})
+
+	// The file must now be valid JSON, not the corrupt bytes.
+	data, err := os.ReadFile(schedPath)
+	require.NoError(t, err)
+	var f map[string]any
+	assert.NoError(t, json.Unmarshal(data, &f), "the corrupt file must have been rewritten as valid JSON")
 }
 
 func TestPendingRunsRoundTrip(t *testing.T) {

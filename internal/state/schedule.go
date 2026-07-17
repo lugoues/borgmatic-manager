@@ -187,16 +187,20 @@ func (s *ScheduleStore) update(mutate func(*scheduleFile) (changed bool)) {
 	}
 
 	f, err := s.readFile()
+	corrupt := false
 	switch {
 	case errors.Is(err, errCorruptState):
 		// Unparseable garbage: nothing to preserve, overwrite fresh.
 		s.logger.Warn("schedule state is corrupt; rewriting it fresh", "path", s.path, "error", err)
+		corrupt = true
 	case err != nil:
 		// Transient failure: disk state may be intact, must not clobber it.
 		s.logger.Error("cannot read schedule state; skipping this update to avoid overwriting it", "path", s.path, "error", err)
 		return
 	}
-	if !mutate(&f) {
+	// When healing a corrupt file, write even on a no-op mutation, or the corpse
+	// is never replaced and the warning repeats every cycle.
+	if !mutate(&f) && !corrupt {
 		return
 	}
 	s.writeFile(f)
