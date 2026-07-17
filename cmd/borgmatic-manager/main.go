@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -48,32 +49,52 @@ borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
 }
 
 func runCmd() *cobra.Command {
-	var scheduler bool
+	var scheduler, all bool
 	cmd := &cobra.Command{
 		Use:   "run [group...]",
-		Short: "Back up now: all groups, or the named ones; --scheduler runs the daemon",
-		Long: `Without --scheduler, run performs an immediate on-demand backup: discover,
-generate configs, and run borgmatic once for every group (or just the groups
-you name), then exit. This is the manual "back up now" path, and it records its
-results just like a scheduled run, so status and inspect see it.
+		Short: "Back up now: named groups or --all; --scheduler runs the daemon",
+		Long: `run performs an immediate on-demand backup: discover, generate configs, and run
+borgmatic once for the groups you name (or every group with --all), then exit.
+It records results just like a scheduled run, so status and inspect see it.
 
-With --scheduler, run becomes the long-lived daemon the systemd unit starts: it
-backs up on manager.period and reacts to container events. It takes no group
-arguments.`,
+With --scheduler, run is instead the long-lived daemon the systemd unit starts:
+it backs up on manager.period and reacts to container events. It takes no group
+arguments.
+
+A target is required. Bare "run" started the daemon in v1.5 and earlier, so it
+errors rather than silently doing something different to a stale caller.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cmd.SilenceUsage = true
-			if scheduler {
+			switch {
+			// Messages avoid leading with a flag: the renderer capitalizes the first letter.
+			case scheduler:
 				if len(args) > 0 {
-					return fmt.Errorf("--scheduler runs the daemon and takes no group arguments")
+					return errors.New("the --scheduler flag runs the daemon and takes no group arguments")
+				}
+				if all {
+					return errors.New("cannot combine --scheduler with --all: one runs the daemon, the other backs up once and exits")
 				}
 				return runDaemon()
+			case all:
+				if len(args) > 0 {
+					return errors.New("the --all flag already backs up every group; do not also name groups")
+				}
+				return runAdhoc(cmd.Context(), nil)
+			case len(args) > 0:
+				return runAdhoc(cmd.Context(), args)
+			default:
+				return errBareRun
 			}
-			return runAdhoc(cmd.Context(), args)
 		},
 	}
 	cmd.Flags().BoolVar(&scheduler, "scheduler", false, "run as the scheduling daemon (used by the systemd unit)")
+	cmd.Flags().BoolVar(&all, "all", false, "back up every discovered group now, then exit")
 	return cmd
 }
+
+// errBareRun refuses a target-less run: bare "run" started the daemon through
+// v1.5, so a stale systemd unit would otherwise silently back up once and exit.
+var errBareRun = errors.New(`backup target required: pass --all to back up every group, name the groups to back up, or --scheduler to run the daemon. Bare "run" started the daemon in v1.5 and earlier, if this came from a systemd unit, update its ExecStart to "run --scheduler"`)
 
 func discoverCmd() *cobra.Command {
 	return &cobra.Command{

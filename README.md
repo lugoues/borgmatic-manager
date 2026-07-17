@@ -367,7 +367,7 @@ non-root path.
 ## CLI
 
 ```
-borgmatic-manager run                     # back up all groups now, then exit
+borgmatic-manager run --all               # back up every group now, then exit
 borgmatic-manager run <group>...          # back up only these groups now
 borgmatic-manager run --scheduler         # the daemon (what the systemd unit runs)
 borgmatic-manager discover                # one-shot: print discovered groups
@@ -380,12 +380,17 @@ borgmatic-manager version
 ```
 
 `run` is the manual "back up now" path: it discovers, generates configs, and
-runs borgmatic once for every group (or just the ones you name), recording
-results into the same state `status`/`inspect` read. `run --scheduler` is the
-long-lived daemon that the systemd unit starts; it backs up on `manager.period`
-and reacts to container events. An ad-hoc `run` and the daemon can coexist
-(Borg's own repository lock serializes them); the ad-hoc path never disturbs the
-daemon's in-flight helper containers.
+runs borgmatic once for the groups you name (or every group with `--all`),
+recording results into the same state `status`/`inspect` read. `run --scheduler`
+is the long-lived daemon that the systemd unit starts; it backs up on
+`manager.period` and reacts to container events.
+
+**Upgrading from v1.5 or earlier:** bare `run` used to start the daemon and now
+requires an explicit target, so it errors instead. This is deliberate — a stale
+`ExecStart=… run` would otherwise run a full backup and exit, leaving the unit
+dead and scheduled backups silently stopped. Packaged units are updated on
+upgrade; a **hand-copied** user unit is not, so change its `ExecStart` to
+`run --scheduler`.
 
 `status` is the dashboard: last run, result, and next due per group, plus a
 live `running (Nm)` while a backup is in flight (`running?` past
