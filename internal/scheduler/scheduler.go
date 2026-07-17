@@ -24,6 +24,10 @@ import (
 // (e.g. one that keeps failing) can't spin the cycle loop hot.
 const minWake = 30 * time.Second
 
+// lockRetryInterval retries a lock-blocked group sooner than a full period (a
+// failed holder records no success) but slower than minWake (no hot cycling).
+const lockRetryInterval = 5 * time.Minute
+
 // discoverTimeout bounds discovery + generation per cycle: a wedged daemon
 // socket would otherwise block RunCycle forever and stop all scheduling.
 const discoverTimeout = 2 * time.Minute
@@ -55,6 +59,10 @@ type Scheduler struct {
 	mu          sync.Mutex
 	lastAttempt map[string]time.Time
 
+	// lockedRetry holds per-group retry times for lock-blocked runs, so NextWake
+	// wakes in lockRetryInterval rather than a full period.
+	lockedRetry map[string]time.Time
+
 	// now is overridable for testing.
 	now func() time.Time
 
@@ -80,6 +88,7 @@ func NewScheduler(
 		generator:   generator,
 		store:       store,
 		lastAttempt: map[string]time.Time{},
+		lockedRetry: map[string]time.Time{},
 		now:         time.Now,
 	}
 
@@ -184,7 +193,11 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 
 		fingerprint := GroupFingerprint(group)
 		if due, next := s.groupDue(name, fingerprint, now); !due {
+			// Succeeded within the period (maybe via the other process): clear any pending lock-retry.
 			s.logger.Debug("group not due", "group", name, "next_run", next.Format(time.RFC3339))
+			s.mu.Lock()
+			delete(s.lockedRetry, name)
+			s.mu.Unlock()
 			waiting++
 			continue
 		}
@@ -203,13 +216,12 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 			acquired, err := s.runner.TryRunGroup(ctx, groupName, m)
 			switch {
 			case errors.Is(err, runner.ErrLockedByAnotherProcess):
-				// Another process is backing this group up right now, and will
-				// hold the lock for the length of its run. Keep the optimistic
-				// attempt mark: restoring it leaves the group overdue, so
-				// NextWake clamps to minWake and spins a full discover +
-				// generate cycle (rewriting every config with fresh run IDs)
-				// every 30s for that run's entire duration.
+				// Keep the attempt mark (else NextWake spins at minWake) but schedule a
+				// bounded retry in case the other process's run fails.
 				s.logger.Debug("skipping group, locked by another process", "group", groupName)
+				s.mu.Lock()
+				s.lockedRetry[groupName] = now.Add(lockRetryInterval)
+				s.mu.Unlock()
 
 			case !acquired && err == nil:
 				// An in-flight run in this process owns the attempt mark; restore ours
@@ -221,15 +233,22 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 				} else {
 					delete(s.lastAttempt, groupName)
 				}
+				delete(s.lockedRetry, groupName)
 				s.mu.Unlock()
 
 			case err != nil:
 				s.logger.Warn("group backup error", "group", groupName, "error", err)
+				s.mu.Lock()
+				delete(s.lockedRetry, groupName)
+				s.mu.Unlock()
 
 			default:
 				if s.store != nil {
 					s.store.MarkSuccess(groupName, fingerprint, now)
 				}
+				s.mu.Lock()
+				delete(s.lockedRetry, groupName)
+				s.mu.Unlock()
 			}
 		}(name, fingerprint, m, prevAttempt, hadAttempt)
 	}
@@ -242,6 +261,11 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 		for name := range s.lastAttempt {
 			if _, ok := live[name]; !ok {
 				delete(s.lastAttempt, name)
+			}
+		}
+		for name := range s.lockedRetry {
+			if _, ok := live[name]; !ok {
+				delete(s.lockedRetry, name)
 			}
 		}
 		s.mu.Unlock()
@@ -302,6 +326,13 @@ func (s *Scheduler) NextWake() time.Duration {
 		if attempt.After(rec.LastSuccess) {
 			rec.LastSuccess = attempt
 			records[name] = rec
+		}
+	}
+	// A group awaiting a lock retry wakes us at its retry time, not a full
+	// period out (the optimistic attempt mark above would otherwise hide it).
+	for _, retry := range s.lockedRetry {
+		if d := retry.Sub(now); d < wake {
+			wake = d
 		}
 	}
 	s.mu.Unlock()

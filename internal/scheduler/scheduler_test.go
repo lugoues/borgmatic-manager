@@ -354,12 +354,11 @@ func TestDueGating_FailureIsNotMarkedSuccess(t *testing.T) {
 	}
 }
 
-// A group locked by another process (an ad-hoc run holding its repo flock) must
-// not spin the cycle loop. Restoring the attempt mark leaves the group overdue,
-// so NextWake clamps to minWake and the daemon re-runs a full discover +
-// generate, rewriting every config with fresh run IDs, which is what makes the
-// run-ID/helper-leak race likely, every 30s for that run's whole duration.
-func TestNextWake_BacksOffWhenGroupLockedByAnotherProcess(t *testing.T) {
+// A group locked by another process must retry on a bounded interval: not
+// minWake (which would spin a full discover+generate cycle every 30s for the
+// lock holder's whole run), and not a full period (which would strand the
+// group's backup if the lock holder then fails without recording success).
+func TestNextWake_LockedGroupRetriesOnBoundedInterval(t *testing.T) {
 	mock := newMockGroupRunner()
 	store := testStore(t)
 	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
@@ -369,14 +368,40 @@ func TestNextWake_BacksOffWhenGroupLockedByAnotherProcess(t *testing.T) {
 	// A success at t0 gives the group real history to go stale.
 	s.RunAllGroups(context.Background(), bs, metaFor(bs))
 
-	// Three hours on it is overdue, and another process now holds its lock for
-	// the length of its backup.
+	// Three hours on it is overdue, and another process now holds its lock.
 	s.now = func() time.Time { return t0.Add(3 * time.Hour) }
 	mock.results["app"] = tryRunResult{acquired: false, err: runner.ErrLockedByAnotherProcess}
 	s.RunAllGroups(context.Background(), bs, metaFor(bs))
 
+	if got := s.NextWake(); got != lockRetryInterval {
+		t.Fatalf("a locked group must retry in lockRetryInterval (%v), got %v (minWake=%v spins hot, a full period strands a failed holder)", lockRetryInterval, got, minWake)
+	}
+}
+
+// Once the group succeeds (here, in-process), the lock-retry is cleared and the
+// normal period cadence resumes, the bounded retry does not persist.
+func TestNextWake_LockRetryClearedOnSuccess(t *testing.T) {
+	mock := newMockGroupRunner()
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+	s := dueTestScheduler(mock, store, t0)
+	bs := singleGroupState()
+
+	s.RunAllGroups(context.Background(), bs, metaFor(bs))
+	s.now = func() time.Time { return t0.Add(3 * time.Hour) }
+	mock.results["app"] = tryRunResult{acquired: false, err: runner.ErrLockedByAnotherProcess}
+	s.RunAllGroups(context.Background(), bs, metaFor(bs))
+	if got := s.NextWake(); got != lockRetryInterval {
+		t.Fatalf("expected lock-retry wake %v, got %v", lockRetryInterval, got)
+	}
+
+	// Lock is free now; the group succeeds.
+	s.now = func() time.Time { return t0.Add(3*time.Hour + lockRetryInterval) }
+	delete(mock.results, "app")
+	s.RunAllGroups(context.Background(), bs, metaFor(bs))
+
 	if got := s.NextWake(); got != time.Hour {
-		t.Fatalf("a group locked by another process must back off a full period, got %v; %v would re-run a full discover+generate cycle that often for the lock holder's whole run", got, minWake)
+		t.Fatalf("after success the retry must clear and the full period resume, got %v", got)
 	}
 }
 
