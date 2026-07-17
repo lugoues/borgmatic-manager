@@ -334,6 +334,24 @@ func kv(label, value string) {
 	fmt.Printf(edgePad+"  %s  %s\n", styleDetail.Render(fmt.Sprintf("%-13s", label)), value)
 }
 
+// trendSeries builds total and new-data series from run history. A run with no
+// archive carries the last total forward instead of drawing a cliff to zero;
+// entries before the first archive are dropped.
+func trendSeries(history []state.RunOutcome) (totals, deltas []int64) {
+	var last int64
+	for _, h := range history {
+		if h.OriginalBytes > 0 {
+			last = h.OriginalBytes
+		}
+		if last == 0 {
+			continue
+		}
+		totals = append(totals, last)
+		deltas = append(deltas, h.DeduplicatedBytes)
+	}
+	return totals, deltas
+}
+
 var blockRunes = []rune("▁▂▃▄▅▆▇█")
 
 // sparkline renders values as a single line of block characters, scaled
@@ -441,19 +459,9 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 		}
 	}
 
-	// Size trend across successful runs, on two axes that answer different
-	// questions: "total" is each archive's full logical size (is the dataset
-	// growing?), "new" is the data that run actually added to the repository
-	// after deduplication (churn, where spikes show up). Both series cover
-	// the same runs, so the shapes are comparable.
-	totals := make([]int64, 0, len(rec.History))
-	deltas := make([]int64, 0, len(rec.History))
-	for _, h := range rec.History {
-		if h.OriginalBytes > 0 {
-			totals = append(totals, h.OriginalBytes)
-			deltas = append(deltas, h.DeduplicatedBytes)
-		}
-	}
+	// Two axes: "total" is each archive's full logical size, "new" is the data
+	// added after deduplication. Same runs in both, so the shapes are comparable.
+	totals, deltas := trendSeries(rec.History)
 	if spark := sparkline(totals); spark != "" {
 		section("Size trend")
 		fmt.Printf(edgePad+"  %s  %s   %s → %s  (%d runs)\n",

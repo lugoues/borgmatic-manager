@@ -143,6 +143,34 @@ func TestInspectRendersSectionsAndTrend(t *testing.T) {
 	assert.Contains(t, out, "peak", "the churn line summarises its peak")
 }
 
+// A run that produced no archive added no new data (delta zero), but the
+// dataset is unchanged, the total must hold its line, not drop to zero and
+// draw a cliff that never happened.
+func TestTrendSeriesCarriesTotalAcrossRunsWithNoArchive(t *testing.T) {
+	history := []state.RunOutcome{
+		{Result: state.ResultOK, OriginalBytes: 100, DeduplicatedBytes: 10},
+		{Result: state.ResultFailed, ExitCode: 1}, // no archive, no stats
+		{Result: state.ResultOK, OriginalBytes: 400, DeduplicatedBytes: 40},
+	}
+
+	totals, deltas := trendSeries(history)
+
+	assert.Equal(t, []int64{100, 100, 400}, totals, "the failed run holds the dataset size, it does not zero it")
+	assert.Equal(t, []int64{10, 0, 40}, deltas, "but it contributed no new data")
+}
+
+func TestTrendSeriesSkipsRunsBeforeTheFirstArchive(t *testing.T) {
+	history := []state.RunOutcome{
+		{Result: state.ResultFailed, ExitCode: 1}, // nothing known yet
+		{Result: state.ResultOK, OriginalBytes: 100, DeduplicatedBytes: 10},
+	}
+
+	totals, deltas := trendSeries(history)
+
+	assert.Equal(t, []int64{100}, totals, "with no total yet there is nothing to carry forward")
+	assert.Equal(t, []int64{10}, deltas)
+}
+
 // With no deduplicated stats recorded, the churn line is omitted rather than
 // drawn as a flat row of zeroes (which would read as "no new data").
 func TestInspectOmitsChurnLineWithoutDedupStats(t *testing.T) {
