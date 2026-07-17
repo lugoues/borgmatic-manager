@@ -429,24 +429,34 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 		r.recorder.RecordRun(groupName, outcome)
 	}
 
-	switch exitCode {
-	case 0:
+	switch {
+	case exitCode == 0:
 		record(state.ResultOK)
 		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode,
 			"warnings", warnings, "duration", duration.Round(time.Second).String())
 		return nil
 
-	// SIGINT/SIGTERM/SIGKILL, whether borgmatic exited with the code itself or
-	// died on the signal (mapped above). SIGKILL is ours: the run timeout
-	// escalates to it, so attributing it to a timeout beats "failed".
-	case sigintExit, sigtermExit, sigkillExit:
+	// Our own run-timeout escalation: a deliberate stop, recorded as terminated.
+	case timedOut && (exitCode == sigtermExit || exitCode == sigkillExit):
+		record(state.ResultTerminated)
+		r.logger.Warn("borgmatic timed out and was terminated", "group", groupName, "exit_code", exitCode,
+			"timeout", r.runTimeout, "duration", duration.Round(time.Second).String())
+		return fmt.Errorf("borgmatic for group %s timed out after %s and was terminated", groupName, r.runTimeout)
+
+	// SIGINT/SIGTERM without a timeout: clean shutdown, expected, not a failure.
+	case exitCode == sigintExit || exitCode == sigtermExit:
 		record(state.ResultTerminated)
 		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
-			"timed_out", timedOut, "duration", duration.Round(time.Second).String())
-		if timedOut {
-			return fmt.Errorf("borgmatic for group %s timed out after %s and was terminated", groupName, r.runTimeout)
-		}
+			"duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)
+
+	// External SIGKILL (OOM killer, kill -9) counts as failed: "terminated"
+	// would hide the group from status's failed-groups alert.
+	case exitCode == sigkillExit:
+		record(state.ResultFailed)
+		r.logger.Error("borgmatic killed (SIGKILL), likely the OOM killer or an external kill -9", "group", groupName,
+			"exit_code", exitCode, "duration", duration.Round(time.Second).String())
+		return fmt.Errorf("borgmatic for group %s was killed (exit %d); not a manager timeout, check for OOM", groupName, exitCode)
 
 	default:
 		record(state.ResultFailed)

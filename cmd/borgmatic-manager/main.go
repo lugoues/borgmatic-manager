@@ -488,15 +488,20 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	now := time.Now()
 	var failed, locked, unattempted []string
 	for i, name := range targets {
-		// An interrupt stops the loop, so everything after this point never
-		// ran. Tracking that is what keeps the summary honest: computing "ok"
-		// as targets-minus-failures would report interrupted groups as backed
-		// up.
+		// An interrupt stops the loop; everything from here on never ran.
 		if ctx.Err() != nil {
 			unattempted = append(unattempted, targets[i:]...)
 			break
 		}
 		acquired, runErr := r.TryRunGroup(ctx, name, meta[name])
+		// If the interrupt landed while this group was running, TryRunGroup
+		// returns an error, but it is an interruption, not a backup failure.
+		// Bucket this group and the rest as not-run so the summary stays
+		// honest (the whole point of the interrupt tracking).
+		if ctx.Err() != nil {
+			unattempted = append(unattempted, targets[i:]...)
+			break
+		}
 		switch {
 		case errors.Is(runErr, runner.ErrLockedByAnotherProcess):
 			// The daemon, or a concurrent ad-hoc run, holds this group's

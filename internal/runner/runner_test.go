@@ -596,6 +596,28 @@ func TestTryRunGroup_SignalDeathRecordsTerminated(t *testing.T) {
 	assert.Equal(t, 143, o.ExitCode, "SIGTERM maps to 128+15, not -1")
 }
 
+// An external SIGKILL (the OOM killer, or an operator kill -9) is an abnormal
+// death, not a manager-initiated termination. It must be recorded as failed so
+// it reaches status's failed-groups alert, recording it as "terminated" would
+// silently hide dying backups.
+func TestTryRunGroup_ExternalSigkillRecordsFailed(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.runScript = "kill -KILL $$; sleep 5" // external SIGKILL, no manager timeout
+	r := newTestRunner(t, fake, nil)          // runTimeout 0: not a timeout
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "killed", "the error must name the abnormal kill")
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["files"]
+	assert.Equal(t, state.ResultFailed, o.Result, "an external SIGKILL is a failure, not a benign termination")
+	assert.Equal(t, 137, o.ExitCode, "SIGKILL maps to 128+9")
+}
+
 // A validate killed on shutdown must still fail the group, nothing may run
 // against an unvalidated config, but must NOT be recorded as config-invalid:
 // the config was never judged, and the mark would outlive the restart, leaving
