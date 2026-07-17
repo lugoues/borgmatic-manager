@@ -551,34 +551,28 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	now := time.Now()
 	var failed, locked, unattempted []string
 	for i, name := range targets {
-		// An interrupt stops the loop; everything from here on never ran.
+		// An interrupt between groups stops the loop; nothing from here ran.
 		if ctx.Err() != nil {
 			unattempted = append(unattempted, targets[i:]...)
 			break
 		}
 		acquired, runErr := r.TryRunGroup(ctx, name, meta[name])
-		// If the interrupt landed while this group was running, TryRunGroup
-		// returns an error, but it is an interruption, not a backup failure.
-		// Bucket this group and the rest as not-run so the summary stays
-		// honest (the whole point of the interrupt tracking).
-		if ctx.Err() != nil {
-			unattempted = append(unattempted, targets[i:]...)
-			break
-		}
-		switch {
-		case errors.Is(runErr, runner.ErrLockedByAnotherProcess):
-			// The daemon, or a concurrent ad-hoc run, holds this group's
-			// repo/snapshot lock. Ad-hoc never queues: report and move on so
-			// the operator can retry, rather than blocking on someone's backup.
-			locked = append(locked, name)
-		case runErr != nil:
-			failed = append(failed, name)
-		case !acquired:
-			// Held in-process; can't happen in this sequential loop, but a
-			// silent "success" here would be a lie.
-			locked = append(locked, name)
-		default:
+
+		switch classifyAdhocOutcome(acquired, runErr, ctx.Err() != nil) {
+		case adhocSuccess:
 			store.MarkSuccess(name, scheduler.GroupFingerprint(backupState.Groups[name]), now)
+		case adhocLocked:
+			locked = append(locked, name)
+		case adhocNotRun:
+			unattempted = append(unattempted, name)
+		case adhocFailed:
+			failed = append(failed, name)
+		}
+
+		// Interrupted: the current group is already classified; the rest never run.
+		if ctx.Err() != nil {
+			unattempted = append(unattempted, targets[i+1:]...)
+			break
 		}
 	}
 
@@ -592,6 +586,38 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		return fmt.Errorf("%d group(s) are locked by a run already in progress, try again later", len(locked))
 	}
 	return nil
+}
+
+// adhocOutcome buckets one group's ad-hoc run result for the summary.
+type adhocOutcome int
+
+const (
+	adhocSuccess adhocOutcome = iota
+	adhocLocked
+	adhocNotRun // interrupted mid-run, or not reached
+	adhocFailed
+)
+
+// classifyAdhocOutcome maps a TryRunGroup result to its summary bucket. Success
+// is checked before interrupt: a group that finished just before the interrupt
+// must record its success, not be dropped as "not run".
+func classifyAdhocOutcome(acquired bool, runErr error, interrupted bool) adhocOutcome {
+	switch {
+	case runErr == nil && acquired:
+		return adhocSuccess
+	case errors.Is(runErr, runner.ErrLockedByAnotherProcess):
+		// Another process holds the repo/snapshot lock; ad-hoc never queues.
+		return adhocLocked
+	case interrupted:
+		// The error is the interruption, not a backup failure.
+		return adhocNotRun
+	case runErr != nil:
+		return adhocFailed
+	default:
+		// !acquired with no error: held in-process. Can't happen in the
+		// sequential ad-hoc loop, but a silent "success" would be a lie.
+		return adhocLocked
+	}
 }
 
 // resolveAdhocTargets returns the groups to back up: all that generated a config

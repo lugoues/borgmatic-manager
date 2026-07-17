@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/models"
+	"github.com/lugoues/borgmatic-manager/internal/runner"
 )
 
 func adhocFixture() (*models.BackupState, map[string]config.GroupRunMeta) {
@@ -59,6 +61,23 @@ func TestRunCmd_AllRejectsGroupArgs(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already backs up every group")
+}
+
+func TestClassifyAdhocOutcome(t *testing.T) {
+	lockErr := runner.ErrLockedByAnotherProcess
+	realErr := errors.New("borgmatic failed")
+
+	// The load-bearing case (finding 2): a group that COMPLETED just before an
+	// interrupt arrived must be recorded as a success, not discarded as not-run.
+	assert.Equal(t, adhocSuccess, classifyAdhocOutcome(true, nil, true),
+		"a completed-then-interrupted group records its success")
+
+	assert.Equal(t, adhocSuccess, classifyAdhocOutcome(true, nil, false), "clean success")
+	assert.Equal(t, adhocLocked, classifyAdhocOutcome(false, lockErr, false), "locked by another process")
+	assert.Equal(t, adhocNotRun, classifyAdhocOutcome(true, realErr, true),
+		"an error while interrupted is the interruption, not a failure")
+	assert.Equal(t, adhocFailed, classifyAdhocOutcome(true, realErr, false), "a real failure, not interrupted")
+	assert.Equal(t, adhocLocked, classifyAdhocOutcome(false, nil, false), "in-process skip is never a silent success")
 }
 
 func TestResolveAdhocTargets_AllWhenNoneNamed(t *testing.T) {
