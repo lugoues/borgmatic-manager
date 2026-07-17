@@ -210,6 +210,32 @@ func TestInspectOmitsChurnLineWithoutDedupStats(t *testing.T) {
 	assert.NotContains(t, out, "peak", "but the churn line is omitted without dedup stats")
 }
 
+// discover and inspect must describe a group's members identically. inspect
+// carried its own copy of the rendering and had lost the sqlite and hostname
+// cases, labelling both "container=...", which is wrong for a sqlite database
+// (it has no container connection) and for hostname mode.
+func TestDiscoverAndInspectAgreeOnMemberDetail(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	bs.AddDatabases("demo", []models.DatabaseConfig{
+		{Type: "sqlite", Name: "app", Path: "/data/app.db"},
+		{Type: "postgresql", Name: "remote", Hostname: "db.internal", Port: 5432},
+		{Type: "postgresql", Name: "local", Container: "pg"},
+	})
+	group := bs.Groups["demo"]
+	store := state.LoadSchedule(t.TempDir(), nil)
+
+	discover := captureStdout(t, func() { printGroups(bs, store) })
+	inspect := captureStdout(t, func() {
+		printInspect("demo", group, state.GroupRecord{}, false, "", "none", time.Hour)
+	})
+
+	for _, want := range []string{"/data/app.db", "hostname=db.internal port=5432", "container=pg"} {
+		assert.Contains(t, discover, want)
+		assert.Contains(t, inspect, want, "inspect must describe members exactly as discover does")
+	}
+}
+
 func TestInspectHandlesNoHistory(t *testing.T) {
 	bs := models.NewBackupState()
 	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})

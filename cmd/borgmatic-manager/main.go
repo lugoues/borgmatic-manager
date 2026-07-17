@@ -131,9 +131,9 @@ func runStatus(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	period, err := time.ParseDuration(e.cfg.Manager.Period)
+	period, err := e.cfg.ParsedPeriod()
 	if err != nil {
-		return fmt.Errorf("parsing manager.period: %w", err)
+		return err
 	}
 	// Plan (no writes) surfaces groups generation refuses, so status can
 	// say "refused" instead of a forever-"due now" that never runs.
@@ -181,9 +181,9 @@ func runInspect(ctx context.Context, group string) error {
 	if !ok {
 		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(backupState))
 	}
-	period, err := time.ParseDuration(e.cfg.Manager.Period)
+	period, err := e.cfg.ParsedPeriod()
 	if err != nil {
-		return fmt.Errorf("parsing manager.period: %w", err)
+		return err
 	}
 
 	rec, haveRec := stateStore(e, logger).Record(group)

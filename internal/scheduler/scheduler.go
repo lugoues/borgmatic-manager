@@ -84,7 +84,7 @@ func NewScheduler(
 	}
 
 	// An unparseable period surfaces from Start; until then 0 means always due.
-	if period, err := time.ParseDuration(cfg.Manager.Period); err == nil {
+	if period, err := cfg.ParsedPeriod(); err == nil {
 		s.period = period
 	}
 
@@ -113,19 +113,41 @@ func GroupFingerprint(group *models.VolumeGroup) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// groupDue reports whether a group should run now, and when it is next due
-// otherwise. Unknown groups, changed membership, and clock rollbacks all
-// resolve to "due": the safe failure direction is an extra backup.
+// Dueness describes whether a group should run now, and why. It is the single
+// authority on the rules, so scheduler, status, and inspect cannot disagree.
+type Dueness struct {
+	Due bool
+	// Next is when the group next comes due; meaningful only when !Due.
+	Next time.Time
+	// MembershipChanged reports the content set changed since last success,
+	// which makes the group due regardless of the period.
+	MembershipChanged bool
+}
+
+// Due applies the dueness rules; period <= 0 means always due. Unknown groups,
+// changed membership, and clock rollbacks resolve to due: an extra backup is
+// the safe failure direction.
+func Due(rec state.GroupRecord, haveRec bool, fingerprint string, period time.Duration, now time.Time) Dueness {
+	if period <= 0 || !haveRec {
+		return Dueness{Due: true, Next: now}
+	}
+	if rec.Fingerprint != fingerprint {
+		return Dueness{Due: true, Next: now, MembershipChanged: true}
+	}
+	if rec.LastSuccess.After(now) {
+		return Dueness{Due: true, Next: now} // clock rolled back
+	}
+	next := rec.LastSuccess.Add(period)
+	return Dueness{Due: !now.Before(next), Next: next}
+}
+
 func (s *Scheduler) groupDue(name, fingerprint string, now time.Time) (bool, time.Time) {
-	if s.store == nil || s.period <= 0 {
+	if s.store == nil {
 		return true, now
 	}
 	rec, ok := s.store.Record(name)
-	if !ok || rec.Fingerprint != fingerprint || rec.LastSuccess.After(now) {
-		return true, now
-	}
-	next := rec.LastSuccess.Add(s.period)
-	return !now.Before(next), next
+	d := Due(rec, ok, fingerprint, s.period, now)
+	return d.Due, d.Next
 }
 
 // RunAllGroups runs every due group in parallel goroutines; per-group errors

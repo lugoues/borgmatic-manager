@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -15,6 +16,19 @@ import (
 type ManagerConfig struct {
 	Manager   ManagerSettings        `yaml:"manager"`
 	Borgmatic map[string]interface{} `yaml:"borgmatic"`
+}
+
+// ParsedPeriod parses and validates manager.period in one place. Non-positive
+// periods are rejected: zero would hot-loop the cycle timer.
+func (c *ManagerConfig) ParsedPeriod() (time.Duration, error) {
+	d, err := time.ParseDuration(c.Manager.Period)
+	if err != nil {
+		return 0, fmt.Errorf("invalid manager.period %q: %w", c.Manager.Period, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid manager.period %q: must be positive", c.Manager.Period)
+	}
+	return d, nil
 }
 
 // ManagerSettings holds manager-specific runtime configuration.

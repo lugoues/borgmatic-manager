@@ -88,10 +88,6 @@ func (d *DockerRuntime) ListVolumes(ctx context.Context) ([]VolumeInfo, error) {
 		return nil, fmt.Errorf("listing volumes: %w", err)
 	}
 
-	if len(resp.Volumes) == 0 {
-		return nil, nil
-	}
-
 	vols := make([]VolumeInfo, 0, len(resp.Volumes))
 	for _, v := range resp.Volumes {
 		vols = append(vols, VolumeInfo{
@@ -113,10 +109,6 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 	})
 	if err != nil {
 		return nil, fmt.Errorf("listing containers: %w", err)
-	}
-
-	if len(containers) == 0 {
-		return nil, nil
 	}
 
 	infos := make([]ContainerInfo, 0, len(containers))

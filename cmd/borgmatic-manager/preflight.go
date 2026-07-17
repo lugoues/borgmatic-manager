@@ -39,13 +39,10 @@ type preflightResult struct {
 func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	res := &preflightResult{}
 
-	// manager.period must parse to a positive duration, a typo would
-	// otherwise silently disable periodic backups, and zero/negative
-	// values would hot-loop the cycle timer.
-	if p, err := time.ParseDuration(e.cfg.Manager.Period); err != nil {
-		return nil, fmt.Errorf("invalid manager.period %q: %w", e.cfg.Manager.Period, err)
-	} else if p <= 0 {
-		return nil, fmt.Errorf("invalid manager.period %q: must be positive", e.cfg.Manager.Period)
+	// A typo here would otherwise silently disable periodic backups, and a
+	// zero or negative period would hot-loop the cycle timer.
+	if _, err := e.cfg.ParsedPeriod(); err != nil {
+		return nil, err
 	}
 
 	timeout, timeoutErr := runTimeoutFromConfig(e.cfg)
@@ -148,14 +145,13 @@ func resolveBorgmatic(cfg *config.ManagerConfig) (string, error) {
 // snapshotHooksConfigured reports whether any btrfs/zfs/lvm hook appears in
 // the global borgmatic defaults or any per-group override.
 func snapshotHooksConfigured(cfg *config.ManagerConfig, overrides map[string]map[string]interface{}) bool {
-	hooks := []string{"btrfs", "zfs", "lvm"}
-	for _, h := range hooks {
+	for _, h := range config.SnapshotHookKeys {
 		if _, ok := cfg.Borgmatic[h]; ok {
 			return true
 		}
 	}
 	for _, override := range overrides {
-		for _, h := range hooks {
+		for _, h := range config.SnapshotHookKeys {
 			if _, ok := override[h]; ok {
 				return true
 			}

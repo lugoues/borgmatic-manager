@@ -86,30 +86,52 @@ func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
 		}
 		fmt.Println(spreadLine(styleGroup.Render(name), styleDetail.Render(lastBackup)))
 
-		for _, v := range group.Volumes {
-			fmt.Printf(edgePad+"  %s  %s  %s\n",
-				styleKind.Render(fmt.Sprintf("%-8s", "volume")),
-				styleName.Render(fmt.Sprintf("%-*s", nameWidth, v.Name)),
-				styleDetail.Render(v.HostPath),
-			)
-		}
-		for _, db := range group.Databases {
-			detail := "container=" + db.Container
-			switch {
-			case db.Type == "sqlite":
-				detail = db.Path
-			case db.Hostname != "":
-				detail = fmt.Sprintf("hostname=%s port=%d", db.Hostname, db.Port)
-			case db.Mode == "exec":
-				detail = "container=" + db.Container + " (exec)"
-			}
-			fmt.Printf(edgePad+"  %s  %s  %s\n",
-				styleKind.Render(fmt.Sprintf("%-8s", "database")),
-				styleName.Render(fmt.Sprintf("%-*s", nameWidth, db.Type+"/"+db.Name)),
-				styleDetail.Render(detail),
-			)
-		}
+		printMemberRows(group, nameWidth)
 	}
+}
+
+// printMemberRows renders a group's volume and database rows. Shared by discover
+// and inspect so the two cannot disagree about what a group contains.
+func printMemberRows(group *models.VolumeGroup, nameWidth int) {
+	for _, v := range group.Volumes {
+		fmt.Printf(edgePad+"  %s  %s  %s\n",
+			styleKind.Render(fmt.Sprintf("%-8s", "volume")),
+			styleName.Render(fmt.Sprintf("%-*s", nameWidth, v.Name)),
+			styleDetail.Render(v.HostPath),
+		)
+	}
+	for _, db := range group.Databases {
+		fmt.Printf(edgePad+"  %s  %s  %s\n",
+			styleKind.Render(fmt.Sprintf("%-8s", "database")),
+			styleName.Render(fmt.Sprintf("%-*s", nameWidth, db.Type+"/"+db.Name)),
+			styleDetail.Render(databaseDetail(db)),
+		)
+	}
+}
+
+// databaseDetail describes where a database's dump comes from.
+func databaseDetail(db models.DatabaseConfig) string {
+	switch {
+	case db.Type == "sqlite":
+		return db.Path
+	case db.Hostname != "":
+		return fmt.Sprintf("hostname=%s port=%d", db.Hostname, db.Port)
+	case db.Mode == "exec":
+		return "container=" + db.Container + " (exec)"
+	default:
+		return "container=" + db.Container
+	}
+}
+
+func memberNameWidth(group *models.VolumeGroup) int {
+	width := 0
+	for _, v := range group.Volumes {
+		width = max(width, len(v.Name))
+	}
+	for _, db := range group.Databases {
+		width = max(width, len(db.Type+"/"+db.Name))
+	}
+	return width
 }
 
 // summaryCounts renders "N groups · N volumes · N databases".
@@ -234,20 +256,15 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 			rows = append(rows, r)
 			continue
 		}
-		switch {
-		case refused[name] != "":
+		if refused[name] != "" {
 			r.next = "refused: " + refused[name]
 			rows = append(rows, r)
 			continue // a refused group never runs; keep it out of soonest
-		case !ok:
-			// r.next stays "due now"
-		case rec.Fingerprint != scheduler.GroupFingerprint(group):
-			r.next = "due now (membership changed)"
-		case rec.LastSuccess.Add(period).After(now):
-			wait = time.Until(rec.LastSuccess.Add(period))
-			r.next = "in " + shortDuration(wait)
-		default:
-			r.next = "due now"
+		}
+		due := scheduler.Due(rec, ok, scheduler.GroupFingerprint(group), period, now)
+		r.next = dueLabel(due, now)
+		if !due.Due {
+			wait = time.Until(due.Next)
 		}
 		if soonest < 0 || wait < soonest {
 			soonest = wait
@@ -267,10 +284,8 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 	fmt.Println(spreadLine(styleTitle.Render("Status"), styleDetail.Render(header)))
 	fmt.Println()
 
-	tbl := table.New().
-		BorderTop(false).BorderBottom(false).BorderLeft(false).BorderRight(false).
-		BorderColumn(false).BorderHeader(false).BorderRow(false).
-		StyleFunc(func(row, col int) lipgloss.Style {
+	tbl := borderlessTable(
+		func(row, col int) lipgloss.Style {
 			base := lipgloss.NewStyle().PaddingRight(2)
 			switch {
 			case row == table.HeaderRow:
@@ -298,12 +313,12 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 				return base.Inherit(styleDetail)
 			}
 			return base
-		}).
-		Headers("group", "last run", "result", "files", "size", "next run")
+		},
+		"group", "last run", "result", "files", "size", "next run")
 	for _, r := range rows {
 		tbl.Row(r.name, r.last, r.result, r.files, r.size, r.next)
 	}
-	fmt.Println(lipgloss.NewStyle().MarginLeft(hPad).Render(tbl.Render()))
+	printTable(tbl)
 
 	// Failed groups get a pointer to inspect; status stays a dashboard.
 	var failed []string
@@ -321,6 +336,19 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 			styleDetail.Render(" to see why, or ") +
 			styleName.Render("logs <group>") +
 			styleDetail.Render(" for the full output."))
+	}
+}
+
+// dueLabel renders a group's dueness for display. Both status and inspect use
+// it, so they can never disagree with each other or with the scheduler.
+func dueLabel(d scheduler.Dueness, now time.Time) string {
+	switch {
+	case d.MembershipChanged:
+		return "due now (membership changed)"
+	case d.Due:
+		return "due now"
+	default:
+		return "in " + shortDuration(d.Next.Sub(now))
 	}
 }
 
@@ -388,25 +416,7 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	fmt.Println(spreadLine(styleTitle.Render("Inspect "+name), styleDetail.Render(memberCount)))
 
 	section("Members")
-	nameWidth := 0
-	for _, v := range group.Volumes {
-		nameWidth = max(nameWidth, len(v.Name))
-	}
-	for _, db := range group.Databases {
-		nameWidth = max(nameWidth, len(db.Type+"/"+db.Name))
-	}
-	for _, v := range group.Volumes {
-		fmt.Printf(edgePad+"  %s  %s  %s\n",
-			styleKind.Render(fmt.Sprintf("%-8s", "volume")),
-			styleName.Render(fmt.Sprintf("%-*s", nameWidth, v.Name)),
-			styleDetail.Render(v.HostPath))
-	}
-	for _, db := range group.Databases {
-		fmt.Printf(edgePad+"  %s  %s  %s\n",
-			styleKind.Render(fmt.Sprintf("%-8s", "database")),
-			styleName.Render(fmt.Sprintf("%-*s", nameWidth, db.Type+"/"+db.Name)),
-			styleDetail.Render("container="+db.Container))
-	}
+	printMemberRows(group, memberNameWidth(group))
 
 	section("Schedule")
 	if haveRec && !rec.LastSuccess.IsZero() {
@@ -414,16 +424,7 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	} else {
 		kv("last backup", styleDetail.Render("never"))
 	}
-	switch {
-	case !haveRec:
-		kv("next run", "due now")
-	case rec.Fingerprint != scheduler.GroupFingerprint(group):
-		kv("next run", "due now "+styleDetail.Render("(membership changed)"))
-	case rec.LastSuccess.Add(period).After(now):
-		kv("next run", "in "+shortDuration(time.Until(rec.LastSuccess.Add(period))))
-	default:
-		kv("next run", "due now")
-	}
+	kv("next run", dueLabel(scheduler.Due(rec, haveRec, scheduler.GroupFingerprint(group), period, now), now))
 
 	if rec.LastRun != nil {
 		o := rec.LastRun
@@ -554,10 +555,8 @@ func printRecentRuns(history []state.RunOutcome, now time.Time) {
 		display = append(display, rr{when, result, size, shortDuration(time.Duration(o.DurationSeconds) * time.Second)})
 	}
 
-	tbl := table.New().
-		BorderTop(false).BorderBottom(false).BorderLeft(false).BorderRight(false).
-		BorderColumn(false).BorderHeader(false).BorderRow(false).
-		StyleFunc(func(row, col int) lipgloss.Style {
+	tbl := borderlessTable(
+		func(row, col int) lipgloss.Style {
 			base := lipgloss.NewStyle().PaddingRight(2)
 			switch {
 			case row == table.HeaderRow:
@@ -569,11 +568,25 @@ func printRecentRuns(history []state.RunOutcome, now time.Time) {
 				return base.Inherit(styleBad)
 			}
 			return base
-		}).
-		Headers("when", "result", "size", "duration")
+		},
+		"when", "result", "size", "duration")
 	for _, r := range display {
 		tbl.Row(r.when, r.result, r.size, r.duration)
 	}
+	printTable(tbl)
+}
+
+// borderlessTable builds the plain listing style shared by status and inspect.
+func borderlessTable(styleFunc func(row, col int) lipgloss.Style, headers ...string) *table.Table {
+	return table.New().
+		BorderTop(false).BorderBottom(false).BorderLeft(false).BorderRight(false).
+		BorderColumn(false).BorderHeader(false).BorderRow(false).
+		StyleFunc(styleFunc).
+		Headers(headers...)
+}
+
+// printTable renders a table inset from the terminal edge.
+func printTable(tbl *table.Table) {
 	fmt.Println(lipgloss.NewStyle().MarginLeft(hPad).Render(tbl.Render()))
 }
 
