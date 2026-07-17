@@ -28,6 +28,10 @@ var snapshotHookKeys = []string{"btrfs", "zfs", "lvm"}
 // defaultArchiveNameFormat: {group} is substituted by the manager, the rest by borg.
 const defaultArchiveNameFormat = "{hostname}-{group}-{now:%Y-%m-%d_%H:%M}"
 
+// groupTokenPlaceholder is substituted with the group name. Requiring the
+// literal token keeps groups sharing a repository distinguishable at prune time.
+const groupTokenPlaceholder = "{group}"
+
 // GroupRunMeta is scheduling metadata extracted from a group's generated config.
 type GroupRunMeta struct {
 	// Repos are canonicalized repository keys. Groups sharing a key must not
@@ -155,6 +159,10 @@ type pending struct {
 	name  string
 	final map[string]interface{}
 	meta  GroupRunMeta
+	// groupToken: archive_name_format carried the literal {group} token before
+	// substitution. Shared-repo groups need the token, not a substring match,
+	// or one group's prune can delete another's archives.
+	groupToken bool
 }
 
 // plan builds every group's final config in memory (pass 1) and applies
@@ -203,11 +211,14 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 		if format == "" {
 			format = defaultArchiveNameFormat
 		}
-		final["archive_name_format"] = strings.ReplaceAll(format, "{group}", groupName)
+		// Record the token before substitution: pass 2 needs the literal {group}, not a substring.
+		hasGroupToken := strings.Contains(format, groupTokenPlaceholder)
+		final["archive_name_format"] = strings.ReplaceAll(format, groupTokenPlaceholder, groupName)
 
 		entries = append(entries, &pending{
-			name:  groupName,
-			final: final,
+			name:       groupName,
+			final:      final,
+			groupToken: hasGroupToken,
 			meta: GroupRunMeta{
 				Repos:         extractRepoKeys(final),
 				SnapshotHooks: hasSnapshotHooks(final),
@@ -235,11 +246,15 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 				break
 			}
 		}
-		format, _ := e.final["archive_name_format"].(string)
-		if sharesRepo && !strings.Contains(format, e.name) {
-			g.logger.Error("archive_name_format must contain the group name (use the {group} token) when groups share a repository, retention for one group would otherwise prune the others' archives; skipping group",
+		// The token, not the resolved name: a substring match here would accept
+		// "{hostname}-appdata-{now}" for both "app" and "data", leaving their
+		// archives indistinguishable and letting one group's prune delete the
+		// other's, the exact loss this guard exists to prevent.
+		if sharesRepo && !e.groupToken {
+			format, _ := e.final["archive_name_format"].(string)
+			g.logger.Error("archive_name_format must contain the literal {group} token when groups share a repository, retention for one group would otherwise prune the others' archives; skipping group",
 				"group", e.name, "archive_name_format", format)
-			refusals = append(refusals, Refusal{Group: e.name, Reason: "archive_name_format must contain the group name when groups share a repository"})
+			refusals = append(refusals, Refusal{Group: e.name, Reason: "archive_name_format must contain the {group} token when groups share a repository"})
 			continue
 		}
 		kept = append(kept, e)

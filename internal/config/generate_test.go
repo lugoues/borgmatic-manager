@@ -529,8 +529,65 @@ func TestGenerateCustomFormatWithoutGroupRefusedOnSharedRepo(t *testing.T) {
 	assert.Empty(t, meta, "groups sharing a repo with an indistinguishable format must be refused")
 	_, statErr := os.Stat(filepath.Join(outDir, "alpha.yaml"))
 	assert.True(t, os.IsNotExist(statErr), "no config may be written for a refused group")
-	assert.Contains(t, buf.String(), "must contain the group name")
-	assert.Contains(t, buf.String(), "{group}")
+	assert.Contains(t, buf.String(), "must contain the literal {group} token")
+}
+
+// The guard must require the {group} token, not merely that the resolved format
+// happens to contain the group's name: "{hostname}-appdata-{now}" contains both
+// "app" and "data" as substrings, so a Contains-based check passed both groups
+// while leaving their archives identically named, letting one group's prune
+// permanently delete the other's archives.
+func TestGenerateSubstringGroupNameRefusedOnSharedRepo(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("data", models.VolumeInfo{Name: "d", HostPath: "/mnt/d"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+			"archive_name_format": "{hostname}-appdata-{now}", // contains "app" and "data"; no {group}
+		},
+	}
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	outDir := t.TempDir()
+	g := config.NewGenerator(cfg, nil, outDir, config.GeneratorOptions{}, logger)
+	g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
+
+	meta, err := g.Generate(state)
+	require.NoError(t, err)
+
+	assert.Empty(t, meta, "a format merely containing the group names as substrings must be refused, not accepted")
+	for _, group := range []string{"app", "data"} {
+		_, statErr := os.Stat(filepath.Join(outDir, group+".yaml"))
+		assert.True(t, os.IsNotExist(statErr), "no config may be written for refused group %s", group)
+	}
+	assert.Contains(t, buf.String(), "must contain the literal {group} token")
+}
+
+// The token still satisfies the guard for groups sharing a repository.
+func TestGenerateGroupTokenAllowedOnSharedRepo(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("data", models.VolumeInfo{Name: "d", HostPath: "/mnt/d"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+			"archive_name_format": "{hostname}-{group}-{now}",
+		},
+	}
+
+	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	meta, err := g.Generate(state)
+	require.NoError(t, err)
+
+	require.Contains(t, meta, "app")
+	require.Contains(t, meta, "data")
+	assert.Equal(t, "{hostname}-app-{now}", readGenerated(t, outDir, "app")["archive_name_format"])
+	assert.Equal(t, "{hostname}-data-{now}", readGenerated(t, outDir, "data")["archive_name_format"],
+		"each group's archives carry its own name, so prune stays scoped")
 }
 
 func TestGeneratePrefixGroupNamesWarnOnSharedRepo(t *testing.T) {

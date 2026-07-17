@@ -159,11 +159,13 @@ borgmatic:
   archive_name_format: "{group}-{now:%Y-%m-%d_%H:%M}"
 ```
 
-Safety rule, enforced at generation: when groups share a repository, the
-format must contain the group name (use `{group}`) — retention is scoped by
-archive name, so indistinguishable formats would let one group's prune eat
-another group's history. Groups with exclusive repositories may use any
-format.
+Safety rule, enforced at generation: when groups share a repository, the format
+must contain the literal `{group}` token — retention is scoped by archive name,
+so indistinguishable formats would let one group's prune eat another group's
+history. The token is required, not merely the group's name: a format like
+`{hostname}-appdata-{now}` happens to contain both "app" and "data" yet names
+every group's archives identically, which is exactly the collision this rule
+exists to prevent. Groups with exclusive repositories may use any format.
 
 ### How database dumps run
 
