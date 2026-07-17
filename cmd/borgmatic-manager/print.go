@@ -585,20 +585,22 @@ func colorLogLine(line string) string {
 	return styleDetail.Render(line)
 }
 
-// printAdhocSummary reports the outcome of an on-demand `run` to stdout.
-// locked lists groups a concurrent run already holds a lock on (ad-hoc never
-// waits, the user retries).
-func printAdhocSummary(targets, failed, locked []string) {
+// printAdhocSummary reports an on-demand run's outcome. unattempted groups were
+// stopped by an interrupt and must never be counted as backed up.
+func printAdhocSummary(targets, failed, locked, unattempted []string) {
 	fmt.Println()
-	if len(failed) == 0 && len(locked) == 0 {
+	if len(failed) == 0 && len(locked) == 0 && len(unattempted) == 0 {
 		fmt.Println(edgePad + styleName.Render(fmt.Sprintf("✓ backed up %s", plural(len(targets), "group"))))
 		fmt.Println()
 		return
 	}
 
-	okCount := len(targets) - len(failed) - len(locked)
-	fmt.Println(edgePad + styleTitle.Render("Run complete") +
-		styleDetail.Render(fmt.Sprintf("  %d ok · %d failed · %d locked", okCount, len(failed), len(locked))))
+	okCount := len(targets) - len(failed) - len(locked) - len(unattempted)
+	summary := fmt.Sprintf("  %d ok · %d failed · %d locked", okCount, len(failed), len(locked))
+	if len(unattempted) > 0 {
+		summary += fmt.Sprintf(" · %d not run", len(unattempted))
+	}
+	fmt.Println(edgePad + styleTitle.Render("Run complete") + styleDetail.Render(summary))
 	if len(failed) > 0 {
 		fmt.Println()
 		fmt.Println(edgePad + styleBad.Render("failed") + styleDetail.Render(": "+strings.Join(failed, ", ")))
@@ -611,6 +613,11 @@ func printAdhocSummary(targets, failed, locked []string) {
 		fmt.Println(edgePad + styleWarn.Render("locked") +
 			styleDetail.Render(" (a run is already in progress): "+strings.Join(locked, ", ")))
 		fmt.Println(edgePad + styleDetail.Render("Not queued. Try again once it finishes."))
+	}
+	if len(unattempted) > 0 {
+		fmt.Println()
+		fmt.Println(edgePad + styleWarn.Render("not run") +
+			styleDetail.Render(" (interrupted): "+strings.Join(unattempted, ", ")))
 	}
 	fmt.Println()
 }

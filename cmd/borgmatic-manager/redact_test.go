@@ -33,6 +33,41 @@ func TestRedactConfigSecrets(t *testing.T) {
 	assert.Contains(t, out, "source_directories:")
 }
 
+// A secret containing a newline is marshaled by yaml.v3 as a block scalar
+// ("password: |-" plus indented lines). Masking only the key's line would print
+// the secret body verbatim under a banner claiming secrets were redacted.
+func TestRedactMultilineBlockScalarSecrets(t *testing.T) {
+	in := strings.Join([]string{
+		"encryption_passphrase: |-",
+		"    PASSPHRASE_LINE_ONE",
+		"    PASSPHRASE_LINE_TWO",
+		"keep_daily: 14",
+		"postgresql_databases:",
+		"    - name: appdb",
+		"      password: |-",
+		"        DBSECRET_LINE_ONE",
+		"        DBSECRET_LINE_TWO",
+		"      hostname: 127.0.0.1",
+	}, "\n")
+
+	out := redactConfigSecrets(in)
+
+	for _, secret := range []string{
+		"PASSPHRASE_LINE_ONE", "PASSPHRASE_LINE_TWO",
+		"DBSECRET_LINE_ONE", "DBSECRET_LINE_TWO",
+	} {
+		assert.NotContains(t, out, secret, "the block scalar body must not survive redaction")
+	}
+	assert.Contains(t, out, "encryption_passphrase: ***redacted***")
+	assert.Contains(t, out, "password: ***redacted***")
+
+	// Structure around the blocks stays intact: consuming the body must stop at
+	// the next key, not swallow the rest of the document.
+	assert.Contains(t, out, "keep_daily: 14")
+	assert.Contains(t, out, "name: appdb")
+	assert.Contains(t, out, "hostname: 127.0.0.1")
+}
+
 func TestRedactLeavesCredentialReferences(t *testing.T) {
 	in := `encryption_passphrase: "{credential systemd BORG_PASSPHRASE}"`
 

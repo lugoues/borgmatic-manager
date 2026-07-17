@@ -575,7 +575,32 @@ func TestTryRunGroup_RunsWhenLockFree(t *testing.T) {
 	assert.NotEmpty(t, fake.callArgs(), "borgmatic is invoked")
 }
 
-func TestValidateConfig_TimeoutKillsAndFails(t *testing.T) {
+// A borgmatic that dies on a signal has no exit status of its own: Go reports
+// ExitCode() == -1. Without mapping that to the shell's 128+signal convention it
+// falls through to "failed (exit -1)", including for a SIGKILL the manager
+// itself sent after the run timeout.
+func TestTryRunGroup_SignalDeathRecordsTerminated(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.runScript = "kill -TERM $$; sleep 5" // die on SIGTERM, no exit code of our own
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["files"]
+	assert.Equal(t, state.ResultTerminated, o.Result, "signal death is a termination, not a failure")
+	assert.Equal(t, 143, o.ExitCode, "SIGTERM maps to 128+15, not -1")
+}
+
+// A validate killed on shutdown must still fail the group, nothing may run
+// against an unvalidated config, but must NOT be recorded as config-invalid:
+// the config was never judged, and the mark would outlive the restart, leaving
+// the group flagged broken until its next successful run.
+func TestValidateConfig_ShutdownDoesNotMarkConfigInvalid(t *testing.T) {
 	fake := newFakeExecutor()
 	fake.validateScript = "sleep 60"
 	r := newTestRunner(t, fake, nil)
@@ -583,8 +608,6 @@ func TestValidateConfig_TimeoutKillsAndFails(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	// Shrink the validate timeout via a cancelled context (the shutdown
-	// path exercises the same terminate-and-wait machinery).
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
 
@@ -595,9 +618,8 @@ func TestValidateConfig_TimeoutKillsAndFails(t *testing.T) {
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	o, ok := rec.outcomes["wedged"]
-	require.True(t, ok, "validation failures must reach status")
-	assert.Equal(t, "config-invalid", o.Result)
+	assert.NotContains(t, rec.outcomes, "wedged",
+		"a validate killed on the way down says nothing about the config")
 }
 
 func TestValidateConfig_FailureRecordedForStatus(t *testing.T) {

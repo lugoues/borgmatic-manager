@@ -31,6 +31,13 @@ var defaultActions = []string{actionCreate, "prune", "compact", "check"}
 // defaultKillGrace is the SIGTERM-to-SIGKILL grace after a run timeout fires.
 const defaultKillGrace = 60 * time.Second
 
+// Shell-convention exit codes for death by signal (128 + signal number).
+const (
+	sigintExit  = 130 // 128 + SIGINT
+	sigkillExit = 137 // 128 + SIGKILL, the run timeout's escalation
+	sigtermExit = 143 // 128 + SIGTERM, shutdown
+)
+
 // snapshotLockKey serializes groups with snapshot hooks: borgmatic's snapshot
 // cleanup is name-prefix-matched, so concurrent runs destroy each other's snapshots.
 const snapshotLockKey = "snapshots"
@@ -331,14 +338,22 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 	defer timer.Stop()
 
 	var err error
+	var interrupted bool
 	select {
 	case err = <-done:
 	case <-ctx.Done():
+		interrupted = true
 		r.logger.Info("shutdown: signalling config validation", "group", groupName)
 		err = r.terminateAndWait(cmd, done, groupName)
 	case <-timer.C:
 		r.logger.Error("config validation timed out: signalling borgmatic", "group", groupName, "timeout", validateTimeout)
 		err = r.terminateAndWait(cmd, done, groupName)
+	}
+
+	// A validation we killed says nothing about the config; recording
+	// config-invalid would leave the group falsely marked broken.
+	if interrupted {
+		return fmt.Errorf("config validation for group %s interrupted: %w", groupName, ctx.Err())
 	}
 
 	if err != nil {
@@ -383,6 +398,11 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
+			// Signal deaths report ExitCode -1; map to the shell's 128+signal
+			// convention so our own terminations are not "failed (exit -1)".
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				exitCode = 128 + int(status.Signal())
+			}
 		} else {
 			return fmt.Errorf("waiting for borgmatic for group %s: %w", groupName, waitErr)
 		}
@@ -421,10 +441,16 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 			"warnings", warnings, "duration", duration.Round(time.Second).String())
 		return nil
 
-	case 143, 130:
+	// SIGINT/SIGTERM/SIGKILL, whether borgmatic exited with the code itself or
+	// died on the signal (mapped above). SIGKILL is ours: the run timeout
+	// escalates to it, so attributing it to a timeout beats "failed".
+	case sigintExit, sigtermExit, sigkillExit:
 		record(state.ResultTerminated)
 		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
 			"timed_out", timedOut, "duration", duration.Round(time.Second).String())
+		if timedOut {
+			return fmt.Errorf("borgmatic for group %s timed out after %s and was terminated", groupName, r.runTimeout)
+		}
 		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)
 
 	default:

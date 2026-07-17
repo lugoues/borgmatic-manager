@@ -84,6 +84,22 @@ func TestStatusFailurePointsToInspect(t *testing.T) {
 	assert.Contains(t, out, "inspect", "and the pointer must send the user to inspect")
 }
 
+// Interrupting a multi-group run must not report the groups it never reached as
+// backed up: "ok" is what actually ran, not everything minus the failures.
+func TestAdhocSummaryDoesNotCountInterruptedGroupsAsOk(t *testing.T) {
+	targets := []string{"a", "b", "c", "d", "e"}
+
+	out := captureStdout(t, func() {
+		// Only "a" ran; an interrupt stopped the rest.
+		printAdhocSummary(targets, nil, nil, []string{"b", "c", "d", "e"})
+	})
+
+	assert.Contains(t, out, "1 ok", "only the group that actually ran counts as ok")
+	assert.Contains(t, out, "4 not run")
+	assert.Contains(t, out, "interrupted")
+	assert.NotContains(t, out, "✓ backed up", "an interrupted run is not a clean success")
+}
+
 func TestStatusShowsRunningGroup(t *testing.T) {
 	bs := models.NewBackupState()
 	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})

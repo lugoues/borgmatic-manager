@@ -490,8 +490,16 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	})
 
 	now := time.Now()
-	var failed, locked []string
-	for _, name := range targets {
+	var failed, locked, unattempted []string
+	for i, name := range targets {
+		// An interrupt stops the loop, so everything after this point never
+		// ran. Tracking that is what keeps the summary honest: computing "ok"
+		// as targets-minus-failures would report interrupted groups as backed
+		// up.
+		if ctx.Err() != nil {
+			unattempted = append(unattempted, targets[i:]...)
+			break
+		}
 		acquired, runErr := r.TryRunGroup(ctx, name, meta[name])
 		switch {
 		case errors.Is(runErr, runner.ErrLockedByAnotherProcess):
@@ -508,15 +516,14 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		default:
 			store.MarkSuccess(name, scheduler.GroupFingerprint(backupState.Groups[name]), now)
 		}
-		if ctx.Err() != nil {
-			break // interrupted; stop launching further groups
-		}
 	}
 
-	printAdhocSummary(targets, failed, locked)
+	printAdhocSummary(targets, failed, locked, unattempted)
 	switch {
 	case len(failed) > 0:
 		return fmt.Errorf("%d of %d group(s) failed", len(failed), len(targets))
+	case len(unattempted) > 0:
+		return fmt.Errorf("interrupted: %d group(s) were not backed up", len(unattempted))
 	case len(locked) > 0:
 		return fmt.Errorf("%d group(s) are locked by a run already in progress, try again later", len(locked))
 	}
