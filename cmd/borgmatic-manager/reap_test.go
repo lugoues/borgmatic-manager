@@ -49,13 +49,13 @@ func TestReapStalePendingRuns_LeavesLiveOwnerAlone(t *testing.T) {
 	assert.Contains(t, store.PendingSnapshot(), "live-run", "and its pending record must survive for that run to clear itself")
 }
 
-// A record whose PID has been reused (alive) but is implausibly old is a
-// phantom from before a reboot, not a real in-flight run, and must be reaped so
-// status stops showing the group "running" forever.
-func TestReapStalePendingRuns_ReapsAgedRecordDespiteLivePID(t *testing.T) {
+// A live owner is trusted regardless of how long it has been running: a
+// multi-day initial seed backup is a legitimate long run, and reaping it by a
+// wall-clock age cap would corrupt the backup. There is no age cap.
+func TestReapStalePendingRuns_LeavesLongRunningLiveOwnerAlone(t *testing.T) {
 	store := state.LoadSchedule(t.TempDir(), quietLogger())
-	// Our own (live) PID, but a start time older than any backup could run.
-	store.RecordPending("phantom", "app", time.Now().Add(-72*time.Hour))
+	// Our own (live) PID, started three days ago, a legitimate long backup.
+	store.RecordPending("seed", "app", time.Now().Add(-72*time.Hour))
 
 	var reaped []string
 	reapStalePendingRuns(context.Background(), store, func(_ context.Context, runID string) ([]string, error) {
@@ -63,7 +63,26 @@ func TestReapStalePendingRuns_ReapsAgedRecordDespiteLivePID(t *testing.T) {
 		return nil, nil
 	})
 
-	assert.Equal(t, []string{"phantom"}, reaped, "an implausibly old record is a reused-PID phantom and must be reaped")
+	assert.Empty(t, reaped, "a long-running live backup must never be reaped by age")
+	assert.Contains(t, store.PendingSnapshot(), "seed")
+}
+
+// A PID reused by an unrelated (non-manager) process after a reboot is a
+// phantom: identity, not liveness, distinguishes it. PID 1 is always alive but
+// is not a borgmatic-manager, so its record is reaped.
+func TestReapStalePendingRuns_ReapsReusedNonManagerPID(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schedule.json"),
+		[]byte(`{"version":1,"groups":{},"pending_runs":{"phantom":{"group":"db","started":"2026-01-01T00:00:00Z","pid":1}}}`), 0o600))
+	store := state.LoadSchedule(dir, quietLogger())
+
+	var reaped []string
+	reapStalePendingRuns(context.Background(), store, func(_ context.Context, runID string) ([]string, error) {
+		reaped = append(reaped, runID)
+		return nil, nil
+	})
+
+	assert.Equal(t, []string{"phantom"}, reaped, "a PID reused by a non-manager process is a phantom and must be reaped")
 	assert.NotContains(t, store.PendingSnapshot(), "phantom")
 }
 

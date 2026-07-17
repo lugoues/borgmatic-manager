@@ -367,11 +367,6 @@ func (e *env) newRunner(logger *slog.Logger, configDir, borgmaticPath string, ru
 	return r
 }
 
-// maxPendingAge bounds how long a pending record is trusted against a live PID.
-// No backup runs this long, so a record older than this whose PID is still
-// "alive" is a reused-PID phantom, not a real in-flight run.
-const maxPendingAge = 48 * time.Hour
-
 // reapStalePendingRuns removes dump helpers left behind by a manager process
 // that died mid-run.
 //
@@ -385,14 +380,16 @@ const maxPendingAge = 48 * time.Hour
 // are never touched.
 func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, reap func(context.Context, string) ([]string, error)) {
 	for runID, p := range store.PendingSnapshot() {
-		// A live owner means a real in-flight run, unless the record predates
-		// this daemon uptime by more than any backup could plausibly take, in
-		// which case the PID has been reused by an unrelated process across a
-		// reboot. Reaping then only clears the phantom record (no containers
-		// with that run ID still exist); leaving it would show the group
-		// "running" forever.
-		if processAlive(p.PID) && time.Since(p.Started) < maxPendingAge {
-			slog.Info("leaving pending run alone; its process is still running",
+		// Only a live borgmatic-manager process is a real owner. Bare PID
+		// liveness is not enough: after a reboot the PID may have been reused
+		// by an unrelated process, which would leave a phantom "running" record
+		// forever. But it must be an *identity* check, not a wall-clock age cap
+		// a multi-day initial seed backup is a legitimately long live run,
+		// and reaping it mid-dump would corrupt the backup. Reaping a genuine
+		// phantom is harmless: no containers carry its run ID, so reap clears
+		// the record and removes nothing.
+		if ownedByLiveManager(p.PID) {
+			slog.Info("leaving pending run alone; a live manager process still owns it",
 				"group", p.Group, "run_id", runID, "pid", p.PID)
 			continue
 		}
@@ -414,17 +411,41 @@ func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, reap 
 // processAlive reports whether pid is a live process. Signal 0 performs the
 // permission and existence checks without delivering anything; EPERM means the
 // process exists but belongs to another user, which still counts as alive.
-//
-// A pid of 0 means "no owner recorded", a legacy record, treated as dead.
-// PID reuse could in principle mistake an unrelated process for the owner and
-// skip a reap; the helper is then cleaned up at a later startup, which is the
-// safe direction (a stray container beats killing a live backup's).
+// Used only for tmpfs config-dir cleanup, where a false "alive" merely leaves a
+// dir a little longer.
 func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// ownedByLiveManager reports whether pid is a live borgmatic-manager process,
+// the genuine owner of a pending run, as opposed to a PID reused by an
+// unrelated process after a reboot. It compares /proc/<pid>/comm to our own:
+// an unrelated process will not match, and a matching process is (all but
+// certainly) the manager invocation that recorded the run.
+//
+// This deliberately replaces a wall-clock age cap. Age cannot distinguish a
+// phantom from a legitimately long backup (a multi-day initial seed), and
+// reaping a live run's helpers mid-dump corrupts the backup. A false negative
+// here (a phantom whose reused PID happens to also be a borgmatic-manager)
+// merely lingers until the next restart, the safe direction.
+func ownedByLiveManager(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	// #nosec G304 -- pid comes from our own state file, formatted as an int
+	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return false // process gone (ENOENT) or unreadable
+	}
+	self, err := os.ReadFile("/proc/self/comm")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(comm)) == strings.TrimSpace(string(self))
 }
 
 func runDaemon() error {
