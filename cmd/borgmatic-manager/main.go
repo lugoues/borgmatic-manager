@@ -322,6 +322,41 @@ func (e *env) reapRunHelpers(ctx context.Context, runID string) ([]string, error
 	return e.rt.RemoveContainersByLabel(ctx, models.HelperRunLabel, runID)
 }
 
+// privateConfigDir returns a per-PID dir under the runtime tmpfs (configs carry
+// credentials, never disk-backed /tmp), sweeping dead-PID leftovers first.
+func (e *env) privateConfigDir(kind string) (string, error) {
+	base := filepath.Join(e.runtimeDir, kind)
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return "", fmt.Errorf("creating %s config directory: %w", kind, err)
+	}
+	sweepDeadPIDDirs(base)
+
+	dir := filepath.Join(base, strconv.Itoa(os.Getpid()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("creating %s config directory: %w", kind, err)
+	}
+	return dir, nil
+}
+
+// sweepDeadPIDDirs removes subdirectories of base whose name is a PID no longer
+// alive. Best-effort: cleanup, not correctness.
+func sweepDeadPIDDirs(base string) {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || processAlive(pid) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(base, entry.Name()))
+	}
+}
+
 // newRunner wires a runner for one process; only logger and configDir differ
 // between the daemon and an ad-hoc run, so they are parameters.
 func (e *env) newRunner(logger *slog.Logger, configDir, borgmaticPath string, runTimeout time.Duration, store *state.ScheduleStore) *runner.Runner {
@@ -331,6 +366,11 @@ func (e *env) newRunner(logger *slog.Logger, configDir, borgmaticPath string, ru
 	r.SetHelperReaper(store, e.reapRunHelpers)
 	return r
 }
+
+// maxPendingAge bounds how long a pending record is trusted against a live PID.
+// No backup runs this long, so a record older than this whose PID is still
+// "alive" is a reused-PID phantom, not a real in-flight run.
+const maxPendingAge = 48 * time.Hour
 
 // reapStalePendingRuns removes dump helpers left behind by a manager process
 // that died mid-run.
@@ -345,7 +385,13 @@ func (e *env) newRunner(logger *slog.Logger, configDir, borgmaticPath string, ru
 // are never touched.
 func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, reap func(context.Context, string) ([]string, error)) {
 	for runID, p := range store.PendingSnapshot() {
-		if processAlive(p.PID) {
+		// A live owner means a real in-flight run, unless the record predates
+		// this daemon uptime by more than any backup could plausibly take, in
+		// which case the PID has been reused by an unrelated process across a
+		// reboot. Reaping then only clears the phantom record (no containers
+		// with that run ID still exist); leaving it would show the group
+		// "running" forever.
+		if processAlive(p.PID) && time.Since(p.Started) < maxPendingAge {
 			slog.Info("leaving pending run alone; its process is still running",
 				"group", p.Group, "run_id", runID, "pid", p.PID)
 			continue
@@ -454,16 +500,12 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		return err
 	}
 
-	// Generate into a private directory, never the daemon's live configs dir.
-	// Sharing it would mean this process's reconcile could delete a config the
-	// daemon is about to spawn borgmatic against, and, worse, that borgmatic
-	// reads the on-disk config at spawn time, so a concurrent rewrite would give
-	// it a RunID different from the one our reaper looks for, leaking the dump
-	// helper containers. Owning our own copy removes the race instead of
-	// synchronizing it.
-	configsDir, err := os.MkdirTemp("", "bm-run-*")
+	// Generate into a private tmpfs directory, never the daemon's live configs
+	// dir: sharing it races the daemon (deleted configs, mismatched RunIDs that
+	// leak dump helpers), and the configs carry credentials so never /tmp.
+	configsDir, err := e.privateConfigDir("run")
 	if err != nil {
-		return fmt.Errorf("creating private config directory: %w", err)
+		return err
 	}
 	defer func() { _ = os.RemoveAll(configsDir) }()
 
@@ -643,16 +685,12 @@ func runBorgmaticPassthrough(args []string) error {
 		return err
 	}
 
-	// Generate into a private directory, never the daemon's live configs dir:
-	// rewriting that dir hands a running borgmatic a config carrying a
-	// different RunID (leaking its dump helpers), and this pass's reconcile
-	// could delete a config out from under an in-flight run. It lives under the
-	// runtime dir (tmpfs, 0600, cleared on reboot) rather than /tmp because the
-	// file holds credentials, and exec replaces this process, so there is no
-	// opportunity to clean it up on exit.
-	configsDir := filepath.Join(e.runtimeDir, "passthrough", strconv.Itoa(os.Getpid()))
-	if mkErr := os.MkdirAll(configsDir, 0o700); mkErr != nil {
-		return fmt.Errorf("creating private config directory: %w", mkErr)
+	// Private tmpfs dir, never the daemon's live configs dir: rewriting it races
+	// in-flight runs (mismatched RunIDs leak dump helpers). exec means no cleanup
+	// on exit; privateConfigDir sweeps dead-PID leftovers on the next run.
+	configsDir, err := e.privateConfigDir("passthrough")
+	if err != nil {
+		return err
 	}
 
 	meta, err := e.newGenerator(configsDir, logger).Generate(state)

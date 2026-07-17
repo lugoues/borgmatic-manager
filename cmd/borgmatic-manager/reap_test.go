@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -45,6 +47,40 @@ func TestReapStalePendingRuns_LeavesLiveOwnerAlone(t *testing.T) {
 
 	assert.Empty(t, reaped, "a live process's helpers must not be reaped")
 	assert.Contains(t, store.PendingSnapshot(), "live-run", "and its pending record must survive for that run to clear itself")
+}
+
+// A record whose PID has been reused (alive) but is implausibly old is a
+// phantom from before a reboot, not a real in-flight run, and must be reaped so
+// status stops showing the group "running" forever.
+func TestReapStalePendingRuns_ReapsAgedRecordDespiteLivePID(t *testing.T) {
+	store := state.LoadSchedule(t.TempDir(), quietLogger())
+	// Our own (live) PID, but a start time older than any backup could run.
+	store.RecordPending("phantom", "app", time.Now().Add(-72*time.Hour))
+
+	var reaped []string
+	reapStalePendingRuns(context.Background(), store, func(_ context.Context, runID string) ([]string, error) {
+		reaped = append(reaped, runID)
+		return nil, nil
+	})
+
+	assert.Equal(t, []string{"phantom"}, reaped, "an implausibly old record is a reused-PID phantom and must be reaped")
+	assert.NotContains(t, store.PendingSnapshot(), "phantom")
+}
+
+func TestSweepDeadPIDDirs(t *testing.T) {
+	base := t.TempDir()
+	live := filepath.Join(base, strconv.Itoa(os.Getpid()))
+	dead := filepath.Join(base, "999999") // not a live PID
+	notPID := filepath.Join(base, "keepme")
+	for _, d := range []string{live, dead, notPID} {
+		require.NoError(t, os.Mkdir(d, 0o700))
+	}
+
+	sweepDeadPIDDirs(base)
+
+	assert.DirExists(t, live, "the current process's dir stays")
+	assert.NoDirExists(t, dead, "a dead PID's dir is removed")
+	assert.DirExists(t, notPID, "a non-PID-named dir is left alone")
 }
 
 // A record whose owner is gone is a real orphan and must still be cleaned up.
