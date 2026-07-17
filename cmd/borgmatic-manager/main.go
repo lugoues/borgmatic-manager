@@ -22,6 +22,7 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/events"
+	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/lugoues/borgmatic-manager/internal/orchestrator"
 	"github.com/lugoues/borgmatic-manager/internal/runner"
@@ -367,85 +368,113 @@ func (e *env) newRunner(logger *slog.Logger, configDir, borgmaticPath string, ru
 	return r
 }
 
-// reapStalePendingRuns removes dump helpers left behind by a manager process
-// that died mid-run.
-//
-// A pending record is an orphan only when its owning process is gone. "Nothing
-// can be in flight at startup" stopped being true once ad-hoc runs began
-// writing pending records to the same state file: reaping indiscriminately
-// would force-remove the dump helpers of a backup still running in another
-// process, failing it or archiving a truncated database dump. Records with no
-// owner recorded (written before the PID was tracked) keep the old behavior and
-// are treated as orphans. Manual passthrough runs never record pending IDs and
-// are never touched.
-func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, reap func(context.Context, string) ([]string, error)) {
+// reapStalePendingRuns reaps dump helpers left by a manager process that died
+// mid-run. Liveness comes from the per-run advisory lock (kernel-dropped on
+// crash); no-lock-file records fall back to the stamped PID, biased to keep.
+func reapStalePendingRuns(ctx context.Context, store *state.ScheduleStore, lockDir string, reap func(context.Context, string) ([]string, error)) {
+	if lockDir == "" {
+		return // no lock dir, no way to prove liveness: leave every record
+	}
 	for runID, p := range store.PendingSnapshot() {
-		// Only a live borgmatic-manager process is a real owner. Bare PID
-		// liveness is not enough: after a reboot the PID may have been reused
-		// by an unrelated process, which would leave a phantom "running" record
-		// forever. But it must be an *identity* check, not a wall-clock age cap
-		// a multi-day initial seed backup is a legitimately long live run,
-		// and reaping it mid-dump would corrupt the backup. Reaping a genuine
-		// phantom is harmless: no containers carry its run ID, so reap clears
-		// the record and removes nothing.
-		if ownedByLiveManager(p.PID) {
-			slog.Info("leaving pending run alone; a live manager process still owns it",
-				"group", p.Group, "run_id", runID, "pid", p.PID)
+		lockPath := runner.PendingLockPath(lockDir, runID)
+
+		if _, statErr := os.Stat(lockPath); statErr != nil {
+			if !errors.Is(statErr, os.ErrNotExist) {
+				slog.Warn("cannot stat pending-run liveness lock; leaving the record",
+					"group", p.Group, "run_id", runID, "error", statErr)
+				continue
+			}
+			// No lock file (pre-lock binary or failed acquisition): the owner may be
+			// live, so reap only when the stamped PID is provably gone. No TryExclusive
+			// here: it would create a file the next cycle reads as present-unheld.
+			if p.PID != 0 && processAlive(p.PID) {
+				slog.Info("leaving pending run alone; no liveness lock yet but its PID is live",
+					"group", p.Group, "run_id", runID, "pid", p.PID)
+				continue
+			}
+			reapAndClear(ctx, store, reap, runID, p) // owner gone (or legacy no-PID)
 			continue
 		}
-		names, err := reap(ctx, runID)
+
+		// A lock file exists: the authoritative path.
+		lock, acquired, err := lockfile.TryExclusive(lockPath)
 		if err != nil {
-			slog.Warn("cannot reap stale dump helpers; will retry next startup",
+			slog.Warn("cannot probe pending-run liveness lock; leaving the record",
 				"group", p.Group, "run_id", runID, "error", err)
 			continue
 		}
-		if len(names) > 0 {
-			slog.Warn("reaped dump helpers orphaned by a dead manager process",
-				"group", p.Group, "run_id", runID, "started", p.Started.Format(time.RFC3339),
-				"containers", strings.Join(names, ","))
+		if !acquired {
+			slog.Info("leaving pending run alone; a live process holds its liveness lock",
+				"group", p.Group, "run_id", runID)
+			continue
 		}
-		store.ClearPending(runID)
+		// We took the lock: the owner is gone.
+		if reapAndClear(ctx, store, reap, runID, p) {
+			_ = os.Remove(lockPath)
+		}
+		lock.Release()
 	}
 }
 
-// processAlive reports whether pid is a live process. Signal 0 performs the
-// permission and existence checks without delivering anything; EPERM means the
-// process exists but belongs to another user, which still counts as alive.
-// Used only for tmpfs config-dir cleanup, where a false "alive" merely leaves a
-// dir a little longer.
+// reapAndClear reaps a dead run's helpers and clears its record. Returns true
+// when cleared (safe to remove the lock file), false to retry next startup.
+func reapAndClear(ctx context.Context, store *state.ScheduleStore, reap func(context.Context, string) ([]string, error), runID string, p state.PendingRun) bool {
+	names, err := reap(ctx, runID)
+	if err != nil {
+		slog.Warn("cannot reap stale dump helpers; will retry next startup",
+			"group", p.Group, "run_id", runID, "error", err)
+		return false
+	}
+	if len(names) > 0 {
+		slog.Warn("reaped dump helpers orphaned by a dead manager process",
+			"group", p.Group, "run_id", runID, "started", p.Started.Format(time.RFC3339),
+			"containers", strings.Join(names, ","))
+	}
+	store.ClearPending(runID)
+	return true
+}
+
+// sweepOrphanedPendingLocks removes pending-*.lock files no record references
+// and no process holds; a crash between ClearPending and lock removal strands them.
+func sweepOrphanedPendingLocks(lockDir string, store *state.ScheduleStore) {
+	if lockDir == "" {
+		return
+	}
+	referenced := map[string]bool{}
+	for runID := range store.PendingSnapshot() {
+		referenced[filepath.Base(runner.PendingLockPath(lockDir, runID))] = true
+	}
+	entries, err := os.ReadDir(lockDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "pending-") || !strings.HasSuffix(name, ".lock") {
+			continue
+		}
+		if referenced[name] {
+			continue
+		}
+		// Unreferenced: remove only if not held, to avoid racing a run mid-startup.
+		path := filepath.Join(lockDir, name)
+		lock, acquired, err := lockfile.TryExclusive(path)
+		if err != nil || !acquired {
+			continue
+		}
+		lock.Release()
+		_ = os.Remove(path)
+	}
+}
+
+// processAlive reports whether pid is live via signal 0, biased to "alive when
+// unsure" (EPERM counts): a false "dead" would let callers reap a live run.
 func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
-}
-
-// ownedByLiveManager reports whether pid is a live borgmatic-manager process,
-// the genuine owner of a pending run, as opposed to a PID reused by an
-// unrelated process after a reboot. It compares /proc/<pid>/comm to our own:
-// an unrelated process will not match, and a matching process is (all but
-// certainly) the manager invocation that recorded the run.
-//
-// This deliberately replaces a wall-clock age cap. Age cannot distinguish a
-// phantom from a legitimately long backup (a multi-day initial seed), and
-// reaping a live run's helpers mid-dump corrupts the backup. A false negative
-// here (a phantom whose reused PID happens to also be a borgmatic-manager)
-// merely lingers until the next restart, the safe direction.
-func ownedByLiveManager(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	// #nosec G304 -- pid comes from our own state file, formatted as an int
-	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil {
-		return false // process gone (ENOENT) or unreadable
-	}
-	self, err := os.ReadFile("/proc/self/comm")
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(comm)) == strings.TrimSpace(string(self))
 }
 
 func runDaemon() error {
@@ -471,7 +500,9 @@ func runDaemon() error {
 	gen := e.newGenerator(e.configsDir, slog.Default())
 	store := state.LoadSchedule(e.stateDir, slog.Default())
 	r := e.newRunner(slog.Default(), e.configsDir, pf.borgmaticPath, pf.runTimeout, store)
-	reapStalePendingRuns(ctx, store, e.reapRunHelpers)
+	locksDir := filepath.Join(e.stateDir, "locks")
+	reapStalePendingRuns(ctx, store, locksDir, e.reapRunHelpers)
+	sweepOrphanedPendingLocks(locksDir, store)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
 	l := events.NewListener(e.rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())

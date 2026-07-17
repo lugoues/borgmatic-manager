@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
@@ -729,4 +730,39 @@ func TestHelperReapSkippedWithoutRunID(t *testing.T) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	assert.Empty(t, h.events, "no run id (legacy meta) means no reap bookkeeping")
+}
+
+// A run holds its liveness lock for the whole run body and releases and unlinks
+// it on exit. The reap callback fires while the lock is still held (LIFO: reap
+// before Release), so a probe there proves the lock covers the run; after
+// TryRunGroup returns the lock must be acquirable and the file gone.
+func TestRunHoldsAndReleasesLivenessLock(t *testing.T) {
+	fake := newFakeExecutor()
+	r := newTestRunner(t, fake, nil)
+	lockDir := t.TempDir()
+	r.SetLockDir(lockDir)
+
+	lockPath := PendingLockPath(lockDir, "run-live")
+	var heldDuringRun bool
+	h := &helperReapHarness{}
+	reap := func(ctx context.Context, runID string) ([]string, error) {
+		// Still inside the run: the owner should hold the lock, so a probe fails.
+		if _, acquired, err := lockfile.TryExclusive(lockPath); err == nil {
+			heldDuringRun = !acquired
+		}
+		return h.reap(ctx, runID)
+	}
+	r.SetHelperReaper(h, reap)
+
+	ran, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-live"})
+	require.NoError(t, err)
+	require.True(t, ran)
+
+	assert.True(t, heldDuringRun, "the liveness lock must be held while the run is in flight")
+
+	// The file is unlinked only by the os.Remove defer, which runs after
+	// lock.Release, so its absence proves the lock was both released and
+	// unlinked on exit. (Probing with TryExclusive would recreate it via
+	// O_CREATE, so assert absence directly instead.)
+	assert.NoFileExists(t, lockPath, "the lock must be released and its file unlinked after the run")
 }

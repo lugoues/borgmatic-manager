@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -235,6 +236,19 @@ func (r *Runner) runGroup(ctx context.Context, groupName, runID string) error {
 
 	// Record pending BEFORE spawning so a crash mid-run is reaped by ID at startup.
 	if r.pending != nil && r.reap != nil && runID != "" {
+		// Per-run liveness lock, kernel-dropped on crash, lets the startup reaper
+		// tell a live run from an orphan. Failing to take it must not fail the backup.
+		if r.lockDir != "" {
+			if lock, _, err := lockfile.TryExclusive(PendingLockPath(r.lockDir, runID)); err != nil {
+				r.logger.Warn("cannot take pending-run liveness lock; falling back to PID protection for this run",
+					"run_id", runID, "error", err)
+			} else if lock != nil {
+				// LIFO: these run after reapHelpers, so clear record, release, unlink,
+				// keeping the invariant that a visible record's lock file is always held.
+				defer func() { _ = os.Remove(PendingLockPath(r.lockDir, runID)) }()
+				defer lock.Release()
+			}
+		}
 		r.pending.RecordPending(runID, groupName, time.Now())
 		defer r.reapHelpers(groupName, runID)
 	}

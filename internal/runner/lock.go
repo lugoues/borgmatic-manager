@@ -27,3 +27,10 @@ func lockFileName(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return "bm-" + hex.EncodeToString(sum[:8]) + ".lock"
 }
+
+// PendingLockPath is the path of a run's liveness lock, held for the run's
+// lifetime so startup reconciliation can tell a live run from a crashed one.
+func PendingLockPath(lockDir, runID string) string {
+	sum := sha256.Sum256([]byte(runID))
+	return filepath.Join(lockDir, "pending-"+hex.EncodeToString(sum[:8])+".lock")
+}
