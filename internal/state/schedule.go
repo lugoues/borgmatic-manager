@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -78,6 +79,10 @@ type scheduleFile struct {
 	Pending map[string]PendingRun  `json:"pending_runs,omitempty"`
 }
 
+// errCorruptState marks an unparseable state file: a writer may overwrite
+// corrupt garbage but never state it merely failed to read.
+var errCorruptState = errors.New("schedule state is corrupt")
+
 // ScheduleStore persists per-group schedule records as JSON. Every failure mode
 // degrades to "everything due": an extra backup is recoverable, a skipped one is
 // not. Cross-process safety: every mutation re-reads the shared file under an
@@ -102,38 +107,60 @@ func LoadSchedule(stateDir string, logger *slog.Logger) *ScheduleStore {
 		groups:   map[string]GroupRecord{},
 		pending:  map[string]PendingRun{},
 	}
+	s.sweepStaleTempFiles()
 	s.Reload()
 	return s
 }
 
-// Reload refreshes the in-memory view from disk. Readers otherwise keep the
-// snapshot taken at load and would miss another process's writes, the daemon
-// would re-run a group an ad-hoc run just backed up.
+// sweepStaleTempFiles removes temp files orphaned by a crash mid-write. It
+// runs under the state flock, so any temp seen here cannot be a live write.
+func (s *ScheduleStore) sweepStaleTempFiles() {
+	lock, err := lockfile.Exclusive(s.lockPath)
+	if err != nil {
+		return // best-effort cleanup; not worth blocking startup
+	}
+	defer lock.Release()
+
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(s.path), "schedule-*.json.tmp"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.logger.Warn("cannot remove orphaned schedule temp file", "path", m, "error", err)
+		}
+	}
+}
+
+// Reload refreshes the in-memory view to pick up other processes' writes. A
+// read failure degrades to empty ("everything due"); writers do not use this path.
 func (s *ScheduleStore) Reload() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.readFile()
+	f, err := s.readFile()
+	if err != nil {
+		s.logger.Warn("cannot read schedule state; treating all groups as due", "path", s.path, "error", err)
+	}
 	s.groups, s.pending = f.Groups, f.Pending
 }
 
-// readFile parses the state file, degrading to empty on any failure. Reads need
-// no lock: writes land via atomic rename, so a reader sees whole file or none.
-func (s *ScheduleStore) readFile() scheduleFile {
+// readFile parses the state file; missing means empty state, any other failure
+// is returned so a writer never renames an empty file over good state. Reads
+// need no lock: atomic rename means a reader sees whole or none.
+func (s *ScheduleStore) readFile() (scheduleFile, error) {
 	f := scheduleFile{Version: 1, Groups: map[string]GroupRecord{}, Pending: map[string]PendingRun{}}
 
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
-		return f
+		return f, nil
 	}
 	if err != nil {
-		s.logger.Warn("cannot read schedule state; treating all groups as due", "path", s.path, "error", err)
-		return f
+		return f, err
 	}
 
 	var parsed scheduleFile
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		s.logger.Warn("schedule state is corrupt; treating all groups as due", "path", s.path, "error", err)
-		return f
+		return f, fmt.Errorf("%w: %v", errCorruptState, err)
 	}
 	if parsed.Groups != nil {
 		f.Groups = parsed.Groups
@@ -141,13 +168,13 @@ func (s *ScheduleStore) readFile() scheduleFile {
 	if parsed.Pending != nil {
 		f.Pending = parsed.Pending
 	}
-	return f
+	return f, nil
 }
 
-// update applies mutate to the state file under an exclusive flock: re-read,
-// change, write back. The lock plus the re-read are what keep concurrent
-// processes from erasing each other, see the type comment.
-func (s *ScheduleStore) update(mutate func(*scheduleFile)) {
+// update re-reads the file under an exclusive flock, applies mutate (which
+// reports whether it changed anything), and writes back. A read failure aborts:
+// an empty read must never clobber good state.
+func (s *ScheduleStore) update(mutate func(*scheduleFile) (changed bool)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -159,8 +186,19 @@ func (s *ScheduleStore) update(mutate func(*scheduleFile)) {
 		defer lock.Release()
 	}
 
-	f := s.readFile()
-	mutate(&f)
+	f, err := s.readFile()
+	switch {
+	case errors.Is(err, errCorruptState):
+		// Unparseable garbage: nothing to preserve, overwrite fresh.
+		s.logger.Warn("schedule state is corrupt; rewriting it fresh", "path", s.path, "error", err)
+	case err != nil:
+		// Transient failure: disk state may be intact, must not clobber it.
+		s.logger.Error("cannot read schedule state; skipping this update to avoid overwriting it", "path", s.path, "error", err)
+		return
+	}
+	if !mutate(&f) {
+		return
+	}
 	s.writeFile(f)
 	s.groups, s.pending = f.Groups, f.Pending
 }
@@ -168,14 +206,21 @@ func (s *ScheduleStore) update(mutate func(*scheduleFile)) {
 // RecordPending persists an in-flight run keyed by run ID, stamped with the
 // owning PID so reconciliation can tell an orphan from a live run.
 func (s *ScheduleStore) RecordPending(runID, group string, started time.Time) {
-	s.update(func(f *scheduleFile) {
+	s.update(func(f *scheduleFile) bool {
 		f.Pending[runID] = PendingRun{Group: group, Started: started, PID: os.Getpid()}
+		return true
 	})
 }
 
 // ClearPending removes a pending-run record after its helpers are reaped.
 func (s *ScheduleStore) ClearPending(runID string) {
-	s.update(func(f *scheduleFile) { delete(f.Pending, runID) })
+	s.update(func(f *scheduleFile) bool {
+		if _, ok := f.Pending[runID]; !ok {
+			return false
+		}
+		delete(f.Pending, runID)
+		return true
+	})
 }
 
 // PendingSnapshot returns a copy of the pending-run records.
@@ -211,12 +256,13 @@ func (s *ScheduleStore) Snapshot() map[string]GroupRecord {
 // MarkSuccess records a successful run and persists immediately, so the
 // schedule survives a crash before shutdown.
 func (s *ScheduleStore) MarkSuccess(name, fingerprint string, startedAt time.Time) {
-	s.update(func(f *scheduleFile) {
+	s.update(func(f *scheduleFile) bool {
 		rec := f.Groups[name]
 		rec.LastSuccess = startedAt
 		rec.Fingerprint = fingerprint
 		rec.MissingCycles = 0
 		f.Groups[name] = rec
+		return true
 	})
 }
 
@@ -227,7 +273,7 @@ const maxHistory = 30
 // RecordRun stores a run outcome without touching schedule fields: the full
 // outcome becomes LastRun, a log-stripped copy joins the bounded History.
 func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
-	s.update(func(f *scheduleFile) {
+	s.update(func(f *scheduleFile) bool {
 		rec := f.Groups[name]
 		rec.LastRun = &outcome
 
@@ -239,18 +285,21 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 		}
 
 		f.Groups[name] = rec
+		return true
 	})
 }
 
 // Retain reconciles records against this cycle's groups: a vanished group
 // survives two absent cycles before pruning; presence resets the counter.
 func (s *ScheduleStore) Retain(names map[string]struct{}) {
-	s.update(func(f *scheduleFile) {
+	s.update(func(f *scheduleFile) bool {
+		changed := false
 		for name, rec := range f.Groups {
 			if _, ok := names[name]; ok {
 				if rec.MissingCycles != 0 {
 					rec.MissingCycles = 0
 					f.Groups[name] = rec
+					changed = true
 				}
 				continue
 			}
@@ -260,7 +309,9 @@ func (s *ScheduleStore) Retain(names map[string]struct{}) {
 				rec.MissingCycles++
 				f.Groups[name] = rec
 			}
+			changed = true
 		}
+		return changed
 	})
 }
 

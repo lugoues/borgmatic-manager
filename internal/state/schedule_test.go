@@ -195,6 +195,33 @@ func TestRecordPendingStampsOwningProcess(t *testing.T) {
 	assert.Equal(t, os.Getpid(), p.PID, "the writer's PID identifies the owner")
 }
 
+// A transient read failure during a mutation must NOT overwrite good state with
+// an empty read: the old whole-map save() couldn't do this, the read-modify-
+// write layer can, and it would fire after every backup.
+func TestUpdateAbortsOnReadErrorInsteadOfWiping(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("unreadable-file permissions do not apply to root")
+	}
+	dir := t.TempDir()
+	schedPath := filepath.Join(dir, "schedule.json")
+
+	s := state.LoadSchedule(dir, discardLogger())
+	s.MarkSuccess("keeper", "fp", time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC))
+
+	// Make the existing state unreadable, then mutate: the update must abort.
+	require.NoError(t, os.Chmod(schedPath, 0))
+	t.Cleanup(func() { _ = os.Chmod(schedPath, 0o600) })
+	s.MarkSuccess("newcomer", "fp2", time.Now())
+
+	// Restore readability and read fresh from disk.
+	require.NoError(t, os.Chmod(schedPath, 0o600))
+	reloaded := state.LoadSchedule(dir, discardLogger())
+	_, hasKeeper := reloaded.Record("keeper")
+	_, hasNewcomer := reloaded.Record("newcomer")
+	assert.True(t, hasKeeper, "the existing group must survive a read error during an update")
+	assert.False(t, hasNewcomer, "the update that could not read must not have persisted (it would have wiped keeper)")
+}
+
 func TestPendingRunsRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	s := state.LoadSchedule(dir, discardLogger())
