@@ -470,8 +470,8 @@ Consequences:
   marks success.
 - Missing or corrupt schedule state degrades to "everything is due" — the
   failure direction is an extra backup, never a skipped one.
-- To back up now regardless of the schedule, run `borgmatic-manager run`
-  (all groups) or `borgmatic-manager run <group>` (just one). It records its
+- To back up now regardless of the schedule, run `borgmatic-manager run --all`
+  (every group) or `borgmatic-manager run <group>` (just one). It records its
   outcome and resets that group's period, so the daemon won't redundantly
   re-run it right after.
 
