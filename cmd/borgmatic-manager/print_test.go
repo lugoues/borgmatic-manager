@@ -120,7 +120,7 @@ func TestInspectRendersSectionsAndTrend(t *testing.T) {
 	for i, sz := range []int64{100, 250, 175, 400} {
 		store.RecordRun("demo", state.RunOutcome{
 			Finished: base.Add(time.Duration(i) * time.Hour), Result: state.ResultOK,
-			DurationSeconds: 30, Files: 10, OriginalBytes: sz,
+			DurationSeconds: 30, Files: 10, OriginalBytes: sz, DeduplicatedBytes: sz / 10,
 			LogTail: []string{"INFO creating archive", "INFO archive created"},
 		})
 	}
@@ -136,6 +136,34 @@ func TestInspectRendersSectionsAndTrend(t *testing.T) {
 	}
 	assert.Contains(t, out, "source_directories", "the compiled config is shown")
 	assert.Contains(t, out, "creating archive", "the last run's log tail is shown")
+
+	// Two trend series: total archive size, and the new data each run added.
+	assert.Contains(t, out, "total", "the trend shows total archive size")
+	assert.Contains(t, out, "new", "and the per-run new-data (churn) series")
+	assert.Contains(t, out, "peak", "the churn line summarises its peak")
+}
+
+// With no deduplicated stats recorded, the churn line is omitted rather than
+// drawn as a flat row of zeroes (which would read as "no new data").
+func TestInspectOmitsChurnLineWithoutDedupStats(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	group := bs.Groups["demo"]
+
+	store := state.LoadSchedule(t.TempDir(), nil)
+	for i, sz := range []int64{100, 250, 400} {
+		store.RecordRun("demo", state.RunOutcome{
+			Finished: time.Now().Add(time.Duration(i) * time.Hour), Result: state.ResultOK,
+			OriginalBytes: sz, // no DeduplicatedBytes
+		})
+	}
+	rec, ok := store.Record("demo")
+	require.True(t, ok)
+
+	out := captureStdout(t, func() { printInspect("demo", group, rec, true, "", "none", time.Hour) })
+
+	assert.Contains(t, out, "Size trend", "the total series still renders")
+	assert.NotContains(t, out, "peak", "but the churn line is omitted without dedup stats")
 }
 
 func TestInspectHandlesNoHistory(t *testing.T) {

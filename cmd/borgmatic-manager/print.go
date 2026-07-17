@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -440,20 +441,37 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 		}
 	}
 
-	// Size trend across successful runs.
-	sizes := make([]int64, 0, len(rec.History))
+	// Size trend across successful runs, on two axes that answer different
+	// questions: "total" is each archive's full logical size (is the dataset
+	// growing?), "new" is the data that run actually added to the repository
+	// after deduplication (churn, where spikes show up). Both series cover
+	// the same runs, so the shapes are comparable.
+	totals := make([]int64, 0, len(rec.History))
+	deltas := make([]int64, 0, len(rec.History))
 	for _, h := range rec.History {
 		if h.OriginalBytes > 0 {
-			sizes = append(sizes, h.OriginalBytes)
+			totals = append(totals, h.OriginalBytes)
+			deltas = append(deltas, h.DeduplicatedBytes)
 		}
 	}
-	if spark := sparkline(sizes); spark != "" {
+	if spark := sparkline(totals); spark != "" {
 		section("Size trend")
-		fmt.Printf(edgePad+"  %s   %s → %s  (%d runs)\n",
+		fmt.Printf(edgePad+"  %s  %s   %s → %s  (%d runs)\n",
+			styleDetail.Render(fmt.Sprintf("%-5s", "total")),
 			styleName.Render(spark),
-			styleDetail.Render(humanBytes(sizes[0])),
-			styleDetail.Render(humanBytes(sizes[len(sizes)-1])),
-			len(sizes))
+			styleDetail.Render(humanBytes(totals[0])),
+			styleDetail.Render(humanBytes(totals[len(totals)-1])),
+			len(totals))
+
+		// Skip the churn line when no run reported deduplicated stats: a
+		// flat row of zeroes would read as "no new data" rather than "no data".
+		if spark := sparkline(deltas); spark != "" && slices.Max(deltas) > 0 {
+			fmt.Printf(edgePad+"  %s  %s   %s latest · %s peak\n",
+				styleDetail.Render(fmt.Sprintf("%-5s", "new")),
+				styleName.Render(spark),
+				styleDetail.Render(humanBytes(deltas[len(deltas)-1])),
+				styleDetail.Render(humanBytes(slices.Max(deltas))))
+		}
 	}
 
 	if len(rec.History) > 0 {
