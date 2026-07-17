@@ -84,6 +84,50 @@ func TestListener_DebounceCoalesces(t *testing.T) {
 	m.AssertExpectations(t)
 }
 
+// Sustained churn must not starve discovery. Events arriving faster than the
+// debounce interval reset the window; without a cap on how far it can be
+// pushed, a newly labeled container is never discovered event-driven and waits
+// out a full manager.period for its first backup.
+func TestListener_ContinuousChurnStillFiresWithinMaxWait(t *testing.T) {
+	m := &runtime.MockRuntime{}
+	eventCh, _ := setupMockStream(m)
+
+	l := NewListenerWithDebounce(m, slog.Default(), testDebounce)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	triggerCh := l.Listen(ctx)
+
+	// Hammer the stream faster than the debounce interval, for longer than the
+	// cap. Under the old always-reset behavior this never fires.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.After(l.maxDebounceWait * 3)
+		for {
+			select {
+			case <-deadline:
+				return
+			case <-ctx.Done():
+				return
+			case eventCh <- runtime.Event{Type: "container", Action: "create", Actor: "churn"}:
+				time.Sleep(testDebounce / 4)
+			}
+		}
+	}()
+
+	select {
+	case <-triggerCh:
+		// Fired despite the churn, as the cap requires.
+	case <-time.After(l.maxDebounceWait * 2):
+		t.Fatal("continuous churn starved discovery: no trigger within the max debounce wait")
+	}
+
+	cancel()
+	<-done
+	m.AssertExpectations(t)
+}
+
 func TestListener_Reconnect(t *testing.T) {
 	m := &runtime.MockRuntime{}
 

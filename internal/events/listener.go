@@ -9,23 +9,27 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/runtime"
 )
 
+// defaultDebounce coalesces the burst of events a single `docker compose up`
+// produces into one re-discovery.
+const defaultDebounce = 5 * time.Second
+
+// maxDebounceRatio caps the coalescing window from the burst's first event:
+// sustained churn would otherwise reset the timer forever and strand new containers.
+const maxDebounceRatio = 6
+
 // Listener watches a ContainerRuntime event stream and coalesces rapid events
 // into debounced re-discovery triggers.
 type Listener struct {
 	rt               runtime.ContainerRuntime
 	logger           *slog.Logger
 	debounceDuration time.Duration
+	maxDebounceWait  time.Duration
 	backoffDuration  time.Duration
 }
 
-// NewListener creates a Listener with the default 5-second debounce interval.
+// NewListener creates a Listener with the default debounce interval.
 func NewListener(rt runtime.ContainerRuntime, logger *slog.Logger) *Listener {
-	return &Listener{
-		rt:               rt,
-		logger:           logger,
-		debounceDuration: 5 * time.Second,
-		backoffDuration:  5 * time.Second,
-	}
+	return NewListenerWithDebounce(rt, logger, defaultDebounce)
 }
 
 // NewListenerWithDebounce creates a Listener with a custom debounce, for tests.
@@ -34,6 +38,7 @@ func NewListenerWithDebounce(rt runtime.ContainerRuntime, logger *slog.Logger, d
 		rt:               rt,
 		logger:           logger,
 		debounceDuration: debounce,
+		maxDebounceWait:  debounce * maxDebounceRatio,
 		backoffDuration:  5 * time.Second,
 	}
 }
@@ -115,20 +120,25 @@ func (l *Listener) reconnectLoop(ctx context.Context, sender *triggerSender) {
 // processStream reads from the event and error channels until one of them
 // indicates a disconnect or the context is cancelled.
 func (l *Listener) processStream(ctx context.Context, eventCh <-chan runtime.Event, errCh <-chan error, sender *triggerSender) {
-	var debounceTimer *time.Timer
+	var (
+		timer *time.Timer
+		// fire is non-nil exactly while a debounce is pending, so the loop
+		// knows when a burst ends and the next event starts a fresh one.
+		fire       <-chan time.Time
+		burstStart time.Time
+	)
 
-	// On stream disconnect a pending debounce must fire rather than be
-	// dropped, or an observed event is silently lost across the reconnect.
-	// On shutdown (ctx cancelled) it is simply stopped.
-	fireOrStopPending := func() {
-		if debounceTimer == nil {
+	// A non-nil timer means a trigger is owed: on disconnect it must fire (an
+	// observed event must not be lost); on shutdown it is dropped.
+	defer func() {
+		if timer == nil {
 			return
 		}
-		if debounceTimer.Stop() && ctx.Err() == nil {
+		timer.Stop()
+		if ctx.Err() == nil {
 			sender.send()
 		}
-	}
-	defer fireOrStopPending()
+	}()
 
 	for {
 		select {
@@ -141,14 +151,25 @@ func (l *Listener) processStream(ctx context.Context, eventCh <-chan runtime.Eve
 			}
 			l.logger.Debug("received event", "type", evt.Type, "action", evt.Action, "actor", evt.Actor)
 
-			// Reset or start debounce timer.
-			if debounceTimer != nil {
-				debounceTimer.Stop()
+			now := time.Now()
+			if fire == nil {
+				burstStart = now // first event of a new burst
+			} else {
+				timer.Stop() // extend the current window
 			}
-			debounceTimer = time.AfterFunc(l.debounceDuration, func() {
-				// Non-blocking, close-safe send via the sender.
-				sender.send()
-			})
+
+			// Coalesce, but never past maxDebounceWait from the burst's first event,
+			// or sustained churn pushes the window out forever.
+			wait := l.debounceDuration
+			if remaining := l.maxDebounceWait - now.Sub(burstStart); remaining < wait {
+				wait = max(remaining, 0)
+			}
+			timer = time.NewTimer(wait)
+			fire = timer.C
+
+		case <-fire:
+			timer, fire = nil, nil
+			sender.send()
 
 		case err, ok := <-errCh:
 			if !ok {
