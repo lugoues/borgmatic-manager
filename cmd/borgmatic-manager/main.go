@@ -193,28 +193,20 @@ func runInspect(ctx context.Context, group string) error {
 	return nil
 }
 
-// renderGroupConfig compiles the group's borgmatic config into a scratch
-// directory and returns it, or a note explaining why it is unavailable (a
-// refused group, or a generation error). It never fails the command: inspect
-// is still useful without the config section.
-func renderGroupConfig(backupState *models.BackupState, e *env, logger *slog.Logger, group string) (yaml, note string) {
-	tmp, err := os.MkdirTemp("", "bm-inspect-*")
-	if err != nil {
-		return "", "could not render config: " + err.Error()
+// renderGroupConfig compiles one group's borgmatic config for display, or a note
+// explaining why it is unavailable. Never fails the command; output is redacted.
+func renderGroupConfig(backupState *models.BackupState, e *env, logger *slog.Logger, group string) (configYAML, note string) {
+	cfg, refusal, err := e.newGenerator("", logger).RenderGroup(backupState, group)
+	switch {
+	case err != nil:
+		return "", "config generation failed: " + err.Error()
+	case refusal != "":
+		return "", "config refused: " + refusal
+	case cfg == "":
+		return "", "no config generated for this group"
+	default:
+		return redactConfigSecrets(cfg), ""
 	}
-	defer func() { _ = os.RemoveAll(tmp) }()
-
-	if _, genErr := e.newGenerator(tmp, logger).Generate(backupState); genErr != nil {
-		return "", "config generation failed: " + genErr.Error()
-	}
-	// #nosec G304 -- group is a discovery-validated name and tmp is our own scratch dir
-	data, err := os.ReadFile(filepath.Join(tmp, group+".yaml"))
-	if err != nil {
-		return "", "no config generated for this group, it may be refused; run: borgmatic-manager generate"
-	}
-	// The on-disk config (0600) holds real secrets for borgmatic; the display
-	// copy must not leak them into the terminal or a screenshare.
-	return redactConfigSecrets(string(data)), ""
 }
 
 func discoveredGroupList(backupState *models.BackupState) string {
@@ -325,6 +317,21 @@ func (e *env) newGenerator(outputDir string, logger *slog.Logger) *config.Genera
 	}, logger)
 }
 
+// reapRunHelpers force-removes a run's dump helper containers by run-ID label.
+func (e *env) reapRunHelpers(ctx context.Context, runID string) ([]string, error) {
+	return e.rt.RemoveContainersByLabel(ctx, models.HelperRunLabel, runID)
+}
+
+// newRunner wires a runner for one process; only logger and configDir differ
+// between the daemon and an ad-hoc run, so they are parameters.
+func (e *env) newRunner(logger *slog.Logger, configDir, borgmaticPath string, runTimeout time.Duration, store *state.ScheduleStore) *runner.Runner {
+	r := runner.NewRunner(logger, configDir, borgmaticPath, e.cfg.Manager.Actions, runTimeout)
+	r.SetLockDir(filepath.Join(e.stateDir, "locks"))
+	r.SetRecorder(store)
+	r.SetHelperReaper(store, e.reapRunHelpers)
+	return r
+}
+
 // reapStalePendingRuns removes dump helpers left behind by a manager process
 // that died mid-run.
 //
@@ -395,15 +402,9 @@ func runDaemon() error {
 	}
 
 	gen := e.newGenerator(e.configsDir, slog.Default())
-	r := runner.NewRunner(slog.Default(), e.configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
-	r.SetLockDir(filepath.Join(e.stateDir, "locks"))
 	store := state.LoadSchedule(e.stateDir, slog.Default())
-	r.SetRecorder(store)
-	reap := func(ctx context.Context, runID string) ([]string, error) {
-		return e.rt.RemoveContainersByLabel(ctx, models.HelperRunLabel, runID)
-	}
-	r.SetHelperReaper(store, reap)
-	reapStalePendingRuns(ctx, store, reap)
+	r := e.newRunner(slog.Default(), e.configsDir, pf.borgmaticPath, pf.runTimeout, store)
+	reapStalePendingRuns(ctx, store, e.reapRunHelpers)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
 	l := events.NewListener(e.rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())
@@ -482,12 +483,7 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	// A verbose logger so the user watches borgmatic progress live; outcomes
 	// still land in the shared schedule state.
 	store := state.LoadSchedule(e.stateDir, logger)
-	r := runner.NewRunner(progressLogger(), configsDir, pf.borgmaticPath, e.cfg.Manager.Actions, pf.runTimeout)
-	r.SetLockDir(filepath.Join(e.stateDir, "locks"))
-	r.SetRecorder(store)
-	r.SetHelperReaper(store, func(ctx context.Context, runID string) ([]string, error) {
-		return e.rt.RemoveContainersByLabel(ctx, models.HelperRunLabel, runID)
-	})
+	r := e.newRunner(progressLogger(), configsDir, pf.borgmaticPath, pf.runTimeout, store)
 
 	now := time.Now()
 	var failed, locked, unattempted []string
@@ -564,7 +560,7 @@ func runDiscover() error {
 		return err
 	}
 
-	state, err := discoverState(ctx, e, logger)
+	state, err := discovery.Discover(ctx, e.rt, logger)
 	if err != nil {
 		return err
 	}
@@ -596,7 +592,7 @@ func runGenerate(output string) error {
 		outDir = e.configsDir
 	}
 
-	state, err := discoverState(ctx, e, logger)
+	state, err := discovery.Discover(ctx, e.rt, logger)
 	if err != nil {
 		return err
 	}
@@ -637,7 +633,7 @@ func runBorgmaticPassthrough(args []string) error {
 		return err
 	}
 
-	state, err := discoverState(ctx, e, logger)
+	state, err := discovery.Discover(ctx, e.rt, logger)
 	if err != nil {
 		return err
 	}
@@ -679,11 +675,6 @@ func runBorgmaticPassthrough(args []string) error {
 		return fmt.Errorf("executing borgmatic: %w", err)
 	}
 	return nil
-}
-
-// discoverState runs one discovery pass for the one-shot commands.
-func discoverState(ctx context.Context, e *env, logger *slog.Logger) (*models.BackupState, error) {
-	return discovery.Discover(ctx, e.rt, logger)
 }
 
 // interactiveLogger renders warnings and errors styled on stderr for one-shot

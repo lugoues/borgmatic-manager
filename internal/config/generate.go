@@ -93,14 +93,7 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 		return nil, fmt.Errorf("creating output directory: %w", err)
 	}
 
-	// Sort group names for deterministic output order.
-	groupNames := make([]string, 0, len(state.Groups))
-	for name := range state.Groups {
-		groupNames = append(groupNames, name)
-	}
-	sort.Strings(groupNames)
-
-	entries, _, err := g.plan(state, groupNames)
+	entries, _, err := g.plan(state, sortedGroupNames(state))
 	if err != nil {
 		return nil, err
 	}
@@ -135,13 +128,7 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 // Plan runs generation's build and safety passes without writing anything,
 // returning scheduling metadata and refusals.
 func (g *Generator) Plan(state *models.BackupState) (map[string]GroupRunMeta, []Refusal, error) {
-	groupNames := make([]string, 0, len(state.Groups))
-	for name := range state.Groups {
-		groupNames = append(groupNames, name)
-	}
-	sort.Strings(groupNames)
-
-	entries, refusals, err := g.plan(state, groupNames)
+	entries, refusals, err := g.plan(state, sortedGroupNames(state))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -150,6 +137,42 @@ func (g *Generator) Plan(state *models.BackupState) (map[string]GroupRunMeta, []
 		meta[e.name] = e.meta
 	}
 	return meta, refusals, nil
+}
+
+// RenderGroup compiles one group's config without writing. It runs the full
+// plan so the shared-repo check sees every group; returns a refusal reason if
+// the group was refused, and ("", "", nil) for an unknown group.
+func (g *Generator) RenderGroup(state *models.BackupState, groupName string) (configYAML, refusal string, err error) {
+	entries, refusals, err := g.plan(state, sortedGroupNames(state))
+	if err != nil {
+		return "", "", err
+	}
+	for _, r := range refusals {
+		if r.Group == groupName {
+			return "", r.Reason, nil
+		}
+	}
+	for _, e := range entries {
+		if e.name != groupName {
+			continue
+		}
+		data, mErr := yaml.Marshal(e.final)
+		if mErr != nil {
+			return "", "", fmt.Errorf("marshaling config for group %s: %w", groupName, mErr)
+		}
+		return headerComment + string(data), "", nil
+	}
+	return "", "", nil
+}
+
+// sortedGroupNames returns the state's group names in deterministic order.
+func sortedGroupNames(state *models.BackupState) []string {
+	names := make([]string, 0, len(state.Groups))
+	for name := range state.Groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // pending is one group's fully merged config awaiting the write pass.

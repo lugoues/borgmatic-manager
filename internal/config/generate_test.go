@@ -566,6 +566,59 @@ func TestGenerateSubstringGroupNameRefusedOnSharedRepo(t *testing.T) {
 	assert.Contains(t, buf.String(), "must contain the literal {group} token")
 }
 
+// RenderGroup returns one group's compiled config without writing any files,
+// and runs the full plan so the shared-repo guard still applies.
+func TestRenderGroup(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("data", models.VolumeInfo{Name: "d", HostPath: "/mnt/d"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+			"archive_name_format": "{hostname}-{group}-{now}",
+		},
+	}
+	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+
+	yaml, refusal, err := g.RenderGroup(state, "app")
+	require.NoError(t, err)
+	assert.Empty(t, refusal)
+	assert.Contains(t, yaml, "{hostname}-app-{now}", "the group's own compiled config is returned")
+	assert.NotContains(t, yaml, "{hostname}-data-{now}", "and only that group's")
+
+	// Nothing was written.
+	entries, _ := os.ReadDir(outDir)
+	assert.Empty(t, entries, "RenderGroup must not write any config files")
+
+	// An unknown group is empty, not an error.
+	yaml, refusal, err = g.RenderGroup(state, "nope")
+	require.NoError(t, err)
+	assert.Empty(t, yaml)
+	assert.Empty(t, refusal)
+}
+
+// RenderGroup reports a shared-repo refusal rather than returning a config that
+// would be unsafe to run.
+func TestRenderGroupReportsRefusal(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("data", models.VolumeInfo{Name: "d", HostPath: "/mnt/d"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+			"archive_name_format": "backup-{now}", // no {group}, shared repo
+		},
+	}
+	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+
+	yaml, refusal, err := g.RenderGroup(state, "app")
+	require.NoError(t, err)
+	assert.Empty(t, yaml)
+	assert.Contains(t, refusal, "{group} token", "the guard's reason is surfaced, seen only because the full plan ran")
+}
+
 // The token still satisfies the guard for groups sharing a repository.
 func TestGenerateGroupTokenAllowedOnSharedRepo(t *testing.T) {
 	state := models.NewBackupState()

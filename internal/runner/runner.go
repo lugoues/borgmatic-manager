@@ -295,13 +295,7 @@ func (r *Runner) runGroup(ctx context.Context, groupName, runID string) error {
 		case <-timeoutCh:
 			timedOut.Store(true)
 			r.logger.Error("run timeout exceeded: signalling borgmatic", "group", groupName, "timeout", r.runTimeout)
-			signalGroup(cmd, syscall.SIGTERM)
-			select {
-			case <-done:
-			case <-time.After(r.killGrace):
-				r.logger.Error("borgmatic ignored SIGTERM: killing process group", "group", groupName)
-				signalGroup(cmd, syscall.SIGKILL)
-			}
+			r.terminateGroup(cmd, done, groupName)
 		}
 	}()
 
@@ -331,24 +325,27 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 		return fmt.Errorf("starting config validation for group %s: %w", groupName, err)
 	}
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	exited := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = cmd.Wait(); close(exited) }()
 
 	timer := time.NewTimer(validateTimeout)
 	defer timer.Stop()
 
-	var err error
 	var interrupted bool
 	select {
-	case err = <-done:
+	case <-exited:
 	case <-ctx.Done():
 		interrupted = true
 		r.logger.Info("shutdown: signalling config validation", "group", groupName)
-		err = r.terminateAndWait(cmd, done, groupName)
+		r.terminateGroup(cmd, exited, groupName)
+		<-exited
 	case <-timer.C:
 		r.logger.Error("config validation timed out: signalling borgmatic", "group", groupName, "timeout", validateTimeout)
-		err = r.terminateAndWait(cmd, done, groupName)
+		r.terminateGroup(cmd, exited, groupName)
+		<-exited
 	}
+	err := waitErr
 
 	// A validation we killed says nothing about the config; recording
 	// config-invalid would leave the group falsely marked broken.
@@ -365,17 +362,15 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 	return nil
 }
 
-// terminateAndWait SIGTERMs the command's process group, escalating to
-// SIGKILL after the kill grace, and returns its exit error.
-func (r *Runner) terminateAndWait(cmd *exec.Cmd, done <-chan error, groupName string) error {
+// terminateGroup SIGTERMs the process group, escalating to SIGKILL after the kill
+// grace. Backup shutdown skips this so Borg can release repo locks cleanly.
+func (r *Runner) terminateGroup(cmd *exec.Cmd, exited <-chan struct{}, groupName string) {
 	signalGroup(cmd, syscall.SIGTERM)
 	select {
-	case err := <-done:
-		return err
+	case <-exited:
 	case <-time.After(r.killGrace):
 		r.logger.Error("process ignored SIGTERM: killing process group", "group", groupName)
 		signalGroup(cmd, syscall.SIGKILL)
-		return <-done
 	}
 }
 
