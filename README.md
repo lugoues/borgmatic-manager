@@ -54,7 +54,7 @@ reimplements.
 # From the APT repository (Debian/Ubuntu, tracks new releases via apt upgrade)
 curl -fsSL https://lugoues.github.io/borgmatic-manager/public.key \
   | sudo gpg --dearmor -o /etc/apt/keyrings/borgmatic-manager.gpg
-echo "deb [signed-by=/etc/apt/keyrings/borgmatic-manager.gpg] https://lugoues.github.io/borgmatic-manager stable main" \
+echo "deb [signed-by=/etc/apt/keyrings/borgmatic-manager.gpg] https://lugoues.github.io/borgmatic-manager/repo stable main" \
   | sudo tee /etc/apt/sources.list.d/borgmatic-manager.list
 sudo apt update && sudo apt install borgmatic-manager
 
