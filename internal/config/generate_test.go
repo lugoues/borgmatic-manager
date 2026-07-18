@@ -136,7 +136,7 @@ func TestGenerateArchiveNameFormat(t *testing.T) {
 	parsed := readGenerated(t, outDir, "myapp")
 	format, ok := parsed["archive_name_format"].(string)
 	require.True(t, ok)
-	assert.Equal(t, "{hostname}-myapp-{now:%Y-%m-%d_%H:%M}", format)
+	assert.Equal(t, "{hostname}-myapp-{now:%Y-%m-%d_%H:%M:%S}", format)
 }
 
 func TestGenerateHelperModeDatabases(t *testing.T) {

@@ -44,7 +44,7 @@ borgmatic:
 
   # Archive naming; {group} is filled in by the manager, the rest by borg.
   # Repo-per-host setups often drop the redundant {hostname}.
-  # archive_name_format: "{group}-{now:%Y-%m-%d_%H:%M}"
+  # archive_name_format: "{group}-{now:%Y-%m-%d_%H:%M:%S}"
 
   checks:
     - name: repository
