@@ -1,0 +1,36 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Codename: stable
+Date: Sat, 18 Jul 2026 23:31:16 UTC
+Architectures: amd64 arm64
+Components: main
+Description: lugoues/borgmatic-manager
+MD5Sum:
+ fadabea28a0cd293f03e3c7b8790c424 598 main/binary-amd64/Packages
+ 2c16083718e8a20426fc7522fb09e919 393 main/binary-amd64/Packages.gz
+ c1e7cd8d67fd6bf072f425182cdbd27a 75 main/binary-amd64/Release
+ 3b7efa4aa08180d1a98fba15a3b9d7d9 567 main/binary-arm64/Packages
+ 979ac5ea347f33e2cab915430c35e06f 383 main/binary-arm64/Packages.gz
+ 975d1915e16a2b58c961fb5a5f2aa214 75 main/binary-arm64/Release
+SHA1:
+ 3c9c4cbdab6fc59108477091450aa5e66596146a 598 main/binary-amd64/Packages
+ 1ff1cea85a14ebf9a54e72fe8551691610d4f545 393 main/binary-amd64/Packages.gz
+ 7c0f284dfc36824baabfa81ee88957e451a45637 75 main/binary-amd64/Release
+ 3ef8f873210b2ebf4ba44897cdbf64bf5321c616 567 main/binary-arm64/Packages
+ d45bf0d302f05ca7124805ef8fcc441edd455df9 383 main/binary-arm64/Packages.gz
+ c334bcd8aa7c870d21b02e8bb380d61c20e24a11 75 main/binary-arm64/Release
+SHA256:
+ 9c89d5148a5f62a5c914877f5d9d1be133d97c783e37e73f98567269f5145270 598 main/binary-amd64/Packages
+ 24d0b58cd0bf362f42304d6066e3f87060d57c43d8f325ca35b93227da6fb26a 393 main/binary-amd64/Packages.gz
+ 2671982281214753acd37e395d76342980d0bb8b1f6067dc9a449f574646f5ba 75 main/binary-amd64/Release
+ 90d036b783b949c46a6390a953d89ac300fa6771d7db3f93d4591a06c4bcb920 567 main/binary-arm64/Packages
+ 4d694da2f38b21bac44d66b7c09201e45cd6d0e8779f0b52370d9f867fa8b3f8 383 main/binary-arm64/Packages.gz
+ 8137a5686425c2e2d8883e250e5ea69bc8eea14329ff9181dab3f1218237c30c 75 main/binary-arm64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYIAB0WIQQQ/+JA72RZH05BlUFrp91JO8LjjgUCalwMxAAKCRBrp91JO8Lj
+jq06APkB6HoNhkHW8hu8JjGpL0poo9HGUp9J2YMRUfQ40vPEzwD+JYbgb+eD5Ncj
+lvIwFMsRKYor17m6e4ZJYhwUqK88BAQ=
+=2N9W
+-----END PGP SIGNATURE-----

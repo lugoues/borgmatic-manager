@@ -1,0 +1,7 @@
+Description: lugoues/borgmatic-manager
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+SignWith: 10FFE240EF64591F4E4195416BA7DD493BC2E38E
+
+
