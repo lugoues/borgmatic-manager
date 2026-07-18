@@ -240,6 +240,9 @@ func (r *Runner) runGroup(ctx context.Context, groupName, runID string) error {
 		// tell a live run from an orphan. Failing to take it must not fail the backup.
 		if r.lockDir != "" {
 			if lock, _, err := lockfile.TryExclusive(PendingLockPath(r.lockDir, runID)); err != nil {
+				// A failed TryExclusive leaves the file present but unheld, which reads
+				// as a dead owner: remove it to fall back to the PID check, which keeps us.
+				_ = os.Remove(PendingLockPath(r.lockDir, runID))
 				r.logger.Warn("cannot take pending-run liveness lock; falling back to PID protection for this run",
 					"run_id", runID, "error", err)
 			} else if lock != nil {
