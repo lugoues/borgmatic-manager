@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Borgmatic Manager</title>
+</head>
+<body>
+    <div>
+        Label-driven backup orchestration for Docker and Podman.
+
+        <br/><a href="https://github.com/lugoues/borgmatic-manager">project
+            page</a>
+    </div>
+
+    <div>
+        <pre>
+# Add the repository
+sudo mkdir -p --mode=0755 /usr/share/local/keyrings
+curl -fsSL https://lugoues.github.io/borgmatic-manager/public.key | sudo gpg --dearmor -o
+/etc/apt/keyrings/borgmatic-manager.gpg
+echo "deb [signed-by=/etc/apt/keyrings/borgmatic-manager.gpg] https://lugoues.github.io/borgmatic-manager stable main" |
+sudo tee /etc/apt/sources.list.d/borgmatic-manager.list
+
+# Install borgmatic-manager
+sudo apt-get update &amp;&amp; sudo apt-get install borgmatic-manager</pre>
+        </pre>
+    </div>
+</body>
+</html>
