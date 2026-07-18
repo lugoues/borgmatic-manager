@@ -65,12 +65,12 @@ checksum:
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <artifact>
 signs:
   - cmd: cosign
-    signature: ${artifact}.sigstore.json
+    signature: "${artifact}.sigstore.json"
     args:
-      - sign-blob
-      - --yes
-      - --bundle ${signature}
-      - ${artifact}
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
     artifacts: all
     output: true
 

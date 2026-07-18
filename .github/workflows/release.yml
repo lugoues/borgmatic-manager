@@ -19,6 +19,8 @@ jobs:
           fetch-depth: 0
       - uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.1.2'
       - name: gate on lint and race-enabled tests
         run: |
           mise run lint
