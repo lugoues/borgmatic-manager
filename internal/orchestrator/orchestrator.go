@@ -37,11 +37,13 @@ func NewOrchestrator(scheduler CycleRunner, listener EventSource, logger *slog.L
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.logger.Info("borgmatic-manager starting up")
 
+	// Subscribe before the initial cycle: a container created while that cycle
+	// runs parks a trigger in the buffered channel instead of being missed.
+	triggerCh := o.listener.Listen(ctx)
+
 	if err := o.scheduler.RunCycle(ctx); err != nil {
 		o.logger.Error("initial cycle failed", "error", err)
 	}
-
-	triggerCh := o.listener.Listen(ctx)
 
 	// Shutdown must wait for the scheduler goroutine: abandoning a mid-backup
 	// cycle would cut borgmatic off instead of the clean SIGTERM-and-wait.
