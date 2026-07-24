@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lugoues/borgmatic-manager/internal/models"
+	"github.com/lugoues/borgmatic-manager/internal/scheduler"
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
@@ -251,4 +253,65 @@ func TestInspectHandlesNoHistory(t *testing.T) {
 	assert.Contains(t, out, "never", "an unrun group shows 'never' for last backup")
 	assert.Contains(t, out, "no config generated")
 	assert.NotContains(t, out, "Size trend", "no trend without at least two sized runs")
+}
+
+func TestBuildStatusDoc(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+
+	bs := models.NewBackupState()
+	bs.AddVolume("done", models.VolumeInfo{Name: "vol-a", HostPath: "/mnt/a"})
+	bs.AddVolume("busy", models.VolumeInfo{Name: "vol-b", HostPath: "/mnt/b"})
+	bs.AddVolume("blocked", models.VolumeInfo{Name: "vol-c", HostPath: "/mnt/c"})
+	bs.AddVolume("empty-skip", models.VolumeInfo{}) // zero-member groups are filtered upstream of this
+	bs.Groups["empty-skip"].Volumes = nil
+
+	store := state.LoadSchedule(t.TempDir(), nil)
+	// "done" succeeded 10m ago with stats and a log tail that must not leak.
+	store.MarkSuccess("done", scheduler.GroupFingerprint(bs.Groups["done"]), now.Add(-10*time.Minute))
+	store.RecordRun("done", state.RunOutcome{
+		Finished:        now.Add(-10 * time.Minute),
+		Result:          state.ResultOK,
+		DurationSeconds: 42,
+		Files:           100,
+		OriginalBytes:   1 << 20,
+		LogTail:         []string{"should not appear"},
+	})
+	// "busy" is mid-run, started 5m ago, with a 1m run_timeout: stale.
+	store.RecordPending("run-1", "busy", now.Add(-5*time.Minute))
+
+	doc := buildStatusDoc(bs, store, time.Hour, time.Minute,
+		map[string]time.Duration{"done": 30 * time.Minute},
+		map[string]string{"blocked": "shared repo"}, now)
+
+	require.Len(t, doc.Groups, 3, "empty groups are excluded")
+	byName := map[string]statusGroupJSON{}
+	for _, g := range doc.Groups {
+		byName[g.Name] = g
+	}
+
+	done := byName["done"]
+	assert.EqualValues(t, 1800, done.PeriodSeconds, "file period override wins over global")
+	require.NotNil(t, done.LastRun)
+	assert.Equal(t, state.ResultOK, done.LastRun.Result)
+	assert.Nil(t, done.LastRun.LogTail, "log tail stays out of status output")
+	require.NotNil(t, done.Due)
+	assert.False(t, *done.Due, "succeeded 10m ago on a 30m period")
+	require.NotNil(t, done.NextRun)
+	assert.Equal(t, now.Add(20*time.Minute), *done.NextRun)
+
+	busy := byName["busy"]
+	require.NotNil(t, busy.Running)
+	assert.EqualValues(t, 300, busy.Running.ElapsedSeconds)
+	assert.True(t, busy.Running.Stale, "past run_timeout")
+	assert.Nil(t, busy.Due, "running groups carry no dueness")
+
+	blocked := byName["blocked"]
+	assert.Equal(t, "shared repo", blocked.Refused)
+	assert.Nil(t, blocked.Due)
+
+	// The whole document must round-trip as JSON.
+	raw, err := json.Marshal(doc)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"generated_at"`)
+	assert.NotContains(t, string(raw), "should not appear")
 }

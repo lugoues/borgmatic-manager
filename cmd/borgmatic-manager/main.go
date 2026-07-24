@@ -111,18 +111,21 @@ func discoverCmd() *cobra.Command {
 }
 
 func statusCmd() *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show each group's last run, its result, and when the next run is due",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
-			return runStatus(cmd.Context())
+			return runStatus(cmd.Context(), jsonOut)
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "machine-readable output for scripts and exporters")
+	return cmd
 }
 
-func runStatus(ctx context.Context) error {
+func runStatus(ctx context.Context, jsonOut bool) error {
 	logger := interactiveLogger()
 	e, err := loadEnv()
 	if err != nil {
@@ -152,6 +155,9 @@ func runStatus(ctx context.Context) error {
 		return err
 	}
 
+	if jsonOut {
+		return printStatusJSON(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused)
+	}
 	printStatus(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused)
 	return nil
 }
