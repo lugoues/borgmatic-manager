@@ -157,7 +157,7 @@ func TestInspectRendersSectionsAndTrend(t *testing.T) {
 
 	// Two trend series: total archive size, and the new data each run added.
 	assert.Contains(t, out, "total", "the trend shows total archive size")
-	assert.Contains(t, out, "new", "and the per-run new-data (churn) series")
+	assert.Contains(t, out, "delta", "and the per-run new-data (churn) series")
 	assert.Contains(t, out, "peak", "the churn line summarises its peak")
 }
 

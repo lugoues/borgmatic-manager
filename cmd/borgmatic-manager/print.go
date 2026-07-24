@@ -34,6 +34,9 @@ var (
 	styleBad    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	styleWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	// styleChartHeader labels the trend charts: bold so the series name and
+	// unit stand apart from the stats line beside them.
+	styleChartHeader = lipgloss.NewStyle().Bold(true)
 )
 
 // colorLevel renders a slog level token, colored by severity and padded to align.
@@ -476,17 +479,11 @@ func trendChart(times []time.Time, values []int64, height int) (string, string) 
 	}
 	labels := func(_ int, v float64) string { return strconv.FormatFloat(v, 'f', precision, 64) }
 
-	// Sub-3-day histories label the X axis with clock times; dates would
-	// repeat the same day across the whole axis.
-	xLabels := timeserieslinechart.DateTimeLabelFormatter()
-	if times[len(times)-1].Sub(times[0]) < 72*time.Hour {
-		xLabels = timeserieslinechart.HourTimeLabelFormatter()
-	}
-
+	// X labels are dates only: histories span days, and clock times without
+	// a date turn ambiguous the moment a series crosses midnight.
 	c := timeserieslinechart.New(trendChartWidth(), height,
 		timeserieslinechart.WithYRange(minY, maxY),
 		timeserieslinechart.WithXYSteps(8, 4),
-		timeserieslinechart.WithXLabelFormatter(xLabels),
 		timeserieslinechart.WithYLabelFormatter(labels))
 	for i, v := range drawn {
 		c.Push(timeserieslinechart.TimePoint{Time: times[i], Value: v})
@@ -568,15 +565,19 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	times, totals, deltas := trendSeries(rec.History)
 	if chart, unit := trendChart(times, totals, chartTotalsHeight); chart != "" {
 		section("Size trend")
-		fmt.Printf(edgePad+"  %s\n", styleDetail.Render(fmt.Sprintf("total (%s)   %s → %s  (%d runs)",
-			unit, humanBytes(totals[0]), humanBytes(totals[len(totals)-1]), len(totals))))
+		fmt.Printf(edgePad+"  %s   %s\n",
+			styleChartHeader.Render(fmt.Sprintf("total (%s)", unit)),
+			styleDetail.Render(fmt.Sprintf("%s → %s  (%d runs)",
+				humanBytes(totals[0]), humanBytes(totals[len(totals)-1]), len(totals))))
 		fmt.Println(indentBlock(chart))
 
 		// Skip the churn chart when no run reported deduplicated stats: a
 		// flat zero line would read as "no new data" rather than "no data".
 		if chart, unit := trendChart(times, deltas, chartDeltasHeight); chart != "" && slices.Max(deltas) > 0 {
-			fmt.Printf(edgePad+"  %s\n", styleDetail.Render(fmt.Sprintf("new (%s)   %s latest · %s peak",
-				unit, humanBytes(deltas[len(deltas)-1]), humanBytes(slices.Max(deltas)))))
+			fmt.Printf(edgePad+"  %s   %s\n",
+				styleChartHeader.Render(fmt.Sprintf("delta (%s)", unit)),
+				styleDetail.Render(fmt.Sprintf("%s latest · %s peak",
+					humanBytes(deltas[len(deltas)-1]), humanBytes(slices.Max(deltas)))))
 			fmt.Println(indentBlock(chart))
 		}
 	}
