@@ -165,10 +165,14 @@ func (s *Scheduler) groupDue(name, fingerprint string, period time.Duration, now
 	return d.Due, d.Next
 }
 
-// EffectivePeriod returns the group's period override, or the global fallback.
-func EffectivePeriod(group *models.VolumeGroup, global time.Duration) time.Duration {
+// EffectivePeriod resolves a group's backup interval through the cascade:
+// label override, then groups/ overlay, then the global manager.period.
+func EffectivePeriod(group *models.VolumeGroup, filePeriod, global time.Duration) time.Duration {
 	if group != nil && group.Period > 0 {
 		return group.Period
+	}
+	if filePeriod > 0 {
+		return filePeriod
 	}
 	return global
 }
@@ -206,7 +210,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 		}
 		live[name] = struct{}{}
 
-		groupPeriods[name] = EffectivePeriod(group, s.period)
+		groupPeriods[name] = EffectivePeriod(group, s.cfg.GroupPeriods[name], s.period)
 
 		fingerprint := GroupFingerprint(group)
 		if due, next := s.groupDue(name, fingerprint, groupPeriods[name], now); !due {

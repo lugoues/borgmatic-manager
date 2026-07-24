@@ -16,6 +16,10 @@ import (
 type ManagerConfig struct {
 	Manager   ManagerSettings        `yaml:"manager"`
 	Borgmatic map[string]interface{} `yaml:"borgmatic"`
+
+	// GroupPeriods holds per-group manager.period overrides from the groups/
+	// overlays, resolved by LoadConfig. Label overrides still beat these.
+	GroupPeriods map[string]time.Duration `yaml:"-"`
 }
 
 // ParsedPeriod parses and validates manager.period in one place. Non-positive
@@ -50,11 +54,65 @@ type ManagerSettings struct {
 	ContainerCLI string `yaml:"container_cli"`
 }
 
+// GroupOverride is one groups/{group}.yaml overlay: the same manager+borgmatic
+// shape as manager.yaml, scoped to a single group.
+type GroupOverride struct {
+	// Period overrides manager.period for the group; 0 means no override.
+	Period time.Duration
+	// Borgmatic is the group's borgmatic config fragment, deep-merged over
+	// the manager.yaml borgmatic defaults.
+	Borgmatic map[string]interface{}
+}
+
+// parseGroupOverride validates a group overlay. Top-level keys are restricted
+// to manager/borgmatic, and manager keys to period: a typo'd or un-nested key
+// silently changing nothing would be worse than the error.
+func parseGroupOverride(raw map[string]interface{}, path string) (GroupOverride, error) {
+	var o GroupOverride
+	for key, val := range raw {
+		switch key {
+		case "borgmatic":
+			m, ok := val.(map[string]interface{})
+			if !ok {
+				return o, fmt.Errorf("group override %s: borgmatic section must be a mapping", path)
+			}
+			o.Borgmatic = m
+		case "manager":
+			m, ok := val.(map[string]interface{})
+			if !ok {
+				return o, fmt.Errorf("group override %s: manager section must be a mapping", path)
+			}
+			for mk, mv := range m {
+				switch mk {
+				case "period":
+					s, ok := mv.(string)
+					if !ok {
+						return o, fmt.Errorf("group override %s: manager.period must be a duration string", path)
+					}
+					d, err := time.ParseDuration(strings.TrimSpace(s))
+					if err != nil {
+						return o, fmt.Errorf("group override %s: invalid manager.period %q: %w", path, s, err)
+					}
+					if d <= 0 {
+						return o, fmt.Errorf("group override %s: invalid manager.period %q: must be positive", path, s)
+					}
+					o.Period = d
+				default:
+					return o, fmt.Errorf("group override %s: unknown manager option %q (supported: period)", path, mk)
+				}
+			}
+		default:
+			return o, fmt.Errorf("group override %s: unknown top-level key %q: group files are manager.yaml-shaped overlays; nest borgmatic options under a borgmatic: section", path, key)
+		}
+	}
+	return o, nil
+}
+
 // LoadConfig reads the manager config, deep-merges conf.d/*.yaml drop-ins
-// (lexical order, beside managerPath) over it, and loads per-group override
-// fragments from groupsDir, keyed by filename sans extension. All files
-// support borgmatic's !include tag. A missing groupsDir is not an error.
-func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[string]map[string]interface{}, error) {
+// (lexical order, beside managerPath) over it, and loads per-group overlays
+// from groupsDir, keyed by filename sans extension. All files support
+// borgmatic's !include tag. A missing groupsDir is not an error.
+func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[string]GroupOverride, error) {
 	managerMap, err := loadYAMLWithIncludes(managerPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading manager config: %w", err)
@@ -75,7 +133,7 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 		return nil, nil, fmt.Errorf("parsing manager config: %w", parseErr)
 	}
 
-	overrides := make(map[string]map[string]interface{})
+	overrides := make(map[string]GroupOverride)
 
 	entries, err := os.ReadDir(groupsDir)
 	if err != nil {
@@ -102,14 +160,17 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 			return nil, nil, fmt.Errorf("loading group override %s: %w", groupPath, err)
 		}
 
-		// Legacy wrapper form: a lone top-level "borgmatic" key.
-		if len(raw) == 1 {
-			if wrapped, ok := raw["borgmatic"].(map[string]interface{}); ok {
-				overrides[groupName] = wrapped
-				continue
-			}
+		override, err := parseGroupOverride(raw, groupPath)
+		if err != nil {
+			return nil, nil, err
 		}
-		overrides[groupName] = raw
+		overrides[groupName] = override
+		if override.Period > 0 {
+			if cfg.GroupPeriods == nil {
+				cfg.GroupPeriods = make(map[string]time.Duration)
+			}
+			cfg.GroupPeriods[groupName] = override.Period
+		}
 	}
 
 	return &cfg, overrides, nil

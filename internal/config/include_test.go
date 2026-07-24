@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -139,24 +140,57 @@ borgmatic:
 	assert.Contains(t, err.Error(), "not supported")
 }
 
-func TestGroupFilesAreTopLevelFragmentsWithIncludes(t *testing.T) {
+func TestGroupFilesAreManagerShapedOverlays(t *testing.T) {
 	dir := writeFiles(t, map[string]string{
 		"common.yaml":       "keep_daily: 7\n",
 		"manager.yaml":      "manager:\n    period: \"1h\"\nborgmatic:\n    keep_weekly: 4\n",
-		"groups/myapp.yaml": "<<: !include ../common.yaml\nkeep_monthly: 6\n",
-		// Legacy wrapper form still accepted.
-		"groups/legacy.yaml": "borgmatic:\n    keep_daily: 30\n",
+		"groups/myapp.yaml": "manager:\n    period: \"30m\"\nborgmatic:\n    <<: !include ../common.yaml\n    keep_monthly: 6\n",
+		"groups/plain.yaml": "borgmatic:\n    keep_daily: 30\n",
 	})
 
-	_, overrides, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+	cfg, overrides, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
 	require.NoError(t, err)
 
 	require.Contains(t, overrides, "myapp")
-	assert.Equal(t, 7, overrides["myapp"]["keep_daily"], "group files support includes")
-	assert.Equal(t, 6, overrides["myapp"]["keep_monthly"], "top-level fragment form works")
+	assert.Equal(t, 7, overrides["myapp"].Borgmatic["keep_daily"], "group borgmatic sections support includes")
+	assert.Equal(t, 6, overrides["myapp"].Borgmatic["keep_monthly"], "borgmatic section merges include with local keys")
+	assert.Equal(t, 30*time.Minute, overrides["myapp"].Period, "group manager.period parses")
+	assert.Equal(t, 30*time.Minute, cfg.GroupPeriods["myapp"], "group period lands in cfg.GroupPeriods")
 
-	require.Contains(t, overrides, "legacy")
-	assert.Equal(t, 30, overrides["legacy"]["keep_daily"], "legacy borgmatic: wrapper still accepted")
+	require.Contains(t, overrides, "plain")
+	assert.Equal(t, 30, overrides["plain"].Borgmatic["keep_daily"], "borgmatic-only overlay works")
+	assert.Zero(t, overrides["plain"].Period)
+}
+
+func TestGroupFileBareKeysRejected(t *testing.T) {
+	dir := writeFiles(t, map[string]string{
+		"manager.yaml":      "manager:\n    period: \"1h\"\nborgmatic: {}\n",
+		"groups/myapp.yaml": "keep_daily: 14\n",
+	})
+
+	_, _, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+	require.ErrorContains(t, err, "unknown top-level key")
+	require.ErrorContains(t, err, "nest borgmatic options")
+}
+
+func TestGroupFileManagerSectionValidation(t *testing.T) {
+	cases := []struct {
+		name, body, wantErr string
+	}{
+		{"unknown manager key", "manager:\n    run_timeout: \"5m\"\n", "unknown manager option"},
+		{"bad period", "manager:\n    period: \"often\"\n", "invalid manager.period"},
+		{"non-positive period", "manager:\n    period: \"0s\"\n", "must be positive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeFiles(t, map[string]string{
+				"manager.yaml":      "manager:\n    period: \"1h\"\nborgmatic: {}\n",
+				"groups/myapp.yaml": tc.body,
+			})
+			_, _, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
 }
 
 func TestNativeAnchorsAndMergeStillWork(t *testing.T) {
@@ -222,12 +256,12 @@ func TestYmlExtensionAccepted(t *testing.T) {
 	dir := writeFiles(t, map[string]string{
 		"manager.yaml":    "manager:\n    period: \"1h\"\nborgmatic:\n    keep_daily: 7\n",
 		"conf.d/10-x.yml": "borgmatic:\n    keep_daily: 14\n",
-		"groups/app.yml":  "keep_monthly: 6\n",
+		"groups/app.yml":  "borgmatic:\n    keep_monthly: 6\n",
 	})
 
 	cfg, overrides, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
 	require.NoError(t, err)
 	assert.Equal(t, 14, cfg.Borgmatic["keep_daily"], ".yml drop-ins must load")
 	require.Contains(t, overrides, "app", ".yml group files must load")
-	assert.Equal(t, 6, overrides["app"]["keep_monthly"])
+	assert.Equal(t, 6, overrides["app"].Borgmatic["keep_monthly"])
 }

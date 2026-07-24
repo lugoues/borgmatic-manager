@@ -152,7 +152,7 @@ func runStatus(ctx context.Context) error {
 		return err
 	}
 
-	printStatus(backupState, stateStore(e, logger), period, runTimeout, refused)
+	printStatus(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused)
 	return nil
 }
 
@@ -190,7 +190,7 @@ func runInspect(ctx context.Context, group string) error {
 	rec, haveRec := stateStore(e, logger).Record(group)
 	configYAML, configNote := renderGroupConfig(backupState, e, logger, group)
 
-	printInspect(group, g, rec, haveRec, configYAML, configNote, period)
+	printInspect(group, g, rec, haveRec, configYAML, configNote, period, e.cfg.GroupPeriods[group])
 	return nil
 }
 
@@ -283,7 +283,7 @@ type env struct {
 	configsDir string
 
 	cfg            *config.ManagerConfig
-	groupOverrides map[string]map[string]interface{}
+	groupOverrides map[string]config.GroupOverride
 	rt             *runtime.DockerRuntime
 }
 

@@ -46,7 +46,7 @@ func TestDisplayBlocksArePaddedTopAndBottom(t *testing.T) {
 
 	for name, render := range map[string]func(){
 		"discover": func() { printGroups(bs, store) },
-		"status":   func() { printStatus(bs, store, time.Hour, 0, nil) },
+		"status":   func() { printStatus(bs, store, time.Hour, 0, nil, nil) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := captureStdout(t, render)
@@ -77,7 +77,7 @@ func TestStatusFailurePointsToInspect(t *testing.T) {
 		LastError: "Repository /mnt/repo does not exist.",
 	})
 
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil) })
 
 	assert.Contains(t, out, "1 group failed")
 	assert.Contains(t, out, "demo", "the failing group must be named")
@@ -107,7 +107,7 @@ func TestStatusShowsRunningGroup(t *testing.T) {
 	// A pending record with no matching finished outcome: a run in flight.
 	store.RecordPending("run-1", "demo", time.Now().Add(-3*time.Minute))
 
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil) })
 
 	assert.Contains(t, out, "running", "an in-flight group shows as running")
 	assert.Contains(t, out, "1 group running", "the header reflects the running count")
@@ -121,7 +121,7 @@ func TestStatusFlagsStaleRunningPastTimeout(t *testing.T) {
 	store.RecordPending("run-1", "demo", time.Now().Add(-2*time.Hour))
 
 	// run_timeout of 30m: a 2h "run" is past it and reads as suspect.
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 30*time.Minute, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 30*time.Minute, nil, nil) })
 
 	assert.Contains(t, out, "running?", "past run_timeout, a run is flagged as possibly stale")
 }
@@ -144,7 +144,7 @@ func TestInspectRendersSectionsAndTrend(t *testing.T) {
 	require.True(t, ok)
 
 	out := captureStdout(t, func() {
-		printInspect("demo", group, rec, true, "source_directories:\n  - /mnt/demo\n", "", time.Hour)
+		printInspect("demo", group, rec, true, "source_directories:\n  - /mnt/demo\n", "", time.Hour, 0)
 	})
 
 	for _, want := range []string{"Inspect demo", "Members", "Schedule", "Last run", "Size trend", "Recent runs", "Last run log", "Config"} {
@@ -204,7 +204,7 @@ func TestInspectOmitsChurnLineWithoutDedupStats(t *testing.T) {
 	rec, ok := store.Record("demo")
 	require.True(t, ok)
 
-	out := captureStdout(t, func() { printInspect("demo", group, rec, true, "", "none", time.Hour) })
+	out := captureStdout(t, func() { printInspect("demo", group, rec, true, "", "none", time.Hour, 0) })
 
 	assert.Contains(t, out, "Size trend", "the total series still renders")
 	assert.NotContains(t, out, "peak", "but the churn line is omitted without dedup stats")
@@ -227,7 +227,7 @@ func TestDiscoverAndInspectAgreeOnMemberDetail(t *testing.T) {
 
 	discover := captureStdout(t, func() { printGroups(bs, store) })
 	inspect := captureStdout(t, func() {
-		printInspect("demo", group, state.GroupRecord{}, false, "", "none", time.Hour)
+		printInspect("demo", group, state.GroupRecord{}, false, "", "none", time.Hour, 0)
 	})
 
 	for _, want := range []string{"/data/app.db", "hostname=db.internal port=5432", "container=pg"} {
@@ -244,7 +244,7 @@ func TestInspectHandlesNoHistory(t *testing.T) {
 	// A never-run group: no record. Must render without panicking, and note
 	// the config is unavailable.
 	out := captureStdout(t, func() {
-		printInspect("demo", group, state.GroupRecord{}, false, "", "no config generated for this group", time.Hour)
+		printInspect("demo", group, state.GroupRecord{}, false, "", "no config generated for this group", time.Hour, 0)
 	})
 
 	assert.Contains(t, out, "Inspect demo")

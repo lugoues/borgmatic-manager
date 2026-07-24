@@ -144,7 +144,7 @@ func resolveBorgmatic(cfg *config.ManagerConfig) (string, error) {
 
 // snapshotHooksConfigured reports whether any btrfs/zfs/lvm hook appears in
 // the global borgmatic defaults or any per-group override.
-func snapshotHooksConfigured(cfg *config.ManagerConfig, overrides map[string]map[string]interface{}) bool {
+func snapshotHooksConfigured(cfg *config.ManagerConfig, overrides map[string]config.GroupOverride) bool {
 	for _, h := range config.SnapshotHookKeys {
 		if _, ok := cfg.Borgmatic[h]; ok {
 			return true
@@ -152,7 +152,7 @@ func snapshotHooksConfigured(cfg *config.ManagerConfig, overrides map[string]map
 	}
 	for _, override := range overrides {
 		for _, h := range config.SnapshotHookKeys {
-			if _, ok := override[h]; ok {
+			if _, ok := override.Borgmatic[h]; ok {
 				return true
 			}
 		}

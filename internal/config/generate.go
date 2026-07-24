@@ -60,7 +60,7 @@ type GeneratorOptions struct {
 // Generator produces per-group borgmatic YAML configuration files.
 type Generator struct {
 	cfg            *ManagerConfig
-	groupOverrides map[string]map[string]interface{}
+	groupOverrides map[string]GroupOverride
 	outputDir      string
 	opts           GeneratorOptions
 	logger         *slog.Logger
@@ -71,7 +71,7 @@ type Generator struct {
 
 // NewGenerator creates a Generator. Generated files are written atomically to
 // outputDir/{group}.yaml with 0600 permissions.
-func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]map[string]interface{}, outputDir string, opts GeneratorOptions, logger *slog.Logger) *Generator {
+func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]GroupOverride, outputDir string, opts GeneratorOptions, logger *slog.Logger) *Generator {
 	return &Generator{
 		cfg:            cfg,
 		groupOverrides: groupOverrides,
@@ -205,8 +205,8 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 
 		// 2. Apply per-group overrides if present.
 		if g.groupOverrides != nil {
-			if override, ok := g.groupOverrides[groupName]; ok {
-				base = DeepMerge(base, override)
+			if override, ok := g.groupOverrides[groupName]; ok && override.Borgmatic != nil {
+				base = DeepMerge(base, override.Borgmatic)
 			}
 		}
 

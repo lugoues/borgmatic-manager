@@ -179,7 +179,7 @@ func plural(n int, noun string) string {
 // printStatus renders per-group schedule state. Refused groups are marked as
 // such instead of showing "due now" forever; in-flight runs show "running" with
 // elapsed time, flagged when past runTimeout.
-func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, refused map[string]string) {
+func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string) {
 	// Trailing blank line keeps the table off the shell prompt.
 	defer fmt.Println()
 	now := time.Now()
@@ -261,7 +261,7 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 			rows = append(rows, r)
 			continue // a refused group never runs; keep it out of soonest
 		}
-		due := scheduler.Due(rec, ok, scheduler.GroupFingerprint(group), scheduler.EffectivePeriod(group, period), now)
+		due := scheduler.Due(rec, ok, scheduler.GroupFingerprint(group), scheduler.EffectivePeriod(group, filePeriods[name], period), now)
 		r.next = dueLabel(due, now)
 		if !due.Due {
 			wait = time.Until(due.Next)
@@ -406,7 +406,7 @@ func sparkline(values []int64) string {
 
 // printInspect renders a detailed view of one group. configYAML is the compiled
 // config, or configNote explains why it is unavailable.
-func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord, haveRec bool, configYAML, configNote string, period time.Duration) {
+func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord, haveRec bool, configYAML, configNote string, period, filePeriod time.Duration) {
 	defer fmt.Println()
 	now := time.Now()
 	fmt.Println()
@@ -424,7 +424,7 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	} else {
 		kv("last backup", styleDetail.Render("never"))
 	}
-	kv("next run", dueLabel(scheduler.Due(rec, haveRec, scheduler.GroupFingerprint(group), scheduler.EffectivePeriod(group, period), now), now))
+	kv("next run", dueLabel(scheduler.Due(rec, haveRec, scheduler.GroupFingerprint(group), scheduler.EffectivePeriod(group, filePeriod, period), now), now))
 
 	if rec.LastRun != nil {
 		o := rec.LastRun

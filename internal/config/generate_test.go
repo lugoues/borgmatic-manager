@@ -22,7 +22,11 @@ func discardLogger() *slog.Logger {
 
 // newTestGenerator builds a Generator with all host binaries "found" so
 // dependency warnings don't fire in unrelated tests.
-func newTestGenerator(t *testing.T, cfg *config.ManagerConfig, overrides map[string]map[string]interface{}, opts config.GeneratorOptions) (*config.Generator, string) {
+func newTestGenerator(t *testing.T, cfg *config.ManagerConfig, borgmaticOverrides map[string]map[string]interface{}, opts config.GeneratorOptions) (*config.Generator, string) {
+	overrides := make(map[string]config.GroupOverride, len(borgmaticOverrides))
+	for name, m := range borgmaticOverrides {
+		overrides[name] = config.GroupOverride{Borgmatic: m}
+	}
 	t.Helper()
 	outDir := t.TempDir()
 	g := config.NewGenerator(cfg, overrides, outDir, opts, discardLogger())

@@ -580,3 +580,44 @@ func TestNextWake_PerGroupPeriodOverride(t *testing.T) {
 		t.Fatalf("expected 6m wake from the 10m override, got %v", got)
 	}
 }
+
+func TestEffectivePeriod_Cascade(t *testing.T) {
+	global := time.Hour
+	filePeriod := 30 * time.Minute
+	withLabel := &models.VolumeGroup{Period: 10 * time.Minute}
+	plain := &models.VolumeGroup{}
+
+	if got := EffectivePeriod(withLabel, filePeriod, global); got != 10*time.Minute {
+		t.Fatalf("label must beat the group file, got %v", got)
+	}
+	if got := EffectivePeriod(plain, filePeriod, global); got != filePeriod {
+		t.Fatalf("group file must beat the global, got %v", got)
+	}
+	if got := EffectivePeriod(plain, 0, global); got != global {
+		t.Fatalf("global is the fallback, got %v", got)
+	}
+	if got := EffectivePeriod(nil, 0, global); got != global {
+		t.Fatalf("nil group falls back to global, got %v", got)
+	}
+}
+
+func TestDueGating_GroupFilePeriodOverride(t *testing.T) {
+	runner := newMockGroupRunner()
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+
+	s := dueTestScheduler(runner, store, t0)
+	s.cfg.GroupPeriods = map[string]time.Duration{"app": 10 * time.Minute}
+
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
+	if got := len(runner.getCalls()); got != 1 {
+		t.Fatalf("expected initial run, got %d calls", got)
+	}
+
+	// 30m later: due under the 10m file override despite the 1h global.
+	s.now = func() time.Time { return t0.Add(30 * time.Minute) }
+	s.RunAllGroups(context.Background(), singleGroupState(), metaFor(singleGroupState()))
+	if got := len(runner.getCalls()); got != 2 {
+		t.Fatalf("file override must make the group due at 30m, got %d calls", got)
+	}
+}
