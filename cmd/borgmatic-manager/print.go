@@ -479,11 +479,23 @@ func trendChart(times []time.Time, values []int64, height int) (string, string) 
 	}
 	labels := func(_ int, v float64) string { return strconv.FormatFloat(v, 'f', precision, 64) }
 
-	// X labels are dates only: histories span days, and clock times without
-	// a date turn ambiguous the moment a series crosses midnight.
+	// X axis: dates only (clock times turn ambiguous across midnight), on a
+	// window of at least 7 days ending at the last run. Short histories sit
+	// on the recent end of a week-wide axis instead of stretching two dates
+	// across the full width; tick count tracks the day count so every label
+	// is a distinct date.
+	end := times[len(times)-1]
+	start := times[0]
+	if minStart := end.Add(-7 * 24 * time.Hour); start.After(minStart) {
+		start = minStart
+	}
+	days := int(end.Sub(start).Hours()/24 + 0.5)
+	xSteps := min(10, max(4, days))
+
 	c := timeserieslinechart.New(trendChartWidth(), height,
+		timeserieslinechart.WithTimeRange(start, end),
 		timeserieslinechart.WithYRange(minY, maxY),
-		timeserieslinechart.WithXYSteps(8, 4),
+		timeserieslinechart.WithXYSteps(xSteps, 4),
 		timeserieslinechart.WithYLabelFormatter(labels))
 	for i, v := range drawn {
 		c.Push(timeserieslinechart.TimePoint{Time: times[i], Value: v})
