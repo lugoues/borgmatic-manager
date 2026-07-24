@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/models"
 )
@@ -209,6 +210,13 @@ func runDoctor(ctx context.Context) error {
 				r.warn("labels", "no backup groups discovered; check container labels (see: borgmatic-manager discover)")
 			}
 
+			// Snapshot granularity: hooks snapshot the unit containing each
+			// source dir, so a volumes dir on the root fs means whole-rootfs
+			// snapshots.
+			if snapshots {
+				r.checkSnapshotBoundaries(backupState)
+			}
+
 			// Generation and borgmatic's own schema validation, in a throwaway dir.
 			if borgmaticPath != "" {
 				r.checkGenerate(ctx, e, backupState, borgmaticPath)
@@ -226,6 +234,35 @@ func runDoctor(ctx context.Context) error {
 		fmt.Print("all checks passed\n\n")
 	}
 	return nil
+}
+
+// checkSnapshotBoundaries probes each discovered volumes directory: snapshot
+// hooks capture the subvolume/dataset containing it, which on most hosts is
+// the root filesystem unless the operator carved out a dedicated one.
+func (r *doctorReport) checkSnapshotBoundaries(backupState *models.BackupState) {
+	roots := map[string]bool{}
+	for _, group := range backupState.Groups {
+		for _, v := range group.Volumes {
+			if v.HostPath != "" {
+				roots[config.VolumesRoot(v.HostPath)] = true
+			}
+		}
+	}
+	if len(roots) == 0 {
+		r.pass("snapshots", "hooks configured; no volumes discovered to check")
+		return
+	}
+	for root := range roots {
+		ownBoundary, err := config.IsOwnFilesystemBoundary(root)
+		switch {
+		case err != nil:
+			r.warn("snapshots", fmt.Sprintf("could not probe %s: %v", root, err))
+		case ownBoundary:
+			r.pass("snapshots", root+" is its own subvolume/dataset")
+		default:
+			r.warn("snapshots", root+" is not its own subvolume/dataset: snapshot hooks will snapshot the enclosing filesystem (often the root fs)")
+		}
+	}
 }
 
 // checkGenerate compiles configs into a throwaway private dir and runs

@@ -67,6 +67,9 @@ type Generator struct {
 
 	// lookPath is an exec.LookPath seam for testing host-dependency warnings.
 	lookPath func(string) (string, error)
+	// boundaryProbe is an IsOwnFilesystemBoundary seam for testing the
+	// snapshot-granularity warning without a real btrfs/zfs host.
+	boundaryProbe func(string) (bool, error)
 }
 
 // NewGenerator creates a Generator. Generated files are written atomically to
@@ -79,6 +82,7 @@ func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]GroupOverride, o
 		opts:           opts,
 		logger:         logger,
 		lookPath:       exec.LookPath,
+		boundaryProbe:  IsOwnFilesystemBoundary,
 	}
 }
 
@@ -194,6 +198,10 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 	// Pass 1: build every group's final config in memory.
 	entries := make([]*pending, 0, len(groupNames))
 
+	// probedRoots dedupes the snapshot-granularity warning: one line per
+	// volumes directory per cycle, not one per group per volume.
+	probedRoots := map[string]bool{}
+
 	for _, groupName := range groupNames {
 		group := state.Groups[groupName]
 
@@ -238,13 +246,18 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 		hasGroupToken := strings.Contains(format, groupTokenPlaceholder)
 		final["archive_name_format"] = strings.ReplaceAll(format, groupTokenPlaceholder, groupName)
 
+		snapshotHooks := hasSnapshotHooks(final)
+		if snapshotHooks {
+			g.warnUnscopedSnapshotRoots(groupName, group, probedRoots)
+		}
+
 		entries = append(entries, &pending{
 			name:       groupName,
 			final:      final,
 			groupToken: hasGroupToken,
 			meta: GroupRunMeta{
 				Repos:         extractRepoKeys(final),
-				SnapshotHooks: hasSnapshotHooks(final),
+				SnapshotHooks: snapshotHooks,
 				RunID:         runID,
 			},
 		})
@@ -641,6 +654,28 @@ func canonicalRepoKey(path string) string {
 		return resolved
 	}
 	return cleaned
+}
+
+// warnUnscopedSnapshotRoots warns when a snapshot-hook group's volumes live in
+// a directory that is not its own subvolume/dataset: borgmatic snapshots the
+// unit containing each source dir, so on such hosts that is the enclosing
+// filesystem, often the root fs. Probe failures stay quiet: the warning is a
+// hint, and a missing path already fails loudly elsewhere.
+func (g *Generator) warnUnscopedSnapshotRoots(groupName string, group *models.VolumeGroup, probedRoots map[string]bool) {
+	for _, v := range group.Volumes {
+		if v.HostPath == "" {
+			continue
+		}
+		root := VolumesRoot(v.HostPath)
+		if probedRoots[root] {
+			continue
+		}
+		probedRoots[root] = true
+		if ownBoundary, err := g.boundaryProbe(root); err == nil && !ownBoundary {
+			g.logger.Warn("snapshot hooks are enabled but the volumes directory is not its own subvolume/dataset: borgmatic will snapshot the enclosing filesystem (often the root fs); see the README's snapshot section",
+				"dir", root, "group", groupName)
+		}
+	}
 }
 
 // hasSnapshotHooks reports whether the config enables any filesystem snapshot

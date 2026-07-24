@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"os"
@@ -668,4 +669,54 @@ func TestGeneratePrefixGroupNamesWarnOnSharedRepo(t *testing.T) {
 
 	assert.Len(t, meta, 2, "prefix collisions warn, they do not refuse")
 	assert.Contains(t, buf.String(), "retention can cross group boundaries")
+}
+
+func TestSnapshotBoundaryWarning(t *testing.T) {
+	twoVolumeState := func() *models.BackupState {
+		s := models.NewBackupState()
+		s.AddVolume("app", models.VolumeInfo{Name: "web_data", HostPath: "/var/lib/docker/volumes/web_data/_data"})
+		s.AddVolume("app", models.VolumeInfo{Name: "db_data", HostPath: "/var/lib/docker/volumes/db_data/_data"})
+		return s
+	}
+	newGen := func(t *testing.T, borgmatic map[string]interface{}, probe func(string) (bool, error), buf *bytes.Buffer) *config.Generator {
+		t.Helper()
+		cfg := &config.ManagerConfig{Borgmatic: borgmatic}
+		g := config.NewGenerator(cfg, nil, t.TempDir(), config.GeneratorOptions{}, slog.New(slog.NewTextHandler(buf, nil)))
+		g.SetLookPath(func(string) (string, error) { return "/usr/bin/true", nil })
+		g.SetBoundaryProbe(probe)
+		return g
+	}
+
+	t.Run("warns once per volumes dir when it is not a boundary", func(t *testing.T) {
+		var buf bytes.Buffer
+		probeCalls := 0
+		g := newGen(t, map[string]interface{}{"btrfs": nil}, func(path string) (bool, error) {
+			probeCalls++
+			assert.Equal(t, "/var/lib/docker/volumes", path)
+			return false, nil
+		}, &buf)
+		_, err := g.Generate(twoVolumeState())
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, probeCalls, "one probe per distinct volumes dir")
+		assert.Equal(t, 1, strings.Count(buf.String(), "not its own subvolume/dataset"), "one warning, not one per volume")
+	})
+
+	t.Run("silent when the volumes dir is its own boundary", func(t *testing.T) {
+		var buf bytes.Buffer
+		g := newGen(t, map[string]interface{}{"btrfs": nil}, func(string) (bool, error) { return true, nil }, &buf)
+		_, err := g.Generate(twoVolumeState())
+		require.NoError(t, err)
+		assert.NotContains(t, buf.String(), "not its own subvolume/dataset")
+	})
+
+	t.Run("no probe at all without snapshot hooks", func(t *testing.T) {
+		var buf bytes.Buffer
+		g := newGen(t, map[string]interface{}{"keep_daily": 7}, func(string) (bool, error) {
+			t.Fatal("boundary probe must not run without snapshot hooks")
+			return false, nil
+		}, &buf)
+		_, err := g.Generate(twoVolumeState())
+		require.NoError(t, err)
+	})
 }
