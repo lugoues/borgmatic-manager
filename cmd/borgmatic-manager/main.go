@@ -43,7 +43,7 @@ func main() {
 borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
 	}
 
-	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), inspectCmd(), logsCmd(), borgmaticCmd(), versionCmd())
+	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), inspectCmd(), logsCmd(), doctorCmd(), borgmaticCmd(), versionCmd())
 
 	if err := fang.Execute(context.Background(), root, fang.WithVersion(version)); err != nil {
 		os.Exit(1)
