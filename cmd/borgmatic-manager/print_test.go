@@ -171,7 +171,7 @@ func TestTrendSeriesCarriesTotalAcrossRunsWithNoArchive(t *testing.T) {
 		{Result: state.ResultOK, OriginalBytes: 400, DeduplicatedBytes: 40},
 	}
 
-	totals, deltas := trendSeries(history)
+	_, totals, deltas := trendSeries(history)
 
 	assert.Equal(t, []int64{100, 100, 400}, totals, "the failed run holds the dataset size, it does not zero it")
 	assert.Equal(t, []int64{10, 0, 40}, deltas, "but it contributed no new data")
@@ -183,7 +183,7 @@ func TestTrendSeriesSkipsRunsBeforeTheFirstArchive(t *testing.T) {
 		{Result: state.ResultOK, OriginalBytes: 100, DeduplicatedBytes: 10},
 	}
 
-	totals, deltas := trendSeries(history)
+	_, totals, deltas := trendSeries(history)
 
 	assert.Equal(t, []int64{100}, totals, "with no total yet there is nothing to carry forward")
 	assert.Equal(t, []int64{10}, deltas)

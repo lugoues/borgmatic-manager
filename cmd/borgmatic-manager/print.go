@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NimbleMarkets/ntcharts/v2/linechart/timeserieslinechart"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
 	"golang.org/x/term"
@@ -365,7 +366,7 @@ func kv(label, value string) {
 // trendSeries builds total and new-data series from run history. A run with no
 // archive carries the last total forward instead of drawing a cliff to zero;
 // entries before the first archive are dropped.
-func trendSeries(history []state.RunOutcome) (totals, deltas []int64) {
+func trendSeries(history []state.RunOutcome) (times []time.Time, totals, deltas []int64) {
 	var last int64
 	for _, h := range history {
 		if h.OriginalBytes > 0 {
@@ -374,34 +375,77 @@ func trendSeries(history []state.RunOutcome) (totals, deltas []int64) {
 		if last == 0 {
 			continue
 		}
+		times = append(times, h.Finished)
 		totals = append(totals, last)
 		deltas = append(deltas, h.DeduplicatedBytes)
 	}
-	return totals, deltas
+	return times, totals, deltas
 }
 
-var blockRunes = []rune("▁▂▃▄▅▆▇█")
+// Chart geometry: wide enough for hourly-resolution X labels, short enough
+// that inspect stays a glance, not a page.
+const (
+	chartWidth        = 64
+	chartTotalsHeight = 8
+	chartDeltasHeight = 6
+)
 
-// sparkline renders values as a single line of block characters, scaled
-// between the series min and max. Fewer than two values renders empty.
-func sparkline(values []int64) string {
-	if len(values) < 2 {
-		return ""
-	}
-	lo, hi := values[0], values[0]
-	for _, v := range values {
-		lo = min(lo, v)
-		hi = max(hi, v)
-	}
-	var b strings.Builder
-	for _, v := range values {
-		idx := 0
-		if span := hi - lo; span > 0 {
-			idx = int((v - lo) * int64(len(blockRunes)-1) / span)
+// byteScale picks a display unit for a series so chart Y labels stay readable
+// (raw byte counts render as 8-digit noise).
+func byteScale(maxVal int64) (div float64, unit string) {
+	const step = 1000
+	div, unit = 1, "B"
+	for _, u := range []string{"kB", "MB", "GB", "TB", "PB"} {
+		if maxVal < int64(div*step) {
+			return div, unit
 		}
-		b.WriteRune(blockRunes[idx])
+		div *= step
+		unit = u
 	}
-	return b.String()
+	return div, unit
+}
+
+// trendChart plots a byte series over real run times as a braille line chart.
+// The Y range zooms to the data (with headroom) instead of anchoring at zero,
+// so a 2.1 to 2.6 GB drift reads as a shape, not a flat line; negative values
+// are supported unchanged. Fewer than two points renders empty, matching the
+// old sparkline contract.
+func trendChart(times []time.Time, values []int64, height int) (string, string) {
+	if len(values) < 2 {
+		return "", ""
+	}
+	div, unit := byteScale(slices.Max(values))
+	lo := float64(slices.Min(values)) / div
+	hi := float64(slices.Max(values)) / div
+	pad := (hi - lo) * 0.1
+	if pad == 0 {
+		pad = 1
+	}
+	minY, maxY := lo-pad, hi+pad
+	if lo >= 0 && minY < 0 {
+		minY = 0
+	}
+
+	c := timeserieslinechart.New(chartWidth, height)
+	c.SetYRange(minY, maxY)
+	c.SetViewYRange(minY, maxY)
+	for i, v := range values {
+		c.Push(timeserieslinechart.TimePoint{Time: times[i], Value: float64(v) / div})
+	}
+	c.DrawBraille()
+	return c.View(), unit
+}
+
+// indentBlock prefixes every non-empty line of a multi-line chart with the
+// inspect view's edge padding.
+func indentBlock(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = edgePad + "  " + line
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // printInspect renders a detailed view of one group. configYAML is the compiled
@@ -462,24 +506,19 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 
 	// Two axes: "total" is each archive's full logical size, "new" is the data
 	// added after deduplication. Same runs in both, so the shapes are comparable.
-	totals, deltas := trendSeries(rec.History)
-	if spark := sparkline(totals); spark != "" {
+	times, totals, deltas := trendSeries(rec.History)
+	if chart, unit := trendChart(times, totals, chartTotalsHeight); chart != "" {
 		section("Size trend")
-		fmt.Printf(edgePad+"  %s  %s   %s → %s  (%d runs)\n",
-			styleDetail.Render(fmt.Sprintf("%-5s", "total")),
-			styleName.Render(spark),
-			styleDetail.Render(humanBytes(totals[0])),
-			styleDetail.Render(humanBytes(totals[len(totals)-1])),
-			len(totals))
+		fmt.Printf(edgePad+"  %s\n", styleDetail.Render(fmt.Sprintf("total (%s)   %s → %s  (%d runs)",
+			unit, humanBytes(totals[0]), humanBytes(totals[len(totals)-1]), len(totals))))
+		fmt.Println(indentBlock(chart))
 
-		// Skip the churn line when no run reported deduplicated stats: a
-		// flat row of zeroes would read as "no new data" rather than "no data".
-		if spark := sparkline(deltas); spark != "" && slices.Max(deltas) > 0 {
-			fmt.Printf(edgePad+"  %s  %s   %s latest · %s peak\n",
-				styleDetail.Render(fmt.Sprintf("%-5s", "new")),
-				styleName.Render(spark),
-				styleDetail.Render(humanBytes(deltas[len(deltas)-1])),
-				styleDetail.Render(humanBytes(slices.Max(deltas))))
+		// Skip the churn chart when no run reported deduplicated stats: a
+		// flat zero line would read as "no new data" rather than "no data".
+		if chart, unit := trendChart(times, deltas, chartDeltasHeight); chart != "" && slices.Max(deltas) > 0 {
+			fmt.Printf(edgePad+"  %s\n", styleDetail.Render(fmt.Sprintf("new (%s)   %s latest · %s peak",
+				unit, humanBytes(deltas[len(deltas)-1]), humanBytes(slices.Max(deltas)))))
+			fmt.Println(indentBlock(chart))
 		}
 	}
 
