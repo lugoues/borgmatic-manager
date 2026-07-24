@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -805,4 +806,91 @@ func TestDiscoverIgnoresManagerHelperContainers(t *testing.T) {
 	state, err := discovery.Discover(context.Background(), rt, discardLogger())
 	require.NoError(t, err)
 	assert.Empty(t, state.Groups)
+}
+
+func TestDiscoverPeriodLabel(t *testing.T) {
+	stubProbes(t)
+	c := backupContainer("web", "myapp", mountFixture("app-data", "/data"))
+	c.Labels["borgmatic-manager.period"] = "15m"
+
+	rt := mockLists(
+		[]runtime.VolumeInfo{volumeFixture("app-data")},
+		[]runtime.ContainerInfo{c},
+	)
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+	require.Contains(t, state.Groups, "myapp")
+	assert.Equal(t, 15*time.Minute, state.Groups["myapp"].Period)
+}
+
+func TestDiscoverPeriodFromSpec(t *testing.T) {
+	stubProbes(t)
+	c := runtime.ContainerInfo{
+		ID:   "id-web",
+		Name: "web",
+		Labels: map[string]string{
+			"borgmatic-manager.spec": `{"group": "myapp", "enable": true, "period": "45m"}`,
+		},
+		Mounts: []runtime.VolumeMount{mountFixture("app-data", "/data")},
+	}
+
+	rt := mockLists(
+		[]runtime.VolumeInfo{volumeFixture("app-data")},
+		[]runtime.ContainerInfo{c},
+	)
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+	require.Contains(t, state.Groups, "myapp")
+	assert.Equal(t, 45*time.Minute, state.Groups["myapp"].Period)
+}
+
+func TestDiscoverPeriodInvalidFailsCycle(t *testing.T) {
+	stubProbes(t)
+	c := backupContainer("web", "myapp", mountFixture("app-data", "/data"))
+	c.Labels["borgmatic-manager.period"] = "whenever"
+
+	rt := mockLists(
+		[]runtime.VolumeInfo{volumeFixture("app-data")},
+		[]runtime.ContainerInfo{c},
+	)
+
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.ErrorContains(t, err, "invalid period")
+}
+
+func TestDiscoverPeriodConflictFailsCycle(t *testing.T) {
+	stubProbes(t)
+	a := backupContainer("app-a", "shared", mountFixture("vol-a", "/data"))
+	a.Labels["borgmatic-manager.period"] = "15m"
+	b := backupContainer("app-b", "shared", mountFixture("vol-b", "/data"))
+	b.Labels["borgmatic-manager.period"] = "1h"
+
+	rt := mockLists(
+		[]runtime.VolumeInfo{volumeFixture("vol-a"), volumeFixture("vol-b")},
+		[]runtime.ContainerInfo{a, b},
+	)
+
+	_, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.ErrorContains(t, err, "conflicting period overrides")
+	require.ErrorContains(t, err, "app-a")
+	require.ErrorContains(t, err, "app-b")
+}
+
+func TestDiscoverPeriodAgreementOK(t *testing.T) {
+	stubProbes(t)
+	a := backupContainer("app-a", "shared", mountFixture("vol-a", "/data"))
+	a.Labels["borgmatic-manager.period"] = "15m"
+	b := backupContainer("app-b", "shared", mountFixture("vol-b", "/data"))
+	b.Labels["borgmatic-manager.period"] = "15m"
+
+	rt := mockLists(
+		[]runtime.VolumeInfo{volumeFixture("vol-a"), volumeFixture("vol-b")},
+		[]runtime.ContainerInfo{a, b},
+	)
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+	assert.Equal(t, 15*time.Minute, state.Groups["shared"].Period)
 }

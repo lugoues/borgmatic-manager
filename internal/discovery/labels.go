@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -20,6 +21,7 @@ const (
 	labelEnableRenamed = "borgmatic-manager.backup"
 	labelGroup         = "borgmatic-manager.group"
 	labelVolumes       = "borgmatic-manager.volumes"
+	labelPeriod        = "borgmatic-manager.period"
 	dbPrefix           = "borgmatic-manager.db."
 	configPrefix       = "borgmatic-manager.config."
 )
@@ -58,6 +60,29 @@ func VolumesFilter(labels map[string]string) ([]string, bool) {
 // GetGroup returns the borgmatic-manager.group label value, or empty string if absent.
 func GetGroup(labels map[string]string) string {
 	return labels[labelGroup]
+}
+
+// ParsePeriodLabel parses the optional borgmatic-manager.period label, which
+// overrides manager.period for the container's group. Invalid values are
+// errors: silently falling back to the global period would hide a typo.
+func ParsePeriodLabel(labels map[string]string, containerName string) (time.Duration, error) {
+	raw, ok := labels[labelPeriod]
+	if !ok {
+		return 0, nil
+	}
+	return parsePeriodValue(raw, containerName)
+}
+
+// parsePeriodValue validates a period from a label or spec: a positive Go duration.
+func parsePeriodValue(raw, containerName string) (time.Duration, error) {
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("container %s: invalid period %q: %w", containerName, raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("container %s: invalid period %q: must be positive", containerName, raw)
+	}
+	return d, nil
 }
 
 // HasManagerLabels reports whether any borgmatic-manager.* label is present;

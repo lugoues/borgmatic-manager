@@ -63,6 +63,11 @@ type Scheduler struct {
 	// wakes in lockRetryInterval rather than a full period.
 	lockedRetry map[string]time.Time
 
+	// groupPeriods caches each live group's effective period from the last
+	// cycle, so NextWake honors per-group overrides. Falls back to the global
+	// period for groups not yet discovered this process lifetime.
+	groupPeriods map[string]time.Duration
+
 	// now is overridable for testing.
 	now func() time.Time
 
@@ -81,15 +86,16 @@ func NewScheduler(
 	store *state.ScheduleStore,
 ) *Scheduler {
 	s := &Scheduler{
-		runner:      runner,
-		rt:          rt,
-		logger:      logger,
-		cfg:         cfg,
-		generator:   generator,
-		store:       store,
-		lastAttempt: map[string]time.Time{},
-		lockedRetry: map[string]time.Time{},
-		now:         time.Now,
+		runner:       runner,
+		rt:           rt,
+		logger:       logger,
+		cfg:          cfg,
+		generator:    generator,
+		store:        store,
+		lastAttempt:  map[string]time.Time{},
+		groupPeriods: map[string]time.Duration{},
+		lockedRetry:  map[string]time.Time{},
+		now:          time.Now,
 	}
 
 	// An unparseable period surfaces from Start; until then 0 means always due.
@@ -150,13 +156,21 @@ func Due(rec state.GroupRecord, haveRec bool, fingerprint string, period time.Du
 	return Dueness{Due: !now.Before(next), Next: next}
 }
 
-func (s *Scheduler) groupDue(name, fingerprint string, now time.Time) (bool, time.Time) {
+func (s *Scheduler) groupDue(name, fingerprint string, period time.Duration, now time.Time) (bool, time.Time) {
 	if s.store == nil {
 		return true, now
 	}
 	rec, ok := s.store.Record(name)
-	d := Due(rec, ok, fingerprint, s.period, now)
+	d := Due(rec, ok, fingerprint, period, now)
 	return d.Due, d.Next
+}
+
+// EffectivePeriod returns the group's period override, or the global fallback.
+func EffectivePeriod(group *models.VolumeGroup, global time.Duration) time.Duration {
+	if group != nil && group.Period > 0 {
+		return group.Period
+	}
+	return global
 }
 
 // RunAllGroups runs every due group in parallel goroutines; per-group errors
@@ -171,6 +185,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 
 	now := s.now()
 	live := make(map[string]struct{}, len(names))
+	groupPeriods := make(map[string]time.Duration, len(names))
 	waiting := 0
 
 	var wg sync.WaitGroup
@@ -191,8 +206,10 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 		}
 		live[name] = struct{}{}
 
+		groupPeriods[name] = EffectivePeriod(group, s.period)
+
 		fingerprint := GroupFingerprint(group)
-		if due, next := s.groupDue(name, fingerprint, now); !due {
+		if due, next := s.groupDue(name, fingerprint, groupPeriods[name], now); !due {
 			// Succeeded within the period (maybe via the other process): clear any pending lock-retry.
 			s.logger.Debug("group not due", "group", name, "next_run", next.Format(time.RFC3339))
 			s.mu.Lock()
@@ -268,6 +285,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 				delete(s.lockedRetry, name)
 			}
 		}
+		s.groupPeriods = groupPeriods
 		s.mu.Unlock()
 
 		if waiting > 0 {
@@ -335,13 +353,21 @@ func (s *Scheduler) NextWake() time.Duration {
 			wake = d
 		}
 	}
+	periods := make(map[string]time.Duration, len(s.groupPeriods))
+	for name, p := range s.groupPeriods {
+		periods[name] = p
+	}
 	s.mu.Unlock()
 
-	for _, rec := range records {
+	for name, rec := range records {
 		if rec.MissingCycles > 0 {
 			continue // absent groups don't drive the wake timer
 		}
-		if d := rec.LastSuccess.Add(s.period).Sub(now); d < wake {
+		period := s.period
+		if p, ok := periods[name]; ok {
+			period = p
+		}
+		if d := rec.LastSuccess.Add(period).Sub(now); d < wake {
 			wake = d
 		}
 	}

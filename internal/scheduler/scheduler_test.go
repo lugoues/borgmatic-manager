@@ -524,3 +524,59 @@ func TestRunAllGroups_SkipsGroupsAbsentFromMeta(t *testing.T) {
 		t.Fatalf("groups without generated configs must not run, got %v", calls)
 	}
 }
+
+func TestDueGating_PerGroupPeriodOverride(t *testing.T) {
+	runner := newMockGroupRunner()
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+
+	// Group overrides the 1h global with 10m.
+	overrideState := func() *models.BackupState {
+		bs := models.NewBackupState()
+		bs.AddVolume("app", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
+		bs.SetPeriod("app", 10*time.Minute)
+		return bs
+	}
+
+	s := dueTestScheduler(runner, store, t0)
+	s.RunAllGroups(context.Background(), overrideState(), metaFor(overrideState()))
+	if got := len(runner.getCalls()); got != 1 {
+		t.Fatalf("expected initial run, got %d calls", got)
+	}
+
+	// 30m later: not due under the 1h global, due under the 10m override.
+	s.now = func() time.Time { return t0.Add(30 * time.Minute) }
+	s.RunAllGroups(context.Background(), overrideState(), metaFor(overrideState()))
+	if got := len(runner.getCalls()); got != 2 {
+		t.Fatalf("override period must make the group due at 30m, got %d calls", got)
+	}
+
+	// 5m after that success: not due under the override either.
+	s.now = func() time.Time { return t0.Add(35 * time.Minute) }
+	s.RunAllGroups(context.Background(), overrideState(), metaFor(overrideState()))
+	if got := len(runner.getCalls()); got != 2 {
+		t.Fatalf("group must not re-run inside its override period, got %d calls", got)
+	}
+}
+
+func TestNextWake_PerGroupPeriodOverride(t *testing.T) {
+	runner := newMockGroupRunner()
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+
+	overrideState := func() *models.BackupState {
+		bs := models.NewBackupState()
+		bs.AddVolume("app", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
+		bs.SetPeriod("app", 10*time.Minute)
+		return bs
+	}
+
+	s := dueTestScheduler(runner, store, t0)
+	s.RunAllGroups(context.Background(), overrideState(), metaFor(overrideState()))
+
+	// 4m after success: wake in the 6m override remainder, not the 56m global one.
+	s.now = func() time.Time { return t0.Add(4 * time.Minute) }
+	if got := s.NextWake(); got != 6*time.Minute {
+		t.Fatalf("expected 6m wake from the 10m override, got %v", got)
+	}
+}

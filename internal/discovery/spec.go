@@ -22,6 +22,8 @@ type ContainerSpec struct {
 	Enable bool `json:"enable"`
 	// Volumes filters backed-up volumes; absent or empty both mean all named volumes.
 	Volumes []string `json:"volumes"`
+	// Period overrides manager.period for the group (positive Go duration); empty means global.
+	Period string `json:"period"`
 	// Databases mirrors the db.{n}.* labels; the JSON field is "db".
 	Databases []SpecDatabase `json:"db"`
 	// Config is a borgmatic config fragment for the group, mirroring config.* labels.
@@ -58,7 +60,7 @@ func ParseSpecLabel(labels map[string]string, containerName string) (*ContainerS
 		err = fmt.Errorf("trailing data after the JSON document")
 	}
 	if err != nil {
-		hint := `the value must be valid JSON, e.g. {"group": "x", "enable": true}; fields: group, enable, volumes, db, config`
+		hint := `the value must be valid JSON, e.g. {"group": "x", "enable": true}; fields: group, enable, volumes, period, db, config`
 		if strings.HasPrefix(strings.TrimSpace(raw), "{") && !strings.Contains(raw, `"`) {
 			// Quadlet: systemd strips unquoted double quotes from Label= values.
 			hint = `the label value contains no double quotes, systemd/quadlet strips them from unquoted Label= lines; wrap the whole assignment in single quotes: Label='borgmatic-manager.spec={"group": "x", "enable": true}'`

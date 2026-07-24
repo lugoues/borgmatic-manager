@@ -1,5 +1,7 @@
 package models
 
+import "time"
+
 // Helper-container labels: the generator stamps them on dump helpers, the
 // runner reaps orphans by run ID, discovery skips anything carrying them.
 const (
@@ -48,12 +50,19 @@ func (bs *BackupState) AddLabelConfig(group string, cfg map[string]interface{}) 
 	g.LabelConfigs = append(g.LabelConfigs, cfg)
 }
 
+// SetPeriod records a group's period override, creating the group if needed.
+func (bs *BackupState) SetPeriod(group string, period time.Duration) {
+	bs.getOrCreateGroup(group).Period = period
+}
+
 // VolumeGroup aggregates one backup group's volumes and databases.
 type VolumeGroup struct {
 	Volumes   []VolumeInfo
 	Databases []DatabaseConfig
 	// LabelConfigs are config.* fragments in container-name order; merged over groups/*.yaml.
 	LabelConfigs []map[string]interface{}
+	// Period overrides manager.period for this group; 0 means use the global period.
+	Period time.Duration
 }
 
 // VolumeInfo describes a container volume to be backed up.

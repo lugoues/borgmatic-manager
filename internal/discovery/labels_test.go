@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -326,6 +327,38 @@ func TestParseDatabaseLabels(t *testing.T) {
 			got, err := discovery.ParseDatabaseLabels(tt.labels, discardLogger())
 			if tt.wantErr {
 				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestParsePeriodLabel(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		absent  bool
+		want    time.Duration
+		wantErr string
+	}{
+		{name: "absent", absent: true, want: 0},
+		{name: "valid", value: "30m", want: 30 * time.Minute},
+		{name: "valid with spaces", value: " 2h ", want: 2 * time.Hour},
+		{name: "garbage", value: "often", wantErr: "invalid period"},
+		{name: "zero", value: "0s", wantErr: "must be positive"},
+		{name: "negative", value: "-5m", wantErr: "must be positive"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			labels := map[string]string{}
+			if !tt.absent {
+				labels["borgmatic-manager.period"] = tt.value
+			}
+			got, err := discovery.ParsePeriodLabel(labels, "web")
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
 				return
 			}
 			require.NoError(t, err)

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/lugoues/borgmatic-manager/internal/runtime"
@@ -55,6 +56,9 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 	// Dedupe per group: two containers sharing a volume must not back it up twice.
 	seenVolumes := make(map[string]map[string]bool)
 
+	// periodSetBy tracks which container set each group's period, for conflict errors.
+	periodSetBy := make(map[string]string)
+
 	var specErrs []error
 	for _, c := range containers {
 		intent, ok, err := containerIntentFor(c, logger)
@@ -84,7 +88,20 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			state.AddLabelConfig(intent.group, intent.config)
 		}
 
-		if !intent.enabled && len(dbs) == 0 && intent.config == nil {
+		if intent.period != 0 {
+			// Conflicting overrides fail the cycle: picking one silently would
+			// run the group on a period somebody didn't ask for.
+			if existing := state.Groups[intent.group]; existing != nil && existing.Period != 0 && existing.Period != intent.period {
+				specErrs = append(specErrs, fmt.Errorf(
+					"group %s: conflicting period overrides: %s from container %s vs %s from container %s",
+					intent.group, existing.Period, periodSetBy[intent.group], intent.period, c.Name))
+				continue
+			}
+			state.SetPeriod(intent.group, intent.period)
+			periodSetBy[intent.group] = c.Name
+		}
+
+		if !intent.enabled && len(dbs) == 0 && intent.config == nil && intent.period == 0 {
 			logger.Warn("container has a group but no enable=true, databases, or config; it contributes nothing",
 				"container", c.Name, "group", intent.group)
 		}
@@ -118,6 +135,8 @@ type containerIntent struct {
 	hasVolumesFilter bool
 	databases        []models.DatabaseConfig
 	config           map[string]interface{}
+	// period overrides manager.period for the group; 0 means no override.
+	period time.Duration
 }
 
 // containerIntentFor builds the container's intent; a spec label shadows all flat
@@ -146,6 +165,13 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 			enabled:   spec.Enable,
 			databases: dbs,
 			config:    spec.Config,
+		}
+		if spec.Period != "" {
+			period, err := parsePeriodValue(spec.Period, c.Name)
+			if err != nil {
+				return containerIntent{}, false, err
+			}
+			intent.period = period
 		}
 		if len(spec.Volumes) > 0 {
 			intent.volumesFilter = spec.Volumes
@@ -178,11 +204,16 @@ func containerIntentFor(c runtime.ContainerInfo, logger *slog.Logger) (container
 	if err != nil {
 		return containerIntent{}, false, fmt.Errorf("container %s: %w", c.Name, err)
 	}
+	period, err := ParsePeriodLabel(c.Labels, c.Name)
+	if err != nil {
+		return containerIntent{}, false, err
+	}
 	intent := containerIntent{
 		group:     group,
 		enabled:   IsEnabled(c.Labels),
 		databases: dbs,
 		config:    ParseConfigLabels(c.Labels, logger),
+		period:    period,
 	}
 	intent.volumesFilter, intent.hasVolumesFilter = VolumesFilter(c.Labels)
 	return intent, true, nil

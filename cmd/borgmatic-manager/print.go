@@ -261,7 +261,7 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 			rows = append(rows, r)
 			continue // a refused group never runs; keep it out of soonest
 		}
-		due := scheduler.Due(rec, ok, scheduler.GroupFingerprint(group), period, now)
+		due := scheduler.Due(rec, ok, scheduler.GroupFingerprint(group), scheduler.EffectivePeriod(group, period), now)
 		r.next = dueLabel(due, now)
 		if !due.Due {
 			wait = time.Until(due.Next)
@@ -424,7 +424,7 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	} else {
 		kv("last backup", styleDetail.Render("never"))
 	}
-	kv("next run", dueLabel(scheduler.Due(rec, haveRec, scheduler.GroupFingerprint(group), period, now), now))
+	kv("next run", dueLabel(scheduler.Due(rec, haveRec, scheduler.GroupFingerprint(group), scheduler.EffectivePeriod(group, period), now), now))
 
 	if rec.LastRun != nil {
 		o := rec.LastRun
