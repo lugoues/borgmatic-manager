@@ -270,9 +270,10 @@ func (s *ScheduleStore) MarkSuccess(name, fingerprint string, startedAt time.Tim
 	})
 }
 
-// maxHistory bounds the per-group run history kept for `inspect`. Big enough
-// for a readable trend, small enough that state stays tiny.
-const maxHistory = 30
+// maxHistory bounds the per-group run history kept for `inspect`. Sized for a
+// multi-week trend at hourly periods; entries are slim (log tails stripped),
+// so state stays small.
+const maxHistory = 90
 
 // RecordRun stores a run outcome without touching schedule fields: the full
 // outcome becomes LastRun, a log-stripped copy joins the bounded History.

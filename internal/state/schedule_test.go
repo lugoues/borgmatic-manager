@@ -135,7 +135,7 @@ func TestRecordRunBuildsBoundedHistory(t *testing.T) {
 	s := state.LoadSchedule(dir, discardLogger())
 
 	// Record more runs than the history cap; each carries a log tail.
-	for i := range 40 {
+	for i := range 100 {
 		s.RecordRun("files", state.RunOutcome{
 			Result:        state.ResultOK,
 			OriginalBytes: int64(i),
@@ -146,13 +146,13 @@ func TestRecordRunBuildsBoundedHistory(t *testing.T) {
 	rec, ok := state.LoadSchedule(dir, discardLogger()).Record("files")
 	require.True(t, ok)
 
-	assert.LessOrEqual(t, len(rec.History), 30, "history must be bounded")
-	assert.Equal(t, int64(39), rec.History[len(rec.History)-1].OriginalBytes, "newest run is last")
-	assert.Equal(t, int64(10), rec.History[0].OriginalBytes, "oldest kept run is run 10 (40 recorded, cap 30)")
+	assert.LessOrEqual(t, len(rec.History), 90, "history must be bounded")
+	assert.Equal(t, int64(99), rec.History[len(rec.History)-1].OriginalBytes, "newest run is last")
+	assert.Equal(t, int64(10), rec.History[0].OriginalBytes, "oldest kept run is run 10 (100 recorded, cap 90)")
 
 	// Only the last run keeps its log tail; history entries are stripped.
 	require.NotNil(t, rec.LastRun)
-	assert.Equal(t, []string{"run 39 line"}, rec.LastRun.LogTail)
+	assert.Equal(t, []string{"run 99 line"}, rec.LastRun.LogTail)
 	for _, h := range rec.History {
 		assert.Nil(t, h.LogTail, "history entries must not carry log tails")
 	}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -382,13 +383,40 @@ func trendSeries(history []state.RunOutcome) (times []time.Time, totals, deltas 
 	return times, totals, deltas
 }
 
-// Chart geometry: wide enough for hourly-resolution X labels, short enough
-// that inspect stays a glance, not a page.
+// Chart geometry: wide enough for daily-resolution X labels across months,
+// short enough that inspect stays a glance, not a page.
 const (
-	chartWidth        = 64
-	chartTotalsHeight = 8
-	chartDeltasHeight = 6
+	chartPreferredWidth = 128
+	chartMinWidth       = 48
+	chartTotalsHeight   = 8
+	chartDeltasHeight   = 6
 )
+
+// trendChartWidth clamps the preferred chart width to the terminal so a
+// narrow window gets a narrower chart instead of wrapped braille soup.
+func trendChartWidth() int {
+	if width, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && width > 0 {
+		if usable := width - 2*hPad - 2; usable < chartPreferredWidth {
+			return max(usable, chartMinWidth)
+		}
+	}
+	return chartPreferredWidth
+}
+
+// smoothSeries applies a centered three-point moving average, keeping the raw
+// endpoints. Short series are returned as-is: with few points every one matters.
+func smoothSeries(values []float64) []float64 {
+	if len(values) < 8 {
+		return values
+	}
+	out := make([]float64, len(values))
+	out[0] = values[0]
+	out[len(values)-1] = values[len(values)-1]
+	for i := 1; i < len(values)-1; i++ {
+		out[i] = (values[i-1] + values[i] + values[i+1]) / 3
+	}
+	return out
+}
 
 // byteScale picks a display unit for a series so chart Y labels stay readable
 // (raw byte counts render as 8-digit noise).
@@ -406,31 +434,62 @@ func byteScale(maxVal int64) (div float64, unit string) {
 }
 
 // trendChart plots a byte series over real run times as a braille line chart.
-// The Y range zooms to the data (with headroom) instead of anchoring at zero,
-// so a 2.1 to 2.6 GB drift reads as a shape, not a flat line; negative values
-// are supported unchanged. Fewer than two points renders empty, matching the
-// old sparkline contract.
+// The Y range zooms to the data with headroom, but never tighter than 2% of
+// the series maximum: a steady-state dataset wobbling by 0.05% should read as
+// a flat line, not a mountain range. Negative values are supported unchanged.
+// Fewer than two points renders empty, matching the old sparkline contract.
 func trendChart(times []time.Time, values []int64, height int) (string, string) {
 	if len(values) < 2 {
 		return "", ""
 	}
 	div, unit := byteScale(slices.Max(values))
-	lo := float64(slices.Min(values)) / div
-	hi := float64(slices.Max(values)) / div
-	pad := (hi - lo) * 0.1
+	scaled := make([]float64, len(values))
+	for i, v := range values {
+		scaled[i] = float64(v) / div
+	}
+	drawn := smoothSeries(scaled)
+
+	lo, hi := slices.Min(scaled), slices.Max(scaled)
+	span := hi - lo
+	if minSpan := hi * 0.02; span < minSpan {
+		mid := (hi + lo) / 2
+		lo, hi = mid-minSpan/2, mid+minSpan/2
+		span = minSpan
+	}
+	pad := span * 0.1
 	if pad == 0 {
 		pad = 1
 	}
 	minY, maxY := lo-pad, hi+pad
-	if lo >= 0 && minY < 0 {
+	if slices.Min(scaled) >= 0 && minY < 0 {
 		minY = 0
 	}
 
-	c := timeserieslinechart.New(chartWidth, height)
-	c.SetYRange(minY, maxY)
-	c.SetViewYRange(minY, maxY)
-	for i, v := range values {
-		c.Push(timeserieslinechart.TimePoint{Time: times[i], Value: float64(v) / div})
+	// Label precision follows the zoomed span: a 0.6 MB band needs decimals
+	// or every tick reads as the same rounded number.
+	precision := 0
+	switch {
+	case maxY-minY < 1:
+		precision = 2
+	case maxY-minY < 10:
+		precision = 1
+	}
+	labels := func(_ int, v float64) string { return strconv.FormatFloat(v, 'f', precision, 64) }
+
+	// Sub-3-day histories label the X axis with clock times; dates would
+	// repeat the same day across the whole axis.
+	xLabels := timeserieslinechart.DateTimeLabelFormatter()
+	if times[len(times)-1].Sub(times[0]) < 72*time.Hour {
+		xLabels = timeserieslinechart.HourTimeLabelFormatter()
+	}
+
+	c := timeserieslinechart.New(trendChartWidth(), height,
+		timeserieslinechart.WithYRange(minY, maxY),
+		timeserieslinechart.WithXYSteps(8, 4),
+		timeserieslinechart.WithXLabelFormatter(xLabels),
+		timeserieslinechart.WithYLabelFormatter(labels))
+	for i, v := range drawn {
+		c.Push(timeserieslinechart.TimePoint{Time: times[i], Value: v})
 	}
 	c.DrawBraille()
 	return c.View(), unit
