@@ -53,7 +53,9 @@ func colorLevel(level string) string {
 }
 
 // printGroups renders the discovered backup groups with their last-backup ages.
-func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
+// Members whose container is gone are tagged offline; a group with no live
+// container at all is tagged too, though its volumes are still backed up.
+func printGroups(bs *models.BackupState, store *state.ScheduleStore, off *state.Offline) {
 	// Trailing blank line keeps the block off the shell prompt.
 	defer fmt.Println()
 	now := time.Now()
@@ -89,29 +91,66 @@ func printGroups(bs *models.BackupState, store *state.ScheduleStore) {
 		if rec, ok := store.Record(name); ok && !rec.LastSuccess.IsZero() {
 			lastBackup = "last backup " + humanTime(rec.LastSuccess, now)
 		}
-		fmt.Println(spreadLine(styleGroup.Render(name), styleDetail.Render(lastBackup)))
+		heading := styleGroup.Render(name)
+		if off != nil && off.GroupOffline(name, group) {
+			heading += styleWarn.Render(" (offline)")
+		}
+		fmt.Println(spreadLine(heading, styleDetail.Render(lastBackup)))
 
-		printMemberRows(group, nameWidth)
+		printMemberRows(name, group, nameWidth, off)
 	}
 }
 
 // printMemberRows renders a group's volume and database rows. Shared by discover
-// and inspect so the two cannot disagree about what a group contains.
-func printMemberRows(group *models.VolumeGroup, nameWidth int) {
+// and inspect so the two cannot disagree about what a group contains. A member
+// whose container is gone is tagged "(offline)" in the kind column up front,
+// where it is hard to miss.
+func printMemberRows(groupName string, group *models.VolumeGroup, nameWidth int, off *state.Offline) {
+	// The kind column widens to fit the longest "<kind> (offline)" so the
+	// name column stays aligned whether or not any member is offline.
+	kindWidth := 0
+	measure := func(kind string, offline bool) {
+		w := len(kind)
+		if offline {
+			w += len(" (offline)")
+		}
+		kindWidth = max(kindWidth, w)
+	}
 	for _, v := range group.Volumes {
-		fmt.Printf(edgePad+"  %s  %s  %s\n",
-			styleKind.Render(fmt.Sprintf("%-8s", "volume")),
-			styleName.Render(fmt.Sprintf("%-*s", nameWidth, v.Name)),
-			styleDetail.Render(v.HostPath),
-		)
+		measure("volume", off != nil && off.VolumeOffline(groupName, v.Name))
 	}
 	for _, db := range group.Databases {
+		measure("database", off != nil && off.DatabaseOffline(groupName, db))
+	}
+
+	row := func(kind, name, detail string, offline bool) {
 		fmt.Printf(edgePad+"  %s  %s  %s\n",
-			styleKind.Render(fmt.Sprintf("%-8s", "database")),
-			styleName.Render(fmt.Sprintf("%-*s", nameWidth, db.Type+"/"+db.Name)),
-			styleDetail.Render(databaseDetail(db)),
+			kindCell(kind, offline, kindWidth),
+			styleName.Render(fmt.Sprintf("%-*s", nameWidth, name)),
+			styleDetail.Render(detail),
 		)
 	}
+	for _, v := range group.Volumes {
+		row("volume", v.Name, v.HostPath, off != nil && off.VolumeOffline(groupName, v.Name))
+	}
+	for _, db := range group.Databases {
+		row("database", db.Type+"/"+db.Name, databaseDetail(db), off != nil && off.DatabaseOffline(groupName, db))
+	}
+}
+
+// kindCell renders a padded "<kind>" or "<kind> (offline)" label, coloring the
+// offline suffix distinctly while keeping the visible width at kindWidth.
+func kindCell(kind string, offline bool, kindWidth int) string {
+	visible := len(kind)
+	cell := styleKind.Render(kind)
+	if offline {
+		cell += styleWarn.Render(" (offline)")
+		visible += len(" (offline)")
+	}
+	if pad := kindWidth - visible; pad > 0 {
+		cell += strings.Repeat(" ", pad)
+	}
+	return cell
 }
 
 // databaseDetail describes where a database's dump comes from.
@@ -184,7 +223,7 @@ func plural(n int, noun string) string {
 // printStatus renders per-group schedule state. Refused groups are marked as
 // such instead of showing "due now" forever; in-flight runs show "running" with
 // elapsed time, flagged when past runTimeout.
-func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string) {
+func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline) {
 	// Trailing blank line keeps the table off the shell prompt.
 	defer fmt.Println()
 	now := time.Now()
@@ -247,6 +286,17 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 				if o.DeduplicatedBytes > 0 {
 					r.size += fmt.Sprintf(" (+%s)", humanBytes(o.DeduplicatedBytes))
 				}
+			}
+		}
+		// Offline members are still backed up (data at rest), so the group keeps
+		// its normal schedule; tag the name so the operator sees a container is
+		// down. status does not list members, so it needs this cue.
+		if off != nil {
+			switch {
+			case off.GroupOffline(name, group):
+				r.name += " (offline)"
+			case off.AnyOffline(name):
+				r.name += " (partial)"
 			}
 		}
 		// In-flight runs override next-run and stay out of soonest (happening, not scheduled).
@@ -518,17 +568,21 @@ func indentBlock(s string) string {
 
 // printInspect renders a detailed view of one group. configYAML is the compiled
 // config, or configNote explains why it is unavailable.
-func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord, haveRec bool, configYAML, configNote string, period, filePeriod time.Duration) {
+func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord, haveRec bool, configYAML, configNote string, period, filePeriod time.Duration, off *state.Offline) {
 	defer fmt.Println()
 	now := time.Now()
 	fmt.Println()
 
 	memberCount := fmt.Sprintf("%s · %s",
 		plural(len(group.Volumes), "volume"), plural(len(group.Databases), "database"))
-	fmt.Println(spreadLine(styleTitle.Render("Inspect "+name), styleDetail.Render(memberCount)))
+	title := styleTitle.Render("Inspect " + name)
+	if off != nil && off.GroupOffline(name, group) {
+		title += styleWarn.Render(" (offline)")
+	}
+	fmt.Println(spreadLine(title, styleDetail.Render(memberCount)))
 
 	section("Members")
-	printMemberRows(group, memberNameWidth(group))
+	printMemberRows(name, group, memberNameWidth(group), off)
 
 	section("Schedule")
 	if haveRec && !rec.LastSuccess.IsZero() {

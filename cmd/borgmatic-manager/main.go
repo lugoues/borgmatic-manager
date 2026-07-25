@@ -131,7 +131,7 @@ func runStatus(ctx context.Context, jsonOut bool) error {
 	if err != nil {
 		return err
 	}
-	backupState, err := discovery.Discover(ctx, e.rt, logger)
+	backupState, offline, err := e.discoverMerged(ctx, logger)
 	if err != nil {
 		return err
 	}
@@ -156,9 +156,9 @@ func runStatus(ctx context.Context, jsonOut bool) error {
 	}
 
 	if jsonOut {
-		return printStatusJSON(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused)
+		return printStatusJSON(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
 	}
-	printStatus(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused)
+	printStatus(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
 	return nil
 }
 
@@ -180,7 +180,7 @@ func runInspect(ctx context.Context, group string) error {
 	if err != nil {
 		return err
 	}
-	backupState, err := discovery.Discover(ctx, e.rt, logger)
+	backupState, offline, err := e.discoverMerged(ctx, logger)
 	if err != nil {
 		return err
 	}
@@ -196,7 +196,7 @@ func runInspect(ctx context.Context, group string) error {
 	rec, haveRec := stateStore(e, logger).Record(group)
 	configYAML, configNote := renderGroupConfig(backupState, e, logger, group)
 
-	printInspect(group, g, rec, haveRec, configYAML, configNote, period, e.cfg.GroupPeriods[group])
+	printInspect(group, g, rec, haveRec, configYAML, configNote, period, e.cfg.GroupPeriods[group], offline)
 	return nil
 }
 
@@ -510,6 +510,7 @@ func runDaemon() error {
 	reapStalePendingRuns(ctx, store, locksDir, e.reapRunHelpers)
 	sweepOrphanedPendingLocks(locksDir, store)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
+	s.SetGroupCache(state.LoadGroupCache(e.stateDir, slog.Default()))
 	l := events.NewListener(e.rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())
 
@@ -691,22 +692,35 @@ func runDiscover() error {
 		return err
 	}
 
-	state, err := discovery.Discover(ctx, e.rt, logger)
+	backupState, offline, err := e.discoverMerged(ctx, logger)
 	if err != nil {
 		return err
 	}
 
-	if len(state.Groups) == 0 {
+	if len(backupState.Groups) == 0 {
 		return fmt.Errorf("no backup groups discovered, check your labels (warnings above, if any, explain near-misses)")
 	}
 
-	printGroups(state, stateStore(e, logger))
+	printGroups(backupState, stateStore(e, logger), offline)
 	return nil
 }
 
 // stateStore loads the persisted schedule for one-shot display commands.
 func stateStore(e *env, logger *slog.Logger) *state.ScheduleStore {
 	return state.LoadSchedule(e.stateDir, logger)
+}
+
+// discoverMerged runs live discovery and overlays the durable group cache so a
+// stopped or quadlet-removed container's group still appears. It refreshes the
+// cache with the live set as a side effect. Returns the merged state and the
+// set of offline (cached-only) group names.
+func (e *env) discoverMerged(ctx context.Context, logger *slog.Logger) (*models.BackupState, *state.Offline, error) {
+	live, err := discovery.Discover(ctx, e.rt, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	merged, offline := state.LoadGroupCache(e.stateDir, logger).Reconcile(live, time.Now())
+	return merged, offline, nil
 }
 
 func runGenerate(output string) error {
@@ -764,7 +778,10 @@ func runBorgmaticPassthrough(args []string) error {
 		return err
 	}
 
-	state, err := discovery.Discover(ctx, e.rt, logger)
+	// Merge the durable cache so restore/list still work after the container is
+	// stopped or (quadlets) removed: the group's config is regenerated from its
+	// last-known membership.
+	backupState, offline, err := e.discoverMerged(ctx, logger)
 	if err != nil {
 		return err
 	}
@@ -777,12 +794,19 @@ func runBorgmaticPassthrough(args []string) error {
 		return err
 	}
 
-	meta, err := e.newGenerator(configsDir, logger).Generate(state)
+	meta, err := e.newGenerator(configsDir, logger).Generate(backupState)
 	if err != nil {
 		return err
 	}
 	if _, ok := meta[group]; !ok {
-		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(state))
+		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(backupState))
+	}
+	if offline.GroupOffline(group, backupState.Groups[group]) {
+		lastSeen := ""
+		if ts, ok := state.LoadGroupCache(e.stateDir, logger).LastSeen(group); ok && !ts.IsZero() {
+			lastSeen = " (last seen " + ts.Local().Format("2006-01-02 15:04") + ")"
+		}
+		logger.Warn("group is offline: its container is not running, using the last cached config"+lastSeen+"; membership may be stale", "group", group)
 	}
 
 	borgmaticPath, err := resolveBorgmatic(e.cfg)

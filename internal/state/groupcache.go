@@ -52,6 +52,11 @@ func (o *Offline) DatabaseOffline(group string, db models.DatabaseConfig) bool {
 	return o.Databases[group][dbKey(db)]
 }
 
+// AnyOffline reports whether a group has at least one offline member.
+func (o *Offline) AnyOffline(group string) bool {
+	return len(o.Volumes[group]) > 0 || len(o.Databases[group]) > 0
+}
+
 // GroupOffline reports whether a group has no live container at all (every
 // member is cached-only). Such a group is still backed up while its volume
 // paths exist; the flag is informational.

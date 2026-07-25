@@ -27,6 +27,12 @@ type statusGroupJSON struct {
 	LastRun *state.RunOutcome `json:"last_run,omitempty"`
 	Running *statusRunning    `json:"running,omitempty"`
 	Refused string            `json:"refused,omitempty"`
+	// Offline is true when the group has no live container; it is still backed
+	// up (its volumes are data at rest) and keeps its normal schedule.
+	Offline bool `json:"offline,omitempty"`
+	// OfflineVolumes/OfflineDatabases name the members whose container is gone.
+	OfflineVolumes   []string `json:"offline_volumes,omitempty"`
+	OfflineDatabases []string `json:"offline_databases,omitempty"`
 	// Due/NextRun are omitted while running or refused.
 	Due     *bool      `json:"due,omitempty"`
 	NextRun *time.Time `json:"next_run,omitempty"`
@@ -39,7 +45,7 @@ type statusRunning struct {
 	Stale bool `json:"stale"`
 }
 
-func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, now time.Time) statusDoc {
+func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline, now time.Time) statusDoc {
 	running := map[string]time.Time{}
 	for _, p := range store.PendingSnapshot() {
 		if started, ok := running[p.Group]; !ok || p.Started.Before(started) {
@@ -66,6 +72,19 @@ func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, 
 			Databases:     len(group.Databases),
 			PeriodSeconds: int64(scheduler.EffectivePeriod(group, filePeriods[name], period) / time.Second),
 		}
+		if off != nil {
+			g.Offline = off.GroupOffline(name, group)
+			for _, v := range group.Volumes {
+				if off.VolumeOffline(name, v.Name) {
+					g.OfflineVolumes = append(g.OfflineVolumes, v.Name)
+				}
+			}
+			for _, db := range group.Databases {
+				if off.DatabaseOffline(name, db) {
+					g.OfflineDatabases = append(g.OfflineDatabases, db.Type+"/"+db.Name)
+				}
+			}
+		}
 
 		rec, ok := store.Record(name)
 		if ok && rec.LastRun != nil {
@@ -74,6 +93,7 @@ func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, 
 			g.LastRun = &lr
 		}
 
+		// Offline groups are still backed up, so they carry a normal schedule.
 		switch started, isRunning := running[name]; {
 		case isRunning:
 			elapsed := now.Sub(started)
@@ -98,8 +118,8 @@ func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, 
 	return doc
 }
 
-func printStatusJSON(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string) error {
-	doc := buildStatusDoc(bs, store, period, runTimeout, filePeriods, refused, time.Now())
+func printStatusJSON(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline) error {
+	doc := buildStatusDoc(bs, store, period, runTimeout, filePeriods, refused, off, time.Now())
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding status: %w", err)

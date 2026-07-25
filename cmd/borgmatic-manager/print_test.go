@@ -47,8 +47,8 @@ func TestDisplayBlocksArePaddedTopAndBottom(t *testing.T) {
 	bs, store := padFixture(t)
 
 	for name, render := range map[string]func(){
-		"discover": func() { printGroups(bs, store) },
-		"status":   func() { printStatus(bs, store, time.Hour, 0, nil, nil) },
+		"discover": func() { printGroups(bs, store, nil) },
+		"status":   func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := captureStdout(t, render)
@@ -79,7 +79,7 @@ func TestStatusFailurePointsToInspect(t *testing.T) {
 		LastError: "Repository /mnt/repo does not exist.",
 	})
 
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) })
 
 	assert.Contains(t, out, "1 group failed")
 	assert.Contains(t, out, "demo", "the failing group must be named")
@@ -109,7 +109,7 @@ func TestStatusShowsRunningGroup(t *testing.T) {
 	// A pending record with no matching finished outcome: a run in flight.
 	store.RecordPending("run-1", "demo", time.Now().Add(-3*time.Minute))
 
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) })
 
 	assert.Contains(t, out, "running", "an in-flight group shows as running")
 	assert.Contains(t, out, "1 group running", "the header reflects the running count")
@@ -123,7 +123,7 @@ func TestStatusFlagsStaleRunningPastTimeout(t *testing.T) {
 	store.RecordPending("run-1", "demo", time.Now().Add(-2*time.Hour))
 
 	// run_timeout of 30m: a 2h "run" is past it and reads as suspect.
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 30*time.Minute, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 30*time.Minute, nil, nil, nil) })
 
 	assert.Contains(t, out, "running?", "past run_timeout, a run is flagged as possibly stale")
 }
@@ -146,7 +146,7 @@ func TestInspectRendersSectionsAndTrend(t *testing.T) {
 	require.True(t, ok)
 
 	out := captureStdout(t, func() {
-		printInspect("demo", group, rec, true, "source_directories:\n  - /mnt/demo\n", "", time.Hour, 0)
+		printInspect("demo", group, rec, true, "source_directories:\n  - /mnt/demo\n", "", time.Hour, 0, nil)
 	})
 
 	for _, want := range []string{"Inspect demo", "Members", "Schedule", "Last run", "Size trend", "Recent runs", "Last run log", "Config"} {
@@ -206,7 +206,7 @@ func TestInspectOmitsChurnLineWithoutDedupStats(t *testing.T) {
 	rec, ok := store.Record("demo")
 	require.True(t, ok)
 
-	out := captureStdout(t, func() { printInspect("demo", group, rec, true, "", "none", time.Hour, 0) })
+	out := captureStdout(t, func() { printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil) })
 
 	assert.Contains(t, out, "Size trend", "the total series still renders")
 	assert.NotContains(t, out, "peak", "but the churn line is omitted without dedup stats")
@@ -227,9 +227,9 @@ func TestDiscoverAndInspectAgreeOnMemberDetail(t *testing.T) {
 	group := bs.Groups["demo"]
 	store := state.LoadSchedule(t.TempDir(), nil)
 
-	discover := captureStdout(t, func() { printGroups(bs, store) })
+	discover := captureStdout(t, func() { printGroups(bs, store, nil) })
 	inspect := captureStdout(t, func() {
-		printInspect("demo", group, state.GroupRecord{}, false, "", "none", time.Hour, 0)
+		printInspect("demo", group, state.GroupRecord{}, false, "", "none", time.Hour, 0, nil)
 	})
 
 	for _, want := range []string{"/data/app.db", "hostname=db.internal port=5432", "container=pg"} {
@@ -246,7 +246,7 @@ func TestInspectHandlesNoHistory(t *testing.T) {
 	// A never-run group: no record. Must render without panicking, and note
 	// the config is unavailable.
 	out := captureStdout(t, func() {
-		printInspect("demo", group, state.GroupRecord{}, false, "", "no config generated for this group", time.Hour, 0)
+		printInspect("demo", group, state.GroupRecord{}, false, "", "no config generated for this group", time.Hour, 0, nil)
 	})
 
 	assert.Contains(t, out, "Inspect demo")
@@ -281,7 +281,7 @@ func TestBuildStatusDoc(t *testing.T) {
 
 	doc := buildStatusDoc(bs, store, time.Hour, time.Minute,
 		map[string]time.Duration{"done": 30 * time.Minute},
-		map[string]string{"blocked": "shared repo"}, now)
+		map[string]string{"blocked": "shared repo"}, nil, now)
 
 	require.Len(t, doc.Groups, 3, "empty groups are excluded")
 	byName := map[string]statusGroupJSON{}
@@ -314,4 +314,39 @@ func TestBuildStatusDoc(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(raw), `"generated_at"`)
 	assert.NotContains(t, string(raw), "should not appear")
+}
+
+func TestDiscoverAndStatusShowOfflineMembers(t *testing.T) {
+	// A partly-stopped multi-container group: books offline (still backed up),
+	// postgres live. The group is NOT fully offline.
+	bs := models.NewBackupState()
+	bs.AddVolume("app", models.VolumeInfo{Name: "books", HostPath: "/data/books"})
+	bs.AddVolume("app", models.VolumeInfo{Name: "postgres", HostPath: "/data/pg"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.MarkSuccess("app", "fp", time.Now().Add(-2*time.Minute))
+	off := &state.Offline{Volumes: map[string]map[string]bool{"app": {"books": true}}}
+
+	discover := captureStdout(t, func() { printGroups(bs, store, off) })
+	assert.Contains(t, discover, "books", "the offline volume is still listed")
+	assert.Regexp(t, `\(offline\)[^\n]*books`, discover, "tagged offline in front, before the name")
+	assert.NotRegexp(t, `\(offline\)[^\n]*postgres`, discover, "the live volume is not tagged")
+	assert.NotRegexp(t, `app\b[^\n]*\(offline\)`, discover, "a partly-live group is not fully offline")
+
+	status := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, off) })
+	assert.Regexp(t, `app \(partial\)[^\n]*due now`, status, "a partly-offline group is tagged partial and keeps its schedule")
+}
+
+func TestBuildStatusDocMarksOfflineMembersButKeepsSchedule(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("gone", models.VolumeInfo{Name: "gone_vol", HostPath: "/data/gone"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	off := &state.Offline{Volumes: map[string]map[string]bool{"gone": {"gone_vol": true}}}
+
+	doc := buildStatusDoc(bs, store, time.Hour, 0, nil, nil, off, time.Now())
+	require.Len(t, doc.Groups, 1)
+	g := doc.Groups[0]
+	assert.True(t, g.Offline, "no live container: the group is offline")
+	assert.Equal(t, []string{"gone_vol"}, g.OfflineVolumes)
+	assert.NotNil(t, g.Due, "but it is still scheduled and backed up")
+	assert.True(t, *g.Due, "and due now with no prior success")
 }
