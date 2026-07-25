@@ -296,11 +296,17 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 
 // Retain reconciles records against this cycle's groups: a vanished group
 // survives two absent cycles before pruning; presence resets the counter.
-func (s *ScheduleStore) Retain(names map[string]struct{}) {
+// Retain reconciles group records against the currently live groups. Active
+// groups have their absence counter cleared. Absent groups age out (their
+// record is deleted after two cycles) unless they are in protected: a
+// protected-but-absent group keeps its record and last-backup forever, marked
+// absent (MissingCycles > 0) so it does not drive NextWake. protected is the
+// set of cached groups, so an offline group stays visible in status/discover.
+func (s *ScheduleStore) Retain(active, protected map[string]struct{}) {
 	s.update(func(f *scheduleFile) bool {
 		changed := false
 		for name, rec := range f.Groups {
-			if _, ok := names[name]; ok {
+			if _, ok := active[name]; ok {
 				if rec.MissingCycles != 0 {
 					rec.MissingCycles = 0
 					f.Groups[name] = rec
@@ -308,7 +314,7 @@ func (s *ScheduleStore) Retain(names map[string]struct{}) {
 				}
 				continue
 			}
-			if rec.MissingCycles >= 2 {
+			if _, keep := protected[name]; !keep && rec.MissingCycles >= 2 {
 				delete(f.Groups, name)
 			} else {
 				rec.MissingCycles++

@@ -50,6 +50,10 @@ type Scheduler struct {
 	store  *state.ScheduleStore
 	period time.Duration
 
+	// cache persists discovered group membership so offline groups survive; nil
+	// disables caching (schedule retention then prunes vanished groups as before).
+	cache *state.GroupCache
+
 	// cycleMu makes cycles mutually exclusive: reconcile in one cycle could
 	// otherwise delete what a concurrent cycle just wrote.
 	cycleMu sync.Mutex
@@ -74,6 +78,20 @@ type Scheduler struct {
 	// discoverFunc and generateFunc are overridable for testing.
 	discoverFunc func(ctx context.Context) (*models.BackupState, error)
 	generateFunc func(state *models.BackupState) (map[string]config.GroupRunMeta, error)
+}
+
+// SetGroupCache attaches a durable group cache so offline groups survive and
+// their schedule records are protected from retention pruning.
+func (s *Scheduler) SetGroupCache(cache *state.GroupCache) {
+	s.cache = cache
+}
+
+// cacheNames returns cached group names for retention protection, or nil.
+func (s *Scheduler) cacheNames() map[string]struct{} {
+	if s.cache == nil {
+		return nil
+	}
+	return s.cache.Names()
 }
 
 // NewScheduler creates a Scheduler; a nil store disables dueness gating.
@@ -276,8 +294,9 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 
 	if s.store != nil {
 		// Drop schedule state for vanished groups so it can't distort
-		// next-wake computation or grow without bound.
-		s.store.Retain(live)
+		// next-wake computation or grow without bound, but keep records for
+		// cached (offline) groups so their last-backup stays visible.
+		s.store.Retain(live, s.cacheNames())
 		s.mu.Lock()
 		for name := range s.lastAttempt {
 			if _, ok := live[name]; !ok {
@@ -320,6 +339,18 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 	backupState, err := s.discoverFunc(dctx)
 	if err != nil {
 		return err
+	}
+	// Merge the durable cache so a stopped container's volumes keep being
+	// backed up (data at rest, no silent shrink). Offline databases cannot be
+	// dumped without their container, so drop them from this cycle with a
+	// warning; their last dump stays restorable from prior archives.
+	if s.cache != nil {
+		merged, off := s.cache.Reconcile(backupState, s.now())
+		off.StripUndumpableDatabases(merged, func(group string, db models.DatabaseConfig) {
+			s.logger.Warn("skipping database dump: its container is offline (cannot join a namespace that is gone)",
+				"group", group, "database", db.Type+"/"+db.Name)
+		})
+		backupState = merged
 	}
 
 	meta, err := s.generateFunc(backupState)

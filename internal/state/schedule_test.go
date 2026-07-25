@@ -64,16 +64,16 @@ func TestScheduleRetainGraceThenPrune(t *testing.T) {
 
 	// Two absent cycles: the record survives (redeploy blips must not
 	// wipe schedules and trigger a backup storm on reappearance).
-	s.Retain(map[string]struct{}{"keep": {}})
+	s.Retain(map[string]struct{}{"keep": {}}, nil)
 	rec, ok := s.Record("gone")
 	require.True(t, ok, "one absent cycle must not prune")
 	assert.Equal(t, 1, rec.MissingCycles)
-	s.Retain(map[string]struct{}{"keep": {}})
+	s.Retain(map[string]struct{}{"keep": {}}, nil)
 	_, ok = s.Record("gone")
 	require.True(t, ok, "two absent cycles must not prune")
 
 	// Third consecutive absence prunes, and it persists.
-	s.Retain(map[string]struct{}{"keep": {}})
+	s.Retain(map[string]struct{}{"keep": {}}, nil)
 	_, ok = s.Record("gone")
 	assert.False(t, ok)
 	reloaded := state.LoadSchedule(dir, discardLogger())
@@ -88,8 +88,8 @@ func TestScheduleRetainReappearanceResetsGrace(t *testing.T) {
 	s := state.LoadSchedule(dir, discardLogger())
 	s.MarkSuccess("app", "fp", time.Now())
 
-	s.Retain(map[string]struct{}{})          // absent once
-	s.Retain(map[string]struct{}{"app": {}}) // back
+	s.Retain(map[string]struct{}{}, nil)          // absent once
+	s.Retain(map[string]struct{}{"app": {}}, nil) // back
 	rec, ok := s.Record("app")
 	require.True(t, ok)
 	assert.Equal(t, 0, rec.MissingCycles, "reappearance must reset the absence counter")
@@ -233,7 +233,7 @@ func TestCorruptFileHealedByNoOpMutation(t *testing.T) {
 
 	s := state.LoadSchedule(dir, discardLogger())
 	// Retain over the (empty, corrupt-degraded) state changes nothing.
-	s.Retain(map[string]struct{}{})
+	s.Retain(map[string]struct{}{}, nil)
 
 	// The file must now be valid JSON, not the corrupt bytes.
 	data, err := os.ReadFile(schedPath)
@@ -259,4 +259,29 @@ func TestPendingRunsRoundTrip(t *testing.T) {
 	reloaded.ClearPending("run-abc")
 	assert.Empty(t, reloaded.PendingSnapshot())
 	assert.Empty(t, state.LoadSchedule(dir, discardLogger()).PendingSnapshot(), "clear must persist")
+}
+
+func TestScheduleRetainProtectedGroupNeverPruned(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, discardLogger())
+	s.MarkSuccess("offline", "fp", time.Now())
+
+	protected := map[string]struct{}{"offline": {}}
+	// Many absent cycles: a protected (cached) group keeps its record and its
+	// last-backup, but stays marked absent so NextWake ignores it.
+	for i := 0; i < 5; i++ {
+		s.Retain(map[string]struct{}{}, protected)
+	}
+	rec, ok := s.Record("offline")
+	require.True(t, ok, "a protected group is never pruned, no matter how long it is absent")
+	assert.Positive(t, rec.MissingCycles, "still marked absent so it does not drive NextWake")
+	assert.False(t, rec.LastSuccess.IsZero(), "last-backup survives for the offline display")
+
+	// An unprotected group vanishing alongside it still ages out.
+	s.MarkSuccess("gone", "fp", time.Now())
+	for i := 0; i < 3; i++ {
+		s.Retain(map[string]struct{}{}, protected)
+	}
+	_, ok = s.Record("gone")
+	assert.False(t, ok, "unprotected groups still age out")
 }
