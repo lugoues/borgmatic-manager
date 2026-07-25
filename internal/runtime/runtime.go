@@ -40,6 +40,9 @@ type ContainerInfo struct {
 	Labels map[string]string
 	// Mounts lists named volume mounts (bind/tmpfs excluded).
 	Mounts []VolumeMount
+	// Running is true when the container is currently executing (not merely
+	// present): a restore must not extract into a volume a running app writes.
+	Running bool
 }
 
 // VolumeMount is a named volume attached to a container.

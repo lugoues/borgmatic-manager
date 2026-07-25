@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -43,7 +44,7 @@ func main() {
 borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
 	}
 
-	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), inspectCmd(), logsCmd(), doctorCmd(), borgmaticCmd(), versionCmd())
+	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), inspectCmd(), logsCmd(), doctorCmd(), restoreVolumeCmd(), borgmaticCmd(), versionCmd())
 
 	if err := fang.Execute(context.Background(), root, fang.WithVersion(version)); err != nil {
 		os.Exit(1)
@@ -824,6 +825,228 @@ func runBorgmaticPassthrough(args []string) error {
 	// #nosec G702 G204 -- deliberately exec'ing the resolved borgmatic binary with the operator's own CLI arguments
 	if err := syscall.Exec(borgmaticPath, argv, os.Environ()); err != nil {
 		return fmt.Errorf("executing borgmatic: %w", err)
+	}
+	return nil
+}
+
+func restoreVolumeCmd() *cobra.Command {
+	var archive, into string
+	var force, merge, snapshot bool
+	cmd := &cobra.Command{
+		Use:   "restore-volume <group> <volume>",
+		Short: "Extract one volume from an archive back into place",
+		Long: `Restores a named volume. The manager resolves the volume's host path, so
+there is no --destination to get wrong: it extracts straight into the volume's
+own data directory.
+
+By default it mirrors: the target is emptied first for an exact
+point-in-time restore. --merge keeps files added since the backup (archived
+files still overwrite).
+
+Two ways to keep the current data as a safety net before overwriting it:
+--into <volume> extracts into a different existing volume, leaving the source
+untouched; --snapshot (btrfs only) makes a copy-on-write copy of the volume
+first, then restores in place, so you can roll back.
+
+Extracting into a volume a running container is using risks corruption, so it
+refuses unless the container is stopped or --force.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.SilenceUsage = true
+			return runRestoreVolume(cmd.Context(), args[0], args[1], archive, into, force, merge, snapshot)
+		},
+	}
+	cmd.Flags().StringVar(&archive, "archive", "latest", "archive to restore from")
+	cmd.Flags().StringVar(&into, "into", "", "restore into this volume instead of the source (must already exist)")
+	cmd.Flags().BoolVar(&force, "force", false, "extract even if a running container is using the target volume")
+	cmd.Flags().BoolVar(&merge, "merge", false, "keep files added since the backup instead of emptying the target first")
+	cmd.Flags().BoolVar(&snapshot, "snapshot", false, "btrfs: copy-on-write snapshot the volume before overwriting it, as a rollback point")
+	// --into and --snapshot are two ways to preserve the current data; pick one.
+	cmd.MarkFlagsMutuallyExclusive("into", "snapshot")
+	return cmd
+}
+
+// volumeRestorePlan is the resolved borg geometry for a restore: what to pull
+// from the archive and where to land it.
+type volumeRestorePlan struct {
+	volumesRoot  string // e.g. /var/lib/docker/volumes
+	archivePath  string // path prefix in the archive: <sourceVolume>/_data
+	targetVolume string // volume being written to (source, or --into)
+	targetData   string // <volumesRoot>/<targetVolume>/_data
+}
+
+// planVolumeRestore derives the archive path and target from the source
+// volume's host path. into names an alternate target volume in the same
+// volumes root; empty means restore into the source volume.
+func planVolumeRestore(sourceHostPath, into string) (volumeRestorePlan, error) {
+	volumesRoot := config.VolumesRoot(sourceHostPath)
+	archivePath := strings.TrimPrefix(sourceHostPath, volumesRoot+string(filepath.Separator))
+	if archivePath == "" || archivePath == sourceHostPath {
+		return volumeRestorePlan{}, fmt.Errorf("cannot derive the archive path for %s; restore manually with the borgmatic passthrough", sourceHostPath)
+	}
+	targetVolume := filepath.Base(filepath.Dir(sourceHostPath))
+	targetData := sourceHostPath
+	if into != "" {
+		targetVolume = into
+		targetData = filepath.Join(volumesRoot, into, "_data")
+	}
+	return volumeRestorePlan{volumesRoot: volumesRoot, archivePath: archivePath, targetVolume: targetVolume, targetData: targetData}, nil
+}
+
+// runRestoreVolume extracts a single volume back into its data directory (or an
+// --into target), computing borg's --path/--destination from the volume's known
+// location so the operator never has to.
+func runRestoreVolume(ctx context.Context, group, volume, archive, into string, force, merge, snapshot bool) error {
+	logger := interactiveLogger()
+
+	e, err := loadEnv()
+	if err != nil {
+		return err
+	}
+
+	backupState, _, err := e.discoverMerged(ctx, logger)
+	if err != nil {
+		return err
+	}
+	g, ok := backupState.Groups[group]
+	if !ok {
+		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(backupState))
+	}
+
+	var hostPath string
+	names := make([]string, 0, len(g.Volumes))
+	for _, v := range g.Volumes {
+		names = append(names, v.Name)
+		if v.Name == volume {
+			hostPath = v.HostPath
+		}
+	}
+	if hostPath == "" {
+		return fmt.Errorf("group %q has no volume %q; volumes: %s", group, volume, strings.Join(names, ", "))
+	}
+
+	plan, err := planVolumeRestore(hostPath, into)
+	if err != nil {
+		return err
+	}
+	if _, statErr := os.Stat(plan.targetData); statErr != nil {
+		return fmt.Errorf("target volume data directory %s is not present; create the volume first (docker/podman volume create %s): %w", plan.targetData, plan.targetVolume, statErr)
+	}
+
+	// Extracting into a volume a running container writes races those writes.
+	// A stopped or removed container is safe.
+	running, err := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+	if err != nil {
+		return err
+	}
+	if running && !force {
+		return fmt.Errorf("a running container is using volume %q; stop it first, or pass --force to extract into a live volume", plan.targetVolume)
+	}
+
+	configsDir, err := e.privateConfigDir("restore")
+	if err != nil {
+		return err
+	}
+	if _, genErr := e.newGenerator(configsDir, logger).Generate(backupState); genErr != nil {
+		return genErr
+	}
+
+	// Preserve the current data before overwriting it: a btrfs CoW copy the
+	// operator can roll back from, then removed once the restore is verified.
+	if snapshot {
+		snap, snapErr := snapshotVolume(ctx, plan.targetData)
+		if snapErr != nil {
+			return snapErr
+		}
+		logger.Warn("snapshotted the volume before restore; remove it once you have verified the restore", "snapshot", snap)
+	}
+
+	mode := "mirror"
+	if merge {
+		mode = "merge"
+	} else {
+		if wipeErr := emptyVolumeData(plan.targetData); wipeErr != nil {
+			return fmt.Errorf("emptying the target before a mirror restore: %w", wipeErr)
+		}
+		logger.Warn("emptied the target volume for a mirror restore", "path", plan.targetData)
+	}
+
+	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(configsDir, group+".yaml")
+	// Strip "<sourceVolume>/_data" so files land directly in the target's data
+	// dir, which lets --into retarget a differently-named volume.
+	argv := []string{borgmaticPath, "--config", configPath, "extract", "--archive", archive,
+		"--path", plan.archivePath, "--strip-components", "2", "--destination", plan.targetData}
+
+	fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (%s)\n", group, volume, archive, plan.targetData, mode)
+
+	// #nosec G204 -- deliberately exec'ing the resolved borgmatic binary with computed extract arguments
+	if err := syscall.Exec(borgmaticPath, argv, os.Environ()); err != nil {
+		return fmt.Errorf("executing borgmatic: %w", err)
+	}
+	return nil
+}
+
+// volumeHasRunningContainer reports whether any currently-running container
+// mounts the named volume. A stopped or removed container does not count: its
+// data is at rest and safe to extract into.
+func volumeHasRunningContainer(ctx context.Context, rt runtime.ContainerRuntime, volume string) (bool, error) {
+	containers, err := rt.ListContainers(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range containers {
+		if !c.Running {
+			continue
+		}
+		for _, m := range c.Mounts {
+			if m.Name == volume {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// snapshotVolume makes a copy-on-write copy of the volume's data as a rollback
+// point, requiring btrfs so the copy is near-instant and space-shared. It
+// returns the snapshot path. cp --reflink=always fails loudly if the copy would
+// not be a real reflink, so a silent full-size duplicate never happens.
+func snapshotVolume(ctx context.Context, targetData string) (string, error) {
+	onBtrfs, err := config.IsBtrfs(targetData)
+	if err != nil {
+		return "", fmt.Errorf("checking the filesystem of %s: %w", targetData, err)
+	}
+	if !onBtrfs {
+		return "", fmt.Errorf("--snapshot needs the volume on btrfs, but %s is not; use --into <volume> instead", targetData)
+	}
+	snap := targetData + ".pre-restore-" + time.Now().Format("20060102-150405")
+	// #nosec G204 G702 -- no shell: fixed cp argv over host-derived paths (volume mountpoint + timestamp)
+	out, err := exec.CommandContext(ctx, "cp", "--reflink=always", "-a", targetData, snap).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("btrfs snapshot copy failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return snap, nil
+}
+
+// emptyVolumeData removes the contents of a volume's _data directory (keeping
+// the directory itself). It refuses paths that do not look like a container
+// volume, so a misconfigured host path cannot wipe something unrelated.
+func emptyVolumeData(hostPath string) error {
+	if !strings.Contains(hostPath, string(filepath.Separator)+"volumes"+string(filepath.Separator)) {
+		return fmt.Errorf("refusing to empty %q: not a recognizable container volume path", hostPath)
+	}
+	entries, err := os.ReadDir(hostPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(hostPath, entry.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }

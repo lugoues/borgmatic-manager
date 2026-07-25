@@ -129,11 +129,12 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 			})
 		}
 		infos = append(infos, ContainerInfo{
-			ID:     c.ID,
-			Name:   name,
-			Image:  c.Image,
-			Labels: c.Labels,
-			Mounts: mounts,
+			ID:      c.ID,
+			Name:    name,
+			Image:   c.Image,
+			Labels:  c.Labels,
+			Mounts:  mounts,
+			Running: c.State == "running",
 		})
 	}
 	return infos, nil
