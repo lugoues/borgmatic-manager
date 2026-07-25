@@ -15,6 +15,17 @@
       "matchManagers": ["gomod"],
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "go dependencies"
+    },
+    {
+      "description": "charmbracelet v2 lives at charm.land/* and needs a manual migration (output color-profile handling changed); do not auto-propose the broken github.com/*/v2 major",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": [
+        "github.com/charmbracelet/fang",
+        "github.com/charmbracelet/lipgloss",
+        "github.com/charmbracelet/log"
+      ],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ],
   "postUpdateOptions": ["gomodTidy"],
