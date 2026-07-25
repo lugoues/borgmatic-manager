@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
@@ -37,7 +38,8 @@ func TestWarnCapturingLogger(t *testing.T) {
 // The handler's Enabled gate keeps sub-warn records from ever reaching Handle.
 func TestReportHandlerLevelGate(t *testing.T) {
 	h := reportHandler{r: &doctorReport{}}
-	assert.False(t, h.Enabled(nil, slog.LevelInfo))
-	assert.True(t, h.Enabled(nil, slog.LevelWarn))
-	assert.True(t, h.Enabled(nil, slog.LevelError))
+	ctx := context.Background()
+	assert.False(t, h.Enabled(ctx, slog.LevelInfo))
+	assert.True(t, h.Enabled(ctx, slog.LevelWarn))
+	assert.True(t, h.Enabled(ctx, slog.LevelError))
 }

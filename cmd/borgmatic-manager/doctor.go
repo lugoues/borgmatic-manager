@@ -274,7 +274,7 @@ func (r *doctorReport) checkGenerate(ctx context.Context, e *env, backupState *m
 		r.fail("generate", err.Error())
 		return
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	// Refusals are reported below; the generator's own logging would repeat them.
 	gen := e.newGenerator(dir, slog.New(slog.DiscardHandler))
@@ -286,7 +286,7 @@ func (r *doctorReport) checkGenerate(ctx context.Context, e *env, backupState *m
 	for _, refusal := range refusals {
 		r.warn("generate", fmt.Sprintf("group %s refused: %s", refusal.Group, refusal.Reason))
 	}
-	if _, err := gen.Generate(backupState); err != nil {
+	if _, err = gen.Generate(backupState); err != nil {
 		r.fail("generate", err.Error())
 		return
 	}
@@ -301,6 +301,7 @@ func (r *doctorReport) checkGenerate(ctx context.Context, e *env, backupState *m
 	for _, file := range files {
 		group := strings.TrimSuffix(filepath.Base(file), ".yaml")
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
+		// #nosec G204 -- borgmaticPath is the resolved borgmatic binary; running it is this program's purpose
 		out, err := exec.CommandContext(cctx, borgmaticPath, "--config", file, "config", "validate").CombinedOutput()
 		cancel()
 		if err != nil {
