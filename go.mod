@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/NimbleMarkets/ntcharts/v2 v2.2.0
 	github.com/charmbracelet/fang v1.0.0
-	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/charmbracelet/lipgloss/v2 v2.0.5
 	github.com/charmbracelet/log v1.0.0
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docker/docker v27.5.1+incompatible
