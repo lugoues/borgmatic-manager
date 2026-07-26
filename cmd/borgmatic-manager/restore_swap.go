@@ -570,8 +570,37 @@ func unescapeMountField(field string) string {
 // retainOutOfTheWay moves a copy that must outlive this run to a uniquely named
 // sibling, away from the staging and displaced paths that later runs reuse.
 func retainOutOfTheWay(from, targetData string) (string, error) {
-	kept := fmt.Sprintf("%s.borgmatic-manager-kept-%s", targetData, time.Now().Format("20060102-150405"))
-	if err := os.Rename(from, kept); err != nil {
+	// The destination is created rather than merely named, because a name is not
+	// a claim. Two retentions of the same volume a fraction of a second apart
+	// picked the same second-resolution timestamp, and neither outcome was
+	// acceptable: renaming onto a non-empty retained copy fails, which drops the
+	// caller back to leaving this one on the staging path that the next retry
+	// deletes, and renaming onto an empty one succeeds and discards it silently.
+	// Widening the timestamp would only narrow that window; MkdirTemp closes it,
+	// including against a concurrent process.
+	//
+	// Renaming onto the empty directory it just made is what gives this its
+	// uniqueness, and the retained copy keeps its own mode: the placeholder is
+	// replaced, not merged into.
+	//
+	// unix.Renameat rather than os.Rename, which Lstats the destination and
+	// refuses any existing directory, empty or not. The syscall replaces an
+	// empty one and refuses a non-empty one, which is exactly the rule wanted
+	// here: the placeholder is always ours and always empty, and anything that
+	// somehow got into it makes the rename fail rather than discard it.
+	stamp := time.Now().Format("20060102-150405")
+	kept, err := os.MkdirTemp(filepath.Dir(targetData),
+		fmt.Sprintf("%s.borgmatic-manager-kept-%s-", filepath.Base(targetData), stamp))
+	if err != nil {
+		return "", fmt.Errorf("reserving a name to keep %s under: %w", from, err)
+	}
+	if err := unix.Renameat(unix.AT_FDCWD, from, unix.AT_FDCWD, kept); err != nil {
+		err = &os.LinkError{Op: "rename", Old: from, New: kept, Err: err}
+		// The placeholder is empty and this restore never used it, so removing
+		// it keeps the failure from littering the volumes directory.
+		if rmErr := os.Remove(kept); rmErr != nil {
+			return "", fmt.Errorf("%w (and the placeholder %s could not be removed: %v)", err, kept, rmErr)
+		}
 		return "", err
 	}
 	return kept, nil

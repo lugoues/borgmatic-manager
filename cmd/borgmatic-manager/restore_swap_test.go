@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -683,4 +688,147 @@ func TestEmptyVolumeDataJudgesTheVolumeNotItsBackingDirectory(t *testing.T) {
 	err = emptyVolumeData(backing, filepath.Join(root, "elsewhere", "_data"))
 	require.Error(t, err, "a target that is not a container volume is still refused")
 	assert.Contains(t, err.Error(), "not a recognizable container volume")
+}
+
+// Two retentions of the same volume inside one second used to pick the same
+// name. Renaming onto a non-empty retained copy fails, which put the second one
+// back on the staging path a retry deletes; renaming onto an empty one silently
+// replaced it. Both copies must survive, distinctly.
+func TestRetainOutOfTheWayDoesNotCollideWithinASecond(t *testing.T) {
+	data := liveVolume(t)
+
+	first := data + stagingSuffix
+	require.NoError(t, os.Mkdir(first, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(first, "first.txt"), []byte("first"), 0o644))
+	keptFirst, err := retainOutOfTheWay(first, data)
+	require.NoError(t, err)
+
+	second := data + stagingSuffix
+	require.NoError(t, os.Mkdir(second, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(second, "second.txt"), []byte("second"), 0o644))
+	keptSecond, err := retainOutOfTheWay(second, data)
+	require.NoError(t, err, "a second retention in the same second must not fail")
+
+	assert.NotEqual(t, keptFirst, keptSecond, "the two retained copies must not share a name")
+	assert.Equal(t, []string{"first.txt"}, names(t, keptFirst), "the first copy was not overwritten")
+	assert.Equal(t, []string{"second.txt"}, names(t, keptSecond))
+	assert.Len(t, keptDirsFor(t, data), 2, "both copies are kept")
+	assert.NoDirExists(t, data+stagingSuffix, "neither is left where a retry clears first")
+}
+
+// A retention that cannot complete must not leave its placeholder behind: the
+// volumes directory would collect empty kept- directories that look like
+// recoverable copies.
+func TestRetainOutOfTheWayRemovesItsPlaceholderOnFailure(t *testing.T) {
+	data := liveVolume(t)
+
+	_, err := retainOutOfTheWay(data+stagingSuffix, data) // never created
+	require.Error(t, err)
+	assert.Empty(t, keptDirsFor(t, data), "no empty placeholder was left behind")
+}
+
+// SIGHUP terminates by default and arrives on its own when a controlling
+// terminal goes away, so leaving it unhandled killed the manager while
+// borgmatic and borg kept writing into the live volume.
+//
+// Run in a re-exec'd child: signalling this test binary would take the whole
+// run down, which is the very failure being guarded against. The child runs a
+// fake borgmatic that backgrounds a grandchild, so the assertion covers the
+// group sweep and not merely the leader.
+func TestExtractForwardsSIGHUPToTheWholeGroup(t *testing.T) {
+	// A real file rather than a buffer: a buffer makes exec create a pipe, and
+	// the fake borgmatic inherits its write end, so cmd.Wait would block until
+	// that process exited on its own. A regression would then read as a hang
+	// instead of a failure, which is the shape of bug this test exists to catch.
+	logPath := filepath.Join(t.TempDir(), "child.log")
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer func() { _ = logFile.Close() }()
+
+	// #nosec G204 -- re-execs this test binary
+	child := exec.Command(os.Args[0], "-test.run=TestExtractSignalHelper")
+	child.Env = append(os.Environ(), "BM_EXTRACT_SIGNAL_HELPER=1")
+	child.Stdout, child.Stderr = logFile, logFile
+	require.NoError(t, child.Start())
+
+	// The child builds its own paths and reports where the grandchild's is,
+	// rather than taking them from the environment: a path arriving that way
+	// reaches exec.Command as tainted input and trips the command-injection
+	// analysis on production code that is not doing anything of the sort.
+	grandchild := waitForPID(t, logPath)
+	require.NoError(t, child.Process.Signal(syscall.SIGHUP))
+
+	waitErr := child.Wait()
+	require.Error(t, waitErr, "the extract must report that it did not finish")
+	logged, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(logged), "hangup", "the reason reaches the operator")
+
+	// The grandchild is what an unhandled SIGHUP used to leave writing into the
+	// volume with nothing supervising it.
+	assert.Eventually(t, func() bool {
+		return syscall.Kill(grandchild, 0) != nil
+	}, 10*time.Second, 50*time.Millisecond, "borg was left alive after the manager exited")
+}
+
+// TestExtractSignalHelper is the child half of the test above, not a test.
+func TestExtractSignalHelper(t *testing.T) {
+	if os.Getenv("BM_EXTRACT_SIGNAL_HELPER") != "1" {
+		t.Skip("child half of TestExtractForwardsSIGHUPToTheWholeGroup")
+	}
+	// MkdirTemp rather than t.TempDir: this process leaves via os.Exit, so the
+	// registered cleanup would never run anyway, and saying so is clearer than
+	// appearing to rely on it.
+	dir, err := os.MkdirTemp("", "bm-signal-helper-")
+	require.NoError(t, err)
+
+	pidFile := filepath.Join(dir, "grandchild.pid")
+	fake := filepath.Join(dir, "borgmatic")
+	// The grandchild gets its own stdio, so it does not hold the parent's.
+	require.NoError(t, os.WriteFile(fake,
+		[]byte("#!/bin/sh\nsleep 60 >/dev/null 2>&1 </dev/null &\necho $! > "+pidFile+"\nsleep 60\n"), 0o755))
+	fmt.Println(pidFileMarker + pidFile)
+
+	err = runBorgmaticExtract(context.Background(), fake,
+		"config.yaml", "archive", "vol/_data", filepath.Join(dir, "dest"))
+	if err != nil {
+		fmt.Println("extract returned:", err)
+		os.Exit(3)
+	}
+	os.Exit(0)
+}
+
+// pidFileMarker prefixes the line the child uses to tell the parent where it
+// put the grandchild's pid.
+const pidFileMarker = "GRANDCHILD-PIDFILE: "
+
+// waitForPID reads the child's log for the pid file it announced, then that
+// file for the grandchild's pid.
+func waitForPID(t *testing.T, logPath string) int {
+	t.Helper()
+	var pidFile string
+	require.Eventually(t, func() bool {
+		logged, err := os.ReadFile(logPath)
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(logged), "\n") {
+			if after, found := strings.CutPrefix(line, pidFileMarker); found {
+				pidFile = strings.TrimSpace(after)
+				return pidFile != ""
+			}
+		}
+		return false
+	}, 20*time.Second, 50*time.Millisecond, "the child never announced its pid file")
+
+	var pid int
+	require.Eventually(t, func() bool {
+		raw, err := os.ReadFile(pidFile)
+		if err != nil {
+			return false
+		}
+		pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+		return err == nil && pid > 0
+	}, 20*time.Second, 50*time.Millisecond, "the fake borgmatic never recorded its grandchild")
+	return pid
 }
