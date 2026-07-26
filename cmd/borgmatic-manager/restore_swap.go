@@ -103,11 +103,16 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// Last check before the only destructive step.
 	if stillSafe != nil {
 		if safeErr := stillSafe(); safeErr != nil {
-			// The extract is complete and may have taken hours. Keep it: the
-			// message points the operator at it, and deleting it here would
-			// make that a lie as well as a waste.
+			// The extract is complete and may have taken hours. Keep it, but
+			// move it off the staging path first: the retry the operator is
+			// about to run clears staging as its first act, which would delete
+			// the very tree this error points them at.
 			keepStaging = true
-			return fmt.Errorf("%w (the volume is untouched; the completed restore is kept at %s)", safeErr, staging)
+			kept := staging
+			if moved, moveErr := retainOutOfTheWay(staging, targetData); moveErr == nil {
+				kept = moved
+			}
+			return fmt.Errorf("%w (the volume is untouched; the completed restore is kept at %s)", safeErr, kept)
 		}
 	}
 

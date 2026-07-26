@@ -1042,6 +1042,17 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if err != nil {
 		return err
 	}
+	// Resolve before anything is derived from this path. A _data that is a
+	// symlink to a backing directory would otherwise get its staging sibling
+	// placed beside the link rather than beside the real directory, and the
+	// swap would replace the link itself with a directory, silently detaching
+	// the volume from what it pointed at.
+	if resolved, resErr := filepath.EvalSymlinks(plan.targetData); resErr == nil && resolved != plan.targetData {
+		logger.Warn("the volume's data directory is a symlink; restoring into what it points at",
+			"link", plan.targetData, "resolved", resolved)
+		plan.targetData = resolved
+	}
+
 	// A previous restore killed between the two renames leaves the data under a
 	// suffixed name and nothing at targetData. Put it back before concluding the
 	// volume has no data directory.
@@ -1216,6 +1227,13 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	// Armed before the child exists. A signal landing between Start and Notify
+	// would otherwise take the default action, killing the manager and leaving
+	// borgmatic writing into the volume with nothing supervising it.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting borgmatic: %w", err)
 	}
@@ -1227,18 +1245,17 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	restoreForeground := giveTerminalTo(cmd.Process.Pid)
 	defer restoreForeground()
 
-	// A background group no longer receives the terminal's Ctrl-C either, so
-	// catch the signals this process would have taken and pass them on.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(signals)
-
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 
 	for {
 		select {
 		case err := <-exited:
+			// borgmatic may have died leaving the borg it spawned running, and
+			// a borg still writing into a destination this restore is about to
+			// clean up, swap, or report on is worse than an orphan. Sweep the
+			// group either way; nothing is left in it on a clean exit.
+			signalExtractGroup(cmd, syscall.SIGKILL)
 			if err != nil {
 				return fmt.Errorf("borgmatic extract failed: %w", err)
 			}
@@ -1281,6 +1298,14 @@ func giveTerminalTo(pgid int) func() {
 	previous, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
 	if err != nil {
 		return func() {} // not a terminal
+	}
+	// Only hand over a foreground this process already holds. Run as a
+	// background job ("restore-volume ... &"), the foreground belongs to the
+	// interactive shell, and taking it would steal the user's terminal and
+	// stop their shell. A background job has no terminal input to offer
+	// borgmatic anyway.
+	if self, err := unix.Getpgid(os.Getpid()); err != nil || self != previous {
+		return func() {}
 	}
 	// Changing the foreground group from a process that is not in it raises
 	// SIGTTOU at the caller, which would stop this process mid-restore.
