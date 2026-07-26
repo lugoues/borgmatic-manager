@@ -796,8 +796,17 @@ func TestExtractSignalHelper(t *testing.T) {
 	pidFile := filepath.Join(dir, "grandchild.pid")
 	fake := filepath.Join(dir, "borgmatic")
 	// The grandchild gets its own stdio, so it does not hold the parent's.
-	require.NoError(t, os.WriteFile(fake,
-		[]byte("#!/bin/sh\nsleep 60 >/dev/null 2>&1 </dev/null &\necho $! > "+pidFile+"\nsleep 60\n"), 0o755))
+	script := "#!/bin/sh\nsleep 60 >/dev/null 2>&1 </dev/null &\necho $! > " + pidFile + "\nsleep 60\n"
+	if os.Getenv("BM_FAKE_PROPAGATES_TERM") == "1" {
+		// What real borgmatic does: borgmatic/signals.py handles SIGTERM with
+		// os.killpg(os.getpgrp(), signal_number), so the signal reaches the borg
+		// it spawned rather than stopping at borgmatic. Tests that depend on
+		// that reaching borg have to model it, or they are asserting against a
+		// stand-in that behaves worse than the real thing.
+		script = "#!/bin/sh\ntrap 'kill -TERM -$$ 2>/dev/null; exit 143' TERM\n" +
+			"sleep 60 >/dev/null 2>&1 </dev/null &\necho $! > " + pidFile + "\nwait\n"
+	}
+	require.NoError(t, os.WriteFile(fake, []byte(script), 0o755))
 	fmt.Println(pidFileMarker + pidFile)
 
 	err = runBorgmaticExtract(context.Background(), fake,
@@ -1384,4 +1393,144 @@ func TestCheckVolumeDataDirRejectsANonDirectory(t *testing.T) {
 	require.Error(t, checkVolumeDataDir(link, "myvol"), "a symlink to a file must be refused too")
 
 	require.Error(t, checkVolumeDataDir(filepath.Join(dir, "missing"), "myvol"), "and a missing one still is")
+}
+
+// SIGKILL runs no handler, so forwarding cannot help here: the extract has to
+// be tied to this process by the kernel. Without that a manager that is killed
+// or OOM-killed leaves borgmatic and borg running, and the per-volume lock dies
+// with the manager, so the next attempt starts while the orphan is still
+// writing.
+func TestExtractDiesWithAKilledManager(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "child.log")
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer func() { _ = logFile.Close() }()
+
+	// #nosec G204 -- re-execs this test binary
+	child := exec.Command(os.Args[0], "-test.run=TestExtractSignalHelper")
+	child.Env = minimalEnv("BM_EXTRACT_SIGNAL_HELPER=1", "BM_FAKE_PROPAGATES_TERM=1")
+	child.Stdout, child.Stderr = logFile, logFile
+	require.NoError(t, child.Start())
+
+	grandchild := waitForPID(t, logPath)
+	leader, err := parentOf(grandchild)
+	require.NoError(t, err, "the fake borgmatic must be running to be orphaned")
+
+	// No handler runs, and nothing is forwarded.
+	require.NoError(t, child.Process.Kill())
+	_, _ = child.Process.Wait()
+
+	// The kernel guarantees this one: Pdeathsig is delivered to the direct child
+	// and needs no cooperation from it.
+	assert.Eventually(t, func() bool {
+		return syscall.Kill(leader, 0) != nil
+	}, helperGrace, 20*time.Millisecond, "borgmatic outlived the manager that was killed")
+	// This one runs through borgmatic, which propagates SIGTERM to its process
+	// group. Pdeathsig is per-process and cannot reach borg on its own, so this
+	// asserts the contract with borgmatic rather than a property of the kernel.
+	assert.Eventually(t, func() bool {
+		return syscall.Kill(grandchild, 0) != nil
+	}, helperGrace, 20*time.Millisecond, "borg outlived the manager that was killed")
+}
+
+// parentOf reads a process's ppid from /proc, so the test can name the
+// borgmatic between the manager and the borg it spawned.
+func parentOf(pid int) (int, error) {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	end := strings.LastIndexByte(string(raw), ')')
+	if end < 0 || end+2 >= len(raw) {
+		return 0, fmt.Errorf("cannot parse /proc/%d/stat", pid)
+	}
+	fields := strings.Fields(string(raw[end+2:]))
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("no ppid in /proc/%d/stat", pid)
+	}
+	return strconv.Atoi(fields[1])
+}
+
+// A project id is inode state reached by ioctl, so none of the copying carries
+// it and the replacement starts at project 0. The warning is all this promises,
+// so it has to be accurate in both directions: silent where there is no quota
+// to lose, and specific where there is.
+func TestProjectQuotaWarningOnlyFiresWhenThereIsOneToLose(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	realID := projectQuotaID
+	defer func() { projectQuotaID = realID }()
+
+	for name, tc := range map[string]struct {
+		id       uint64
+		known    bool
+		wantWarn bool
+	}{
+		"under a project quota":         {id: 4242, known: true, wantWarn: true},
+		"project zero, nothing to lose": {id: 0, known: true, wantWarn: false},
+		"filesystem cannot say":         {id: 0, known: false, wantWarn: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			projectQuotaID = func(string) (uint64, bool) { return tc.id, tc.known }
+			logs, logger := capturedWarnLogger()
+			warnAboutProjectQuota(model, logger)
+			if tc.wantWarn {
+				assert.Contains(t, logs.String(), "project quota")
+				assert.Contains(t, logs.String(), "4242", "the id is named so it can be set again")
+			} else {
+				assert.Empty(t, logs.String())
+			}
+		})
+	}
+}
+
+// The reader itself, against whatever this host provides. An ordinary directory
+// must not look like it is under a quota, because a false positive here is a
+// warning that sends an operator looking for a quota that never existed.
+func TestProjectQuotaIDDoesNotInventOneForAnOrdinaryDirectory(t *testing.T) {
+	id, known := projectQuotaID(t.TempDir())
+	if !known {
+		t.Skip("this filesystem does not report project ids")
+	}
+	assert.Zero(t, id, "an ordinary directory is not under a project quota")
+}
+
+// Recovery is reported to the operator as "the volume has been put back", and
+// this restore can still fail for a dozen reasons before it reaches a swap of
+// its own. An unflushed recovery can be rolled back by a power loss after that
+// report, leaving _data missing again with nothing left explaining why.
+func TestRecoverInterruptedSwapFlushesTheRename(t *testing.T) {
+	data := liveVolume(t)
+	require.NoError(t, os.Rename(data, data+oldSuffix)) // interrupted between the renames
+
+	synced := make([]string, 0, 1)
+	realSync := syncDirFn
+	syncDirFn = func(path string) error {
+		synced = append(synced, path)
+		return realSync(path)
+	}
+	defer func() { syncDirFn = realSync }()
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	assert.Equal(t, []string{filepath.Dir(data)}, synced, "the parent was flushed after putting the data back")
+	assert.Equal(t, []string{"original.txt"}, names(t, data))
+}
+
+// A recovery that cannot be made durable must be reported, not reported as
+// success: the operator would otherwise be told the volume is back when a power
+// loss can still take it away again.
+func TestRecoverInterruptedSwapReportsAFlushFailure(t *testing.T) {
+	data := liveVolume(t)
+	require.NoError(t, os.Rename(data, data+oldSuffix))
+
+	realSync := syncDirFn
+	syncDirFn = func(string) error { return errors.New("disk went away") }
+	defer func() { syncDirFn = realSync }()
+
+	err := recoverInterruptedSwap(data, quietLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "may not survive a power loss")
+	assert.DirExists(t, data, "the data really was put back, which the message has to reflect")
 }
