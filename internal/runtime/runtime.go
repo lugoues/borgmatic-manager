@@ -40,8 +40,11 @@ type ContainerInfo struct {
 	Labels map[string]string
 	// Mounts lists named volume mounts (bind/tmpfs excluded).
 	Mounts []VolumeMount
-	// Running is true when the container is currently executing (not merely
-	// present): a restore must not extract into a volume a running app writes.
+	// Running is true while the container still holds its mounts: executing,
+	// paused mid-execution, or restarting. A restore must not write or swap a
+	// volume underneath any of those. A paused container is the trap: its
+	// process still exists and resumes holding the inode it had, so replacing
+	// that inode leaves it writing into an orphaned mount.
 	Running bool
 }
 

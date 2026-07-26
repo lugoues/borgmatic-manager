@@ -36,7 +36,7 @@ func names(t *testing.T, dir string) []string {
 func TestRestoreWithSwapReplacesTheLiveData(t *testing.T) {
 	data := liveVolume(t)
 
-	err := restoreWithSwap(data, quietLogger(), func(dest string) error {
+	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
 	})
 	require.NoError(t, err)
@@ -58,7 +58,7 @@ func TestRestoreWithSwapLeavesLiveDataIntactWhenExtractFails(t *testing.T) {
 	data := liveVolume(t)
 	boom := errors.New("archive was pruned mid-extract")
 
-	err := restoreWithSwap(data, quietLogger(), func(dest string) error {
+	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		// A partial extract, then failure: the realistic shape.
 		require.NoError(t, os.WriteFile(filepath.Join(dest, "half.txt"), []byte("partial"), 0o644))
 		return boom
@@ -76,7 +76,7 @@ func TestRestoreWithSwapLeavesLiveDataIntactWhenExtractFails(t *testing.T) {
 func TestRestoreWithSwapRefusesAnEmptyExtract(t *testing.T) {
 	data := liveVolume(t)
 
-	err := restoreWithSwap(data, quietLogger(), func(string) error { return nil })
+	err := restoreWithSwap(data, quietLogger(), false, func(string) error { return nil })
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "extracted nothing")
@@ -92,7 +92,7 @@ func TestRestoreWithSwapDiscardsLeftoverStaging(t *testing.T) {
 	require.NoError(t, os.MkdirAll(stale, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(stale, "from-a-previous-run.txt"), []byte("stale"), 0o644))
 
-	err := restoreWithSwap(data, quietLogger(), func(dest string) error {
+	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		assert.Empty(t, names(t, dest), "the staging directory starts empty")
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
 	})
@@ -108,7 +108,7 @@ func TestRestoreWithSwapPreservesDirectoryMode(t *testing.T) {
 	before, err := os.Stat(data)
 	require.NoError(t, err)
 
-	require.NoError(t, restoreWithSwap(data, quietLogger(), func(dest string) error {
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("x"), 0o644)
 	}))
 
@@ -212,7 +212,7 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 		}
 	})
 
-	err := restoreWithSwap(data, quietLogger(), func(dest string) error {
+	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
 	})
 
@@ -248,4 +248,17 @@ func TestRecoverInterruptedSwapLeavesAHealthyVolumeAlone(t *testing.T) {
 
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "live data is never overwritten by a leftover")
 	assert.DirExists(t, displaced, "and the leftover is left for the operator to judge")
+}
+
+// A volume that was empty when it was backed up is in the archive as a bare
+// directory. Restoring it back to empty is the correct outcome, so an empty
+// extract must be accepted when the archive says that is what it holds.
+func TestRestoreWithSwapAcceptsAnArchivedEmptyDirectory(t *testing.T) {
+	data := liveVolume(t)
+
+	err := restoreWithSwap(data, quietLogger(), true, func(string) error { return nil })
+
+	require.NoError(t, err, "the archive holds this directory with no children")
+	assert.Empty(t, names(t, data), "the volume is restored to the empty state it was archived in")
+	assert.NoDirExists(t, data+stagingSuffix)
 }

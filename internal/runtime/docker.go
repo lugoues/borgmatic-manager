@@ -134,10 +134,26 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 			Image:   c.Image,
 			Labels:  c.Labels,
 			Mounts:  mounts,
-			Running: c.State == "running",
+			Running: containerHoldsMounts(c.State),
 		})
 	}
 	return infos, nil
+}
+
+// containerHoldsMounts reports whether a container in this state still has its
+// volumes attached to a process that can write to them. "paused" and
+// "restarting" both do, despite not being "running": a paused process resumes
+// with the inode it already had, and a restarting one is about to.
+//
+// The rest have let go. "created" has never started, so its mounts are set up
+// fresh when it does; "exited", "dead", and "removing" have no process at all.
+func containerHoldsMounts(state string) bool {
+	switch state {
+	case "running", "paused", "restarting":
+		return true
+	default:
+		return false
+	}
 }
 
 // relevantActions trigger re-discovery. Docker emits "destroy", podman "remove";

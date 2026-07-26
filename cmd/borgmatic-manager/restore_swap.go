@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -39,7 +41,9 @@ var errStranded = errors.New("restore stranded mid-swap")
 //
 // extract receives the destination to write into and must return a non-nil
 // error if it did not complete.
-func restoreWithSwap(targetData string, logger *slog.Logger, extract func(destination string) error) (err error) {
+// allowEmpty says the archive holds this directory but no children, so an empty
+// extract is the correct result rather than a sign that nothing matched.
+func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, extract func(destination string) error) (err error) {
 	staging := targetData + stagingSuffix
 
 	// A previous run killed between extract and swap leaves this behind. It is
@@ -74,8 +78,15 @@ func restoreWithSwap(targetData string, logger *slog.Logger, extract func(destin
 	if readErr != nil {
 		return fmt.Errorf("reading back the extracted data (the volume is untouched): %w", readErr)
 	}
-	if len(entries) == 0 {
+	if len(entries) == 0 && !allowEmpty {
 		return fmt.Errorf("borgmatic reported success but extracted nothing into %s, so the volume is untouched", staging)
+	}
+
+	// rename gives the namespace change atomically but says nothing about the
+	// contents being on disk. Persist them before the original, which is the
+	// only other durable copy, is deleted.
+	if syncErr := syncTree(staging); syncErr != nil {
+		return fmt.Errorf("flushing the restored data to disk (the volume is untouched): %w", syncErr)
 	}
 
 	displaced, swapErr := swapIntoPlace(staging, targetData)
@@ -83,6 +94,12 @@ func restoreWithSwap(targetData string, logger *slog.Logger, extract func(destin
 		return swapErr
 	}
 	committed = true
+	// Persist the swap itself before removing the copy it replaced, or a power
+	// loss here could replay the deletion without the rename.
+	if syncErr := syncDir(filepath.Dir(targetData)); syncErr != nil {
+		logger.Warn("could not flush the volume directory after the swap; the restore is in place but not yet durable",
+			"path", filepath.Dir(targetData), "error", syncErr)
+	}
 	// The restore is done and live. Failing to delete the copy it replaced is
 	// wasted disk, not a failed restore, so it must not become a nonzero exit
 	// for an operation that succeeded.
@@ -201,6 +218,30 @@ func createStagingLike(staging, model string) error {
 			return err
 		}
 	}
+	return copyAccessControlLists(model, staging)
+}
+
+// aclAttrs are the extended attributes POSIX ACLs live in. Dropping them on the
+// replacement can revoke access the volume's users had, and the default ACL
+// also governs what files created after the restore inherit, so they are copied
+// with the same "an existing one must apply" rule as the SELinux label.
+var aclAttrs = []string{"system.posix_acl_access", "system.posix_acl_default"}
+
+func copyAccessControlLists(from, to string) error {
+	for _, attr := range aclAttrs {
+		value, present, err := readXattr(from, attr)
+		if err != nil {
+			return err
+		}
+		if !present {
+			continue
+		}
+		if err := unix.Lsetxattr(to, attr, value, 0); err != nil {
+			return fmt.Errorf("the volume has a POSIX ACL (%s) that could not be applied to %s, "+
+				"so a swap would change who can reach the restored data (nothing was changed); "+
+				"run the restore as root, or use --merge to write in place: %w", attr, to, err)
+		}
+	}
 	return nil
 }
 
@@ -210,25 +251,36 @@ const seLinuxAttr = "security.selinux"
 // one at all. A host without SELinux, or a filesystem without extended
 // attributes, has nothing to copy and is not an error.
 func readSELinuxContext(path string) (label string, present bool, err error) {
-	// Size first. Contexts with long MCS category sets overflow a fixed buffer,
-	// and a guess that comes up short fails with ERANGE rather than truncating.
-	size, err := unix.Lgetxattr(path, seLinuxAttr, nil)
+	value, present, err := readXattr(path, seLinuxAttr)
+	if err != nil || !present {
+		return "", false, err
+	}
+	label = strings.TrimRight(string(value), "\x00")
+	return label, label != "", nil
+}
+
+// readXattr returns an extended attribute and whether it was set at all. The
+// size is queried first: a fixed buffer that comes up short fails with ERANGE
+// rather than truncating, and SELinux contexts with long MCS category sets do
+// overflow the obvious guesses. Absent, or a filesystem without xattr support,
+// is normal and not an error.
+func readXattr(path, attr string) (value []byte, present bool, err error) {
+	size, err := unix.Lgetxattr(path, attr, nil)
 	if err != nil {
 		if errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
-			return "", false, nil
+			return nil, false, nil
 		}
-		return "", false, fmt.Errorf("reading the SELinux context of %s: %w", path, err)
+		return nil, false, fmt.Errorf("reading %s on %s: %w", attr, path, err)
 	}
 	if size == 0 {
-		return "", false, nil
+		return nil, false, nil
 	}
 	buf := make([]byte, size)
-	n, err := unix.Lgetxattr(path, seLinuxAttr, buf)
+	n, err := unix.Lgetxattr(path, attr, buf)
 	if err != nil {
-		return "", false, fmt.Errorf("reading the SELinux context of %s: %w", path, err)
+		return nil, false, fmt.Errorf("reading %s on %s: %w", attr, path, err)
 	}
-	label = strings.TrimRight(string(buf[:n]), "\x00")
-	return label, label != "", nil
+	return buf[:n], true, nil
 }
 
 // applySELinuxContext copies a label the original definitely had. Failing here
@@ -242,6 +294,60 @@ func applySELinuxContext(path, label string) error {
 			"run the restore as root, or use --merge to write in place: %w", label, path, err)
 	}
 	return nil
+}
+
+// syncTree flushes every file and directory under root, then root itself. A
+// restore is worth little if a power loss just after it can bring back a tree
+// that was never written, so this is deliberately thorough rather than cheap.
+//
+// Every open goes through os.Root, which resolves relative to the staging
+// directory and refuses to escape it. The tree is extracted from an archive, so
+// its shape is not this program's to trust: a path that is a directory when
+// walked and a symlink by the time it is opened would otherwise follow it out.
+func syncTree(root string) error {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = r.Close() }()
+
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		// A symlink has no contents of its own to flush.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		f, openErr := r.Open(rel)
+		if openErr != nil {
+			return openErr
+		}
+		syncErr := f.Sync()
+		if closeErr := f.Close(); syncErr == nil {
+			syncErr = closeErr
+		}
+		return syncErr
+	})
+}
+
+// syncDir flushes a directory entry so renames and creations within it survive
+// a power loss.
+func syncDir(path string) error {
+	// #nosec G304 -- a directory this process is restoring into
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	if closeErr := d.Close(); syncErr == nil {
+		syncErr = closeErr
+	}
+	return syncErr
 }
 
 // stagingPathFor is the staging sibling for a target, exposed so callers can

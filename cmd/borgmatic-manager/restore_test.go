@@ -44,16 +44,28 @@ Need some help? https://torsion.org/borgmatic/#issues
 
 // The probe that gates the destructive wipe: borgmatic's banner is on stdout
 // ahead of borg's entries, so a non-empty stdout is not by itself a match.
-func TestIsArchiveEntryLineSeparatesEntriesFromBanner(t *testing.T) {
+func TestArchiveEntryPathSeparatesEntriesFromBanner(t *testing.T) {
 	lines := strings.Split(strings.TrimRight(listStdoutPathPresent, "\n"), "\n")
 	require.Len(t, lines, 3)
-	assert.False(t, isArchiveEntryLine([]byte(lines[0])), "the banner is not an entry")
-	assert.True(t, isArchiveEntryLine([]byte(lines[1])))
-	assert.True(t, isArchiveEntryLine([]byte(lines[2])))
 
-	assert.False(t, isArchiveEntryLine(nil), "no output is not a match")
-	assert.False(t, isArchiveEntryLine([]byte("{not json")), "a malformed line is not an entry")
-	assert.True(t, isArchiveEntryLine([]byte("  {\"path\": \"x\"}  ")), "surrounding whitespace is tolerated")
+	_, ok := archiveEntryPath([]byte(lines[0]))
+	assert.False(t, ok, "the banner is not an entry")
+
+	dir, ok := archiveEntryPath([]byte(lines[1]))
+	require.True(t, ok)
+	assert.Equal(t, "myvol/_data", dir, "the directory lists as its own entry")
+
+	child, ok := archiveEntryPath([]byte(lines[2]))
+	require.True(t, ok)
+	assert.Equal(t, "myvol/_data/file.txt", child, "and its contents below it")
+
+	_, ok = archiveEntryPath(nil)
+	assert.False(t, ok, "no output is not a match")
+	_, ok = archiveEntryPath([]byte("{not json"))
+	assert.False(t, ok, "a malformed line is not an entry")
+	got, ok := archiveEntryPath([]byte("  {\"path\": \"x\"}  "))
+	require.True(t, ok, "surrounding whitespace is tolerated")
+	assert.Equal(t, "x", got)
 }
 
 // headWriter caps what a chatty failure can cost in memory while keeping the
@@ -80,7 +92,7 @@ func TestFirstNonEmptyLinePicksTheCause(t *testing.T) {
 // The probe must treat a failed borgmatic as "cannot tell", never as "nothing
 // there": returning false with no error would let the caller wipe the target.
 func TestArchivePathPopulatedErrorsWhenBorgmaticFails(t *testing.T) {
-	found, err := archivePathPopulated(context.Background(), "/bin/false", "cfg.yaml", "latest", "myvol/_data")
+	found, _, err := archivePathPopulated(context.Background(), "/bin/false", "cfg.yaml", "latest", "myvol/_data")
 	require.Error(t, err, "a non-zero exit is an error, not an empty result")
 	assert.False(t, found)
 }
@@ -90,7 +102,7 @@ func TestArchivePathPopulatedReadsEntriesFromStdout(t *testing.T) {
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathPresent+"EOF\n"), 0o700))
 
-	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.NoError(t, err)
 	assert.True(t, found, "entries under the path mean the extract has something to write")
 }
@@ -100,7 +112,7 @@ func TestArchivePathPopulatedReportsBannerOnlyAsEmpty(t *testing.T) {
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathAbsent+"EOF\n"), 0o700))
 
-	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.NoError(t, err, "borgmatic exited 0: this is a real answer, not a probe failure")
 	assert.False(t, found, "an archive predating the volume must not be mirrored over live data")
 }
@@ -121,17 +133,21 @@ func TestArchivePathPopulatedStreamsALargeListing(t *testing.T) {
 		"done\n"
 	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
 
+	// Retained heap, not cumulative allocation: the property is that the listing
+	// is never held, and a per-line parse legitimately churns memory the
+	// collector reclaims. TotalAlloc would measure the churn and miss the point.
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	runtime.GC()
 	runtime.ReadMemStats(&after)
 
 	require.NoError(t, err)
 	assert.True(t, found)
-	growth := after.TotalAlloc - before.TotalAlloc
-	assert.Less(t, growth, uint64(32<<20),
-		"the listing must be streamed, not accumulated (allocated %d bytes)", growth)
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	assert.Less(t, retained, int64(8<<20),
+		"the listing must be streamed, not accumulated (retained %d bytes)", retained)
 }
 
 // An entry proves the path is there, but a listing that dies partway through
@@ -147,7 +163,7 @@ func TestArchivePathPopulatedFailsWhenListingDiesAfterAnEntry(t *testing.T) {
 		"exit 2\n"
 	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
 
-	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.Error(t, err, "an entry seen before a failure is not a confirmation")
 	assert.False(t, found)
 	assert.Contains(t, err.Error(), "chunk id mismatch", "the cause reaches the operator")
@@ -173,7 +189,7 @@ func TestArchivePathPopulatedErrorsOnUnreadableStreamWithoutHanging(t *testing.T
 	}
 	done := make(chan result, 1)
 	go func() {
-		found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+		found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 		done <- result{found, err}
 	}()
 
@@ -194,7 +210,7 @@ func TestArchivePathPopulatedPassesExtractArguments(t *testing.T) {
 	argsFile := filepath.Join(dir, "args")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\necho \"$@\" > "+argsFile+"\n"), 0o700))
 
-	_, err := archivePathPopulated(context.Background(), stub, "/tmp/cfg.yaml", "weekly-1", "myvol/_data")
+	_, _, err := archivePathPopulated(context.Background(), stub, "/tmp/cfg.yaml", "weekly-1", "myvol/_data")
 	require.NoError(t, err)
 	recorded, err := os.ReadFile(argsFile)
 	require.NoError(t, err)
@@ -320,4 +336,33 @@ func TestSnapshotVolumeOnBtrfs(t *testing.T) {
 	got, err = os.ReadFile(filepath.Join(snap, "sub", "b.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, "world", string(got))
+}
+
+// The probe answers two questions: is the path in the archive at all, and does
+// it have children. A volume archived while empty is present as a bare
+// directory, and only the second question tells that apart from a path that
+// matched nothing.
+func TestArchivePathPopulatedDistinguishesAnEmptyArchivedDirectory(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	onlyTheDirectory := `/srv/repo: Listing archive host-1
+{"type": "d", "mode": "drwxr-xr-x", "path": "myvol/_data", "size": 0}
+`
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+onlyTheDirectory+"EOF\n"), 0o700))
+
+	found, hasChildren, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	require.NoError(t, err)
+	assert.True(t, found, "the path is in the archive")
+	assert.False(t, hasChildren, "but it held nothing, so restoring to empty is correct")
+}
+
+func TestArchivePathPopulatedReportsChildren(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathPresent+"EOF\n"), 0o700))
+
+	found, hasChildren, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.True(t, hasChildren, "the archive holds files under the path")
 }
