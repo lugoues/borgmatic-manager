@@ -122,7 +122,7 @@ func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	data := liveVolume(t)
 	missingStaging := data + stagingSuffix // deliberately never created
 
-	err := swapIntoPlace(missingStaging, data)
+	_, err := swapIntoPlace(missingStaging, data)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "volume is unchanged")
@@ -141,4 +141,34 @@ func TestCopySELinuxContextIgnoresAbsentLabels(t *testing.T) {
 	require.NoError(t, os.Mkdir(to, 0o755))
 
 	assert.NoError(t, copySELinuxContext(from, to))
+}
+
+// Once the swap lands, the restore has succeeded. Failing to delete the copy it
+// replaced is wasted disk, not a failed restore, and must not turn a completed
+// restore into a nonzero exit that scripts read as "it did not work".
+func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions this test relies on")
+	}
+	data := liveVolume(t)
+	// A subdirectory whose contents cannot be unlinked. The renames still work,
+	// because the volume directory itself stays writable, but removing the
+	// displaced copy afterwards does not.
+	locked := filepath.Join(data, "locked")
+	require.NoError(t, os.Mkdir(locked, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(locked, "pinned.txt"), []byte("pinned"), 0o644))
+	require.NoError(t, os.Chmod(locked, 0o500))
+	// The swap moves it to the displaced path, and it has to be writable again
+	// for TempDir's own cleanup to succeed; chmod wherever it ended up.
+	t.Cleanup(func() {
+		_ = os.Chmod(locked, 0o755)
+		_ = os.Chmod(filepath.Join(data+oldSuffix, "locked"), 0o755)
+	})
+
+	err := restoreWithSwap(data, quietLogger(), func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	})
+
+	require.NoError(t, err, "a cleanup failure must not fail a restore that landed")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restored data is live")
 }

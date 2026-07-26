@@ -70,40 +70,45 @@ func restoreWithSwap(targetData string, logger *slog.Logger, extract func(destin
 		return fmt.Errorf("borgmatic reported success but extracted nothing into %s, so the volume is untouched", staging)
 	}
 
-	if err := swapIntoPlace(staging, targetData); err != nil {
+	displaced, err := swapIntoPlace(staging, targetData)
+	if err != nil {
 		return err
 	}
 	committed = true
+	// The restore is done and live. Failing to delete the copy it replaced is
+	// wasted disk, not a failed restore, so it must not become a nonzero exit
+	// for an operation that succeeded.
+	if rmErr := os.RemoveAll(displaced); rmErr != nil {
+		logger.Warn("restore succeeded, but the data it replaced could not be removed; delete it to reclaim the space",
+			"path", displaced, "error", rmErr)
+	}
 	logger.Info("restore complete", "path", targetData, "entries", len(entries))
 	return nil
 }
 
-// swapIntoPlace makes staging the live data directory. The rename pair is not
-// one atomic step, so the window between them is kept to exactly two syscalls,
-// and a failure in the second puts the original back rather than leaving the
-// volume without a data directory.
-func swapIntoPlace(staging, targetData string) error {
-	displaced := targetData + oldSuffix
+// swapIntoPlace makes staging the live data directory and returns the path the
+// displaced original now sits at, for the caller to dispose of. The rename pair
+// is not one atomic step, so the window between them is kept to exactly two
+// syscalls, and a failure in the second puts the original back rather than
+// leaving the volume without a data directory at all.
+func swapIntoPlace(staging, targetData string) (displaced string, err error) {
+	displaced = targetData + oldSuffix
 	if err := os.RemoveAll(displaced); err != nil {
-		return fmt.Errorf("clearing %s before the swap: %w", displaced, err)
+		return "", fmt.Errorf("clearing %s before the swap: %w", displaced, err)
 	}
 	if err := os.Rename(targetData, displaced); err != nil {
-		return fmt.Errorf("moving the current data aside (the volume is untouched): %w", err)
+		return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w", err)
 	}
 	if err := os.Rename(staging, targetData); err != nil {
 		// Put it back: a volume with no data directory is worse than a failed
 		// restore, and this is the only moment that state can exist.
 		if back := os.Rename(displaced, targetData); back != nil {
-			return fmt.Errorf("restore failed mid-swap and the original could not be put back: "+
+			return "", fmt.Errorf("restore failed mid-swap and the original could not be put back: "+
 				"the data is at %s, move it to %s by hand: %w", displaced, targetData, errors.Join(err, back))
 		}
-		return fmt.Errorf("moving the restored data into place (the volume is unchanged): %w", err)
+		return "", fmt.Errorf("moving the restored data into place (the volume is unchanged): %w", err)
 	}
-	if err := os.RemoveAll(displaced); err != nil {
-		// The restore succeeded; this is only leftover disk usage.
-		return fmt.Errorf("restore succeeded but the replaced data could not be removed, delete %s to reclaim the space: %w", displaced, err)
-	}
-	return nil
+	return displaced, nil
 }
 
 // createStagingLike makes the staging directory carry the same identity as the
