@@ -137,8 +137,13 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// wasted disk, not a failed restore, so it must not become a nonzero exit
 	// for an operation that succeeded.
 	if rmErr := os.RemoveAll(displaced); rmErr != nil {
+		// On the exchange path this *is* the staging path, and the next restore
+		// clears staging as its very first act and refuses to start if it
+		// cannot. Left here, a restore that succeeded today becomes the reason
+		// the next one fails, so move it aside rather than leave it in the way.
+		kept := retainOrWarn(displaced, targetData, logger)
 		logger.Warn("restore succeeded, but the data it replaced could not be removed; delete it to reclaim the space",
-			"path", displaced, "error", rmErr)
+			"path", kept, "error", rmErr)
 	}
 	logger.Info("restore complete", "path", targetData, "entries", len(entries))
 	return nil
