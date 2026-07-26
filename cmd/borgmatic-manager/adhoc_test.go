@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,7 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/lugoues/borgmatic-manager/internal/runner"
+	"github.com/lugoues/borgmatic-manager/internal/state"
 )
 
 func adhocFixture() (*models.BackupState, map[string]config.GroupRunMeta) {
@@ -111,4 +113,43 @@ func TestResolveAdhocTargets_RefusedGroupCannotRun(t *testing.T) {
 	_, err := resolveAdhocTargets(bs, meta, []string{"beta"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refused", "a discovered-but-refused group must fail loudly, not silently skip")
+}
+
+// dbOnlyGroupAllOffline builds the state runAdhoc reaches when a cached
+// database-only group has every container stopped: stripOfflineDatabases removes
+// its last member and leaves the group present but empty.
+func dbOnlyGroupAllOffline(t *testing.T) (*models.BackupState, map[string]config.GroupRunMeta) {
+	t.Helper()
+	bs, meta := adhocFixture()
+	db := models.DatabaseConfig{Type: "postgresql", Name: "app"}
+	bs.Groups["dbonly"] = &models.VolumeGroup{Databases: []models.DatabaseConfig{db}}
+	meta["dbonly"] = config.GroupRunMeta{}
+
+	off := &state.Offline{
+		Volumes:   map[string]map[string]bool{},
+		Databases: map[string]map[string]bool{"dbonly": {db.Type + "/" + db.Name: true}},
+	}
+	stripOfflineDatabases(bs, off, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.Empty(t, bs.Groups["dbonly"].Databases, "the offline database was stripped")
+	return bs, meta
+}
+
+// Scheduler.RunAllGroups skips groups with no volumes and no databases. run --all
+// must agree, or borgmatic is invoked with a config carrying no backup payload.
+func TestResolveAdhocTargets_SkipsGroupEmptiedByOfflineDatabases(t *testing.T) {
+	bs, meta := dbOnlyGroupAllOffline(t)
+
+	targets, err := resolveAdhocTargets(bs, meta, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"alpha"}, targets, "the emptied group is not a run target")
+}
+
+// Naming it explicitly must say why rather than run an empty backup.
+func TestResolveAdhocTargets_NamedEmptyGroupFailsLoudly(t *testing.T) {
+	bs, meta := dbOnlyGroupAllOffline(t)
+
+	_, err := resolveAdhocTargets(bs, meta, []string{"dbonly"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nothing to back up")
+	assert.NotContains(t, err.Error(), "unknown group", "the group exists; it just has no live members")
 }
