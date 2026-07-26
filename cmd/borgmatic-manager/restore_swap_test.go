@@ -135,15 +135,44 @@ func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	assert.NoDirExists(t, data+oldSuffix)
 }
 
-// Not an SELinux host: a context that is not there is normal, not an error,
-// and must not fail the restore.
-func TestReadSELinuxContextTreatsAbsentLabelsAsAbsent(t *testing.T) {
+// Reading a label must succeed on any host and report accurately. Whether one
+// is there is not the test's to assume: on an SELinux system every file carries
+// a context, and on every other system none do. Asserting absence here passed
+// for the wrong reason until it was run on a real enforcing host, where the
+// temp directory came back labelled container_file_t.
+func TestReadSELinuxContextReportsWhatTheHostHas(t *testing.T) {
 	dir := t.TempDir()
 	label, present, err := readSELinuxContext(dir)
 
-	require.NoError(t, err, "no label and no xattr support are both normal")
-	assert.False(t, present)
-	assert.Empty(t, label)
+	require.NoError(t, err, "reading a context is never an error, labelled or not")
+	if present {
+		assert.NotEmpty(t, label, "a host that labels files gives a non-empty context")
+	} else {
+		assert.Empty(t, label, "a host without SELinux has nothing to report")
+	}
+}
+
+// The claim this PR could not check without a real SELinux host: a labelled
+// volume's label reaches the directory that replaces it. Skips where there is
+// no label to carry, which is every non-SELinux host.
+func TestCreateStagingLikeCarriesARealSELinuxLabel(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	want, present, err := readSELinuxContext(model)
+	require.NoError(t, err)
+	if !present {
+		t.Skip("no SELinux label to carry on this host")
+	}
+
+	staging := filepath.Join(dir, "_data"+stagingSuffix)
+	require.NoError(t, createStagingLike(staging, model))
+
+	got, present, err := readSELinuxContext(staging)
+	require.NoError(t, err)
+	require.True(t, present, "the replacement must be labelled, or its container cannot read it")
+	assert.Equal(t, want, got, "and with the same label the original had")
 }
 
 // A label that exists but cannot be applied must stop the restore before the
