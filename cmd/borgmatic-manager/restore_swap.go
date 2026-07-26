@@ -141,7 +141,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		}
 	}
 
-	displaced, swapErr := swapIntoPlaceFn(staging, targetData)
+	displaced, swapErr := swapIntoPlaceFn(staging, targetData, logger)
 	if swapErr != nil {
 		return swapErr
 	}
@@ -208,7 +208,7 @@ var swapIntoPlaceFn = swapIntoPlace
 // Filesystems without it fall back to a pair of renames, which leaves a window
 // of exactly two syscalls; recoverInterruptedSwap repairs that window if the
 // process dies inside it.
-func swapIntoPlace(staging, targetData string) (displaced string, err error) {
+func swapIntoPlace(staging, targetData string, logger *slog.Logger) (displaced string, err error) {
 	switch exErr := unix.Renameat2(unix.AT_FDCWD, staging, unix.AT_FDCWD, targetData, unix.RENAME_EXCHANGE); {
 	case exErr == nil:
 		// The directories traded places: the old data is now under the staging
@@ -221,13 +221,13 @@ func swapIntoPlace(staging, targetData string) (displaced string, err error) {
 		return "", fmt.Errorf("swapping the restored data into place (the volume is untouched): %w", exErr)
 	}
 
-	return swapByRenamePair(staging, targetData)
+	return swapByRenamePair(staging, targetData, logger)
 }
 
 // swapByRenamePair is the swap for filesystems without RENAME_EXCHANGE. It is
 // separate so the rollback below can be exercised directly: on a kernel that
 // does support the atomic exchange, nothing else can reach this code.
-func swapByRenamePair(staging, targetData string) (displaced string, err error) {
+func swapByRenamePair(staging, targetData string, logger *slog.Logger) (displaced string, err error) {
 	// Created rather than merely named, so the name cannot already belong to
 	// something else. unix.Renameat rather than os.Rename below because Go's
 	// wrapper refuses any existing directory while the syscall replaces an empty
@@ -245,7 +245,19 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 	// the rename and the mark produced a missing volume beside an unverifiable
 	// directory, which recovery then refused and left for the operator to sort
 	// out by hand.
-	markAsOurs(targetData)
+	if !markAsOurs(targetData) {
+		// Said before the window opens, not after something has gone wrong in
+		// it. Without a claim on the inode an interruption in the next two
+		// syscalls leaves a volume that recovery cannot put back automatically,
+		// because it will have no way to tell the displaced copy from an
+		// unrelated directory. The restore is still worth doing: both copies
+		// survive and are named here, so the recovery is manual rather than
+		// impossible.
+		logger.Warn("this filesystem cannot record which directory belongs to this restore, and it also has no "+
+			"atomic directory exchange, so if the restore is interrupted in the next moment the volume will have "+
+			"to be put back by hand from the path below",
+			"volume", targetData, "displaced_to", displaced)
+	}
 	if renErr := moveAsideFn(targetData, displaced); renErr != nil {
 		// It never moved, so the claim on it is meaningless and would otherwise
 		// stay on the live volume.
@@ -536,7 +548,7 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 	created := staging
 	defer func() {
 		if err != nil {
-			if rmErr := os.RemoveAll(created); rmErr != nil {
+			if rmErr := removeScratchDir(created); rmErr != nil {
 				logger.Warn("could not remove a staging directory that could not be set up; "+
 					"the volume itself is untouched", "path", created, "error", rmErr)
 			}
@@ -590,7 +602,7 @@ const (
 	fsDaxFlag        = 0x02000000 // FS_DAX_FL
 	fsCasefoldFlag   = 0x40000000 // FS_CASEFOLD_FL
 	inheritableMask  = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
-		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsCasefoldFlag
+		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsDaxFlag | fsCasefoldFlag
 )
 
 // copyInodeFlags carries the model's inheritable inode flags onto staging.
@@ -789,8 +801,8 @@ const scratchMarkerAttr = "user.borgmatic-manager-scratch"
 // extended attributes cannot hold the claim, and the consequence is only that
 // cleanup will later leave the directory alone rather than delete it, which is
 // the safe direction.
-func markAsOurs(path string) {
-	_ = setXattr(path, scratchMarkerAttr, []byte("1"), 0)
+func markAsOurs(path string) bool {
+	return setXattr(path, scratchMarkerAttr, []byte("1"), 0) == nil
 }
 
 // provablyOurs reports whether this tool created path, and whether the question
@@ -846,6 +858,48 @@ func madeByMkdirTemp(name, prefix string) bool {
 	return true
 }
 
+// removeScratchDir deletes a directory this tool created beside a volume.
+//
+// A staging directory made for a btrfs subvolume target is itself a subvolume,
+// and emptying one is not the same as removing it: on a mount that permits
+// creation but not unprivileged subvolume removal, RemoveAll clears the contents
+// and then fails on the root. Left there it is not merely litter, because the
+// next restore tries the same removal and stops on it, so the volume becomes
+// unrestorable until someone deletes it by hand.
+func removeScratchDir(path string) error {
+	rmErr := removeAllFn(path)
+	if rmErr == nil {
+		return nil
+	}
+	subvolume, subErr := isSubvolume(path)
+	if subErr != nil || !subvolume {
+		return rmErr
+	}
+	if delErr := deleteBtrfsSubvolume(path); delErr != nil {
+		return errors.Join(rmErr, delErr)
+	}
+	return nil
+}
+
+// removeAllFn and isSubvolume are seams for a filesystem that empties a
+// directory but refuses to remove its root, which is not one this environment
+// can produce on demand.
+var (
+	removeAllFn = os.RemoveAll
+	isSubvolume = isBtrfsSubvolumeRoot
+)
+
+// deleteBtrfsSubvolume removes a subvolume by the one mechanism that works
+// where rmdir does not.
+var deleteBtrfsSubvolume = func(path string) error {
+	// #nosec G204 -- fixed argv over a path this process created
+	out, err := exec.Command("btrfs", "subvolume", "delete", path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs subvolume delete: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // clearStagingLeftovers removes staging directories a previous run died before
 // finishing. Every one of them was created by MkdirTemp under this tool's
 // prefix, so nothing else can own one.
@@ -870,7 +924,7 @@ func clearStagingLeftovers(targetData string, logger *slog.Logger) error {
 				"path", stale)
 			continue
 		}
-		if rmErr := os.RemoveAll(stale); rmErr != nil {
+		if rmErr := removeScratchDir(stale); rmErr != nil {
 			return fmt.Errorf("clearing a leftover staging directory %s: %w", stale, rmErr)
 		}
 		logger.Warn("removed a staging directory left by a restore that did not finish", "path", stale)
