@@ -94,3 +94,39 @@ func TestIsBtrfsSubvolumeRootIgnoresInode256Elsewhere(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, got, "a non-btrfs path is never a subvolume root")
 }
+
+// A new subvolume has a new subvolume id, so it is a new qgroup: limits and
+// parent assignments are keyed on the old id and stay with the directory this
+// restore is about to delete. Measured rather than assumed, on a real
+// filesystem, because the volume keeps working and nothing else says it has
+// left its quota.
+func TestRestoreWithSwapWarnsThatQgroupsDoNotFollow(t *testing.T) {
+	data := btrfsVolume(t)
+	if !btrfsQuotaEnabled(data) {
+		t.Skip("quotas are not enabled on this btrfs mount (btrfs quota enable <mount>)")
+	}
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, restoreWithSwap(data, logger, false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	assert.Contains(t, logs.String(), "qgroup", "the operator is not told the quota stopped applying")
+	stillSubvol, err := isBtrfsSubvolumeRoot(data)
+	require.NoError(t, err)
+	assert.True(t, stillSubvol, "and it is still a subvolume")
+}
+
+// Without quotas there is nothing to lose, so the warning must not fire.
+func TestRestoreWithSwapIsQuietAboutQgroupsWhenQuotasAreOff(t *testing.T) {
+	data := btrfsVolume(t)
+	if btrfsQuotaEnabled(data) {
+		t.Skip("quotas are enabled on this btrfs mount, so this case cannot be exercised here")
+	}
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, restoreWithSwap(data, logger, false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+	assert.NotContains(t, logs.String(), "qgroup")
+}

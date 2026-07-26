@@ -310,7 +310,7 @@ SURVIVED=$(docker run --rm -v e2e-data-a:/data alpine cat /data/file-a.txt 2>/de
 log "restore-volume leaves no staging directories behind"
 VOLDIR=$(docker volume inspect e2e-data-a --format '{{.Mountpoint}}')
 VOLDIR=$(dirname "$VOLDIR")
-for leftover in "$VOLDIR"/_data.borgmatic-manager-restoring "$VOLDIR"/_data.borgmatic-manager-replaced; do
+for leftover in "$VOLDIR"/_data.borgmatic-manager-restoring* "$VOLDIR"/_data.borgmatic-manager-replaced; do
   [ -e "$leftover" ] && fail "restore left $leftover behind"
 done
 
