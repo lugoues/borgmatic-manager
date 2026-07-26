@@ -887,6 +887,12 @@ func planVolumeRestore(sourceHostPath, into string) (volumeRestorePlan, error) {
 	targetVolume := filepath.Base(filepath.Dir(sourceHostPath))
 	targetData := sourceHostPath
 	if into != "" {
+		// A bare volume name only. Anything with a separator or a ".." escapes
+		// the volumes root once joined, and emptyVolumeData's guard is a
+		// substring test that ".../mnt/volumes/x" would sail straight through.
+		if into != filepath.Clean(into) || strings.ContainsRune(into, filepath.Separator) || into == ".." || into == "." {
+			return volumeRestorePlan{}, fmt.Errorf("--into %q must be a bare volume name, not a path", into)
+		}
 		targetVolume = into
 		targetData = filepath.Join(volumesRoot, into, "_data")
 	}

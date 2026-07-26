@@ -62,6 +62,29 @@ func TestPlanVolumeRestoreSourceAndInto(t *testing.T) {
 	assert.Equal(t, "systemd-app/_data", p.archivePath)
 }
 
+func TestPlanVolumeRestoreRefusesIntoPaths(t *testing.T) {
+	// --merge skips emptyVolumeData entirely, and that guard is only a substring
+	// test for "/volumes/" anyway, so the escape has to be refused here.
+	for _, into := range []string{
+		"../../../srv/x",
+		"../sibling",
+		"sub/vol",
+		"/absolute/vol",
+		"..",
+		".",
+	} {
+		_, err := planVolumeRestore("/var/lib/docker/volumes/myvol/_data", into)
+		require.Error(t, err, "--into %q escapes the volumes root", into)
+		assert.Contains(t, err.Error(), "bare volume name")
+	}
+
+	// Names that merely look path-adjacent are still valid volume names.
+	for _, into := range []string{"myvol-restore", "my.vol", "..vol", "vol.."} {
+		_, err := planVolumeRestore("/var/lib/docker/volumes/myvol/_data", into)
+		assert.NoError(t, err, "--into %q is a legal volume name", into)
+	}
+}
+
 func TestSnapshotVolumeRefusesNonBtrfs(t *testing.T) {
 	dir := t.TempDir() // devcontainer temp is not btrfs
 	_, err := snapshotVolume(context.Background(), dir)
