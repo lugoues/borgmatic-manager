@@ -1345,6 +1345,7 @@ func TestRestoreWithSwapClearsItsOwnLeftovers(t *testing.T) {
 	stale := data + stagingPrefix + "2002"
 	require.NoError(t, os.Mkdir(stale, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(stale, "partial.txt"), []byte("partial"), 0o644))
+	markAsOurs(stale) // it stands in for one this tool created
 
 	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
@@ -1764,6 +1765,7 @@ func TestRecoverInterruptedSwapReapsAbandonedReservations(t *testing.T) {
 	data := liveVolume(t)
 	stale := data + oldPrefix + "8001"
 	require.NoError(t, os.Mkdir(stale, 0o755))
+	markAsOurs(stale) // it stands in for a reservation this tool made
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	assert.NoDirExists(t, stale, "an empty reservation beside an intact volume is rubbish")
@@ -1810,7 +1812,9 @@ func TestRecoverInterruptedSwapRestoresAnEmptyVolume(t *testing.T) {
 // reservation is provably not the volume.
 func TestRecoverInterruptedSwapIgnoresAReservationAlongsideRealData(t *testing.T) {
 	data := liveVolume(t)
-	require.NoError(t, os.Mkdir(data+oldPrefix+"8001", 0o755))
+	abandoned := data + oldPrefix + "8001"
+	require.NoError(t, os.Mkdir(abandoned, 0o755))
+	markAsOurs(abandoned)
 	require.NoError(t, os.Rename(data, data+oldPrefix+"8002"))
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
@@ -1898,4 +1902,73 @@ func TestCreateStagingLikeRemovesAnAclTheVolumeDoesNotHave(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, removed["system.posix_acl_access"], "an inherited access ACL must be cleared")
 	assert.True(t, removed["system.posix_acl_default"], "and an inherited default ACL with it")
+}
+
+// A name is not a signature. A directory an application happens to call
+// <volume>.borgmatic-manager-restoring-1234 has the exact shape MkdirTemp
+// produces, so shape alone sent it to a recursive delete.
+func TestRestoreWithSwapLeavesAnUnmarkedStagingLookalikeAlone(t *testing.T) {
+	data := liveVolume(t)
+	impostor := data + stagingPrefix + "1234" // right shape, never created by us
+	require.NoError(t, os.Mkdir(impostor, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(impostor, "someone-elses.txt"), []byte("keep"), 0o644))
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, restoreWithSwap(data, logger, false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restore still happened")
+	assert.FileExists(t, filepath.Join(impostor, "someone-elses.txt"),
+		"a directory with the right name but no mark was deleted")
+	assert.Contains(t, logs.String(), "carries no mark")
+}
+
+// And the mark must not travel into the volume: what gets promoted is no longer
+// scratch, and a stray marker would make the live volume look like one.
+func TestRestoreWithSwapDoesNotPromoteTheScratchMark(t *testing.T) {
+	data := liveVolume(t)
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		ours, err := provablyOurs(dest)
+		require.NoError(t, err)
+		if !ours {
+			t.Skip("this filesystem cannot hold the marker, so there is nothing to clear")
+		}
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	marked, err := provablyOurs(data)
+	require.NoError(t, err)
+	assert.False(t, marked, "the promoted volume still carries the scratch mark")
+}
+
+// MkdirTemp replaces the last star in its pattern rather than appending, so a
+// target basename containing one had the random suffix substituted into the
+// middle of the name and the result no longer began with the prefix recovery
+// searches for.
+func TestScratchNamesStayFindableWhenTheTargetContainsAStar(t *testing.T) {
+	// The star has to be in the *final* component, because that is what reaches
+	// MkdirTemp as pattern syntax. A symlink-backed volume resolving to
+	// /srv/app/weird*data is how this arises. Putting it in a parent directory
+	// instead proves nothing, which is how the first version of this test passed
+	// against the broken implementation.
+	root := t.TempDir()
+	data := filepath.Join(root, "volumes", "myvol", "weird*data")
+	require.NoError(t, os.MkdirAll(data, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(data, "original.txt"), []byte("original"), 0o644))
+
+	// The displaced name a rename-pair swap reserves has to be discoverable by
+	// the recovery that looks for it afterwards.
+	staging, err := createStagingLike(data, quietLogger())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
+	displaced, err := swapByRenamePair(staging, data)
+	require.NoError(t, err)
+	assert.Equal(t, []string{displaced}, displacedDirsFor(t, data),
+		"the displaced copy must be findable by the prefix recovery searches for")
+
+	// And that is exactly what makes an interrupted swap recoverable.
+	require.NoError(t, os.RemoveAll(data))
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume came back")
 }
