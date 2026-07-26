@@ -121,6 +121,16 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		return fmt.Errorf("flushing the restored data to disk (the volume is untouched): %w", syncErr)
 	}
 
+	// Off before it becomes the volume: the mark says "scratch", and this
+	// directory is about to stop being scratch. Before the read-only step, not
+	// after: that step is the last thing that can write to this directory at
+	// all, and clearing an extended attribute on a read-only subvolume fails
+	// with EROFS.
+	if unmarkErr := removeXattr(staging, scratchMarkerAttr); unmarkErr != nil {
+		return fmt.Errorf("clearing the scratch mark on %s before promoting it (the volume is untouched): %w",
+			staging, unmarkErr)
+	}
+
 	// After the extract, before the swap: borg has to be able to write into
 	// staging, so this is the last moment it can be made read-only and the
 	// first at which doing so is harmless.
@@ -206,10 +216,11 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 	// something else. unix.Renameat rather than os.Rename below because Go's
 	// wrapper refuses any existing directory while the syscall replaces an empty
 	// one, which is exactly what this placeholder is.
-	displaced, err = os.MkdirTemp(filepath.Dir(targetData), filepath.Base(targetData)+oldPrefix)
+	displaced, err = os.MkdirTemp(filepath.Dir(targetData), scratchPattern(targetData, oldPrefix))
 	if err != nil {
 		return "", fmt.Errorf("reserving a name to move the current data aside (the volume is untouched): %w", err)
 	}
+	markAsOurs(displaced)
 	if renErr := unix.Renameat(unix.AT_FDCWD, targetData, unix.AT_FDCWD, displaced); renErr != nil {
 		if rmErr := os.Remove(displaced); rmErr != nil {
 			return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w",
@@ -321,6 +332,15 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 				logger.Warn("a directory displaced by an earlier restore is beside this volume and holds data; "+
 					"the volume itself is fine, so remove it once you have looked at it",
 					"path", m, "volume", targetData)
+				continue
+			}
+			ours, ownErr := provablyOurs(m)
+			if ownErr != nil {
+				return ownErr
+			}
+			if !ours {
+				logger.Warn("an empty directory beside this volume is named like a reservation this tool makes "+
+					"but carries no mark showing it created it, so it is being left alone", "path", m)
 				continue
 			}
 			// Left in place these accumulate, and a later genuine interruption
@@ -492,6 +512,7 @@ const (
 	fsSyncFlag       = 0x00000008 // FS_SYNC_FL
 	fsDirSyncFlag    = 0x00010000 // FS_DIRSYNC_FL
 	fsNoCompressFlag = 0x00000400 // FS_NOCOMP_FL
+	fsDaxFlag        = 0x02000000 // FS_DAX_FL
 	fsCasefoldFlag   = 0x40000000 // FS_CASEFOLD_FL
 	inheritableMask  = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
 		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsCasefoldFlag
@@ -626,7 +647,7 @@ var projectQuotaID = func(path string) (uint64, bool) {
 // in-place restore only ever wrote inside _data, so a volume whose parent is
 // not writable becomes impossible to mirror unless this is noticed first.
 func canCreateSibling(targetData string) (bool, error) {
-	probe, err := os.MkdirTemp(filepath.Dir(targetData), filepath.Base(targetData)+stagingPrefix)
+	probe, err := os.MkdirTemp(filepath.Dir(targetData), scratchPattern(targetData, stagingPrefix))
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS) {
 			return false, nil
@@ -670,6 +691,50 @@ func siblingsWithPrefix(targetData, prefix string) (siblings []string, enumerabl
 	return out, true, nil
 }
 
+// scratchMarkerAttr is set on every scratch directory this tool creates beside a
+// volume, so cleanup can delete on proof rather than on a filename.
+//
+// A name only ever showed that something *looks* like ours. The prefix is
+// public and the digits after it are not a signature, so a directory an
+// application happens to call <volume>.borgmatic-manager-restoring-1234 matched
+// and was recursively deleted. An attribute this process wrote is a fact about
+// who made the directory.
+//
+// It is removed just before the swap, so it never reaches the live volume, and
+// it costs nothing in the emptiness check because an extended attribute is not
+// a directory entry.
+const scratchMarkerAttr = "user.borgmatic-manager-scratch"
+
+// markAsOurs claims a scratch directory. Best effort: a filesystem without user
+// extended attributes cannot hold the claim, and the consequence is only that
+// cleanup will later leave the directory alone rather than delete it, which is
+// the safe direction.
+func markAsOurs(path string) {
+	_ = setXattr(path, scratchMarkerAttr, []byte("1"), 0)
+}
+
+// provablyOurs reports whether this tool created path.
+func provablyOurs(path string) (bool, error) {
+	_, present, err := readXattrFn(path, scratchMarkerAttr)
+	if err != nil {
+		return false, err
+	}
+	return present, nil
+}
+
+// scratchPattern builds the MkdirTemp pattern for a scratch directory beside
+// targetData.
+//
+// The trailing star is the point. MkdirTemp replaces the *last* star in the
+// pattern rather than appending to it, so a target basename that itself
+// contains one has the random suffix substituted into the middle of the name:
+// "star*name.borgmatic-manager-replaced-" becomes "star4201828873name...",
+// which no longer begins with the prefix the recovery searches for. Supplying
+// the final star keeps everything before it literal.
+func scratchPattern(targetData, prefix string) string {
+	return filepath.Base(targetData) + prefix + "*"
+}
+
 // madeByMkdirTemp reports whether name is one MkdirTemp could have produced for
 // this prefix: the prefix followed by its random digits and nothing else.
 //
@@ -704,6 +769,16 @@ func clearStagingLeftovers(targetData string, logger *slog.Logger) error {
 		return nil
 	}
 	for _, stale := range matches {
+		ours, ownErr := provablyOurs(stale)
+		if ownErr != nil {
+			return ownErr
+		}
+		if !ours {
+			logger.Warn("a directory beside this volume is named like a staging directory but carries no mark "+
+				"showing this tool created it, so it is being left alone; remove it yourself if it is not wanted",
+				"path", stale)
+			continue
+		}
 		if rmErr := os.RemoveAll(stale); rmErr != nil {
 			return fmt.Errorf("clearing a leftover staging directory %s: %w", stale, rmErr)
 		}
@@ -853,7 +928,7 @@ const btrfsSubvolumeRootInode = 256
 // Created restrictively and widened afterwards: MkdirTemp makes it 0700, and
 // umask would mask an intended mode passed to Mkdir anyway.
 func createStagingDir(model string, logger *slog.Logger) (string, error) {
-	staging, err := os.MkdirTemp(filepath.Dir(model), filepath.Base(model)+stagingPrefix)
+	staging, err := os.MkdirTemp(filepath.Dir(model), scratchPattern(model, stagingPrefix))
 	if err != nil {
 		return "", err
 	}
@@ -862,6 +937,7 @@ func createStagingDir(model string, logger *slog.Logger) (string, error) {
 		return "", err
 	}
 	if !subvolume {
+		markAsOurs(staging)
 		return staging, nil
 	}
 	// Replace the placeholder with a subvolume of the same name. Safe rather
@@ -881,6 +957,7 @@ func createStagingDir(model string, logger *slog.Logger) (string, error) {
 		if mkErr := os.Mkdir(staging, 0o700); mkErr != nil {
 			return "", mkErr
 		}
+		markAsOurs(staging)
 		return staging, nil
 	}
 	// A new subvolume has a new subvolume id, so it is a new qgroup. Limits and
@@ -898,6 +975,7 @@ func createStagingDir(model string, logger *slog.Logger) (string, error) {
 	if err := os.Chmod(staging, 0o700); err != nil {
 		return "", err
 	}
+	markAsOurs(staging)
 	return staging, nil
 }
 
@@ -1274,7 +1352,7 @@ func retainOutOfTheWay(from, targetData string) (string, error) {
 	// somehow got into it makes the rename fail rather than discard it.
 	stamp := time.Now().Format("20060102-150405")
 	kept, err := os.MkdirTemp(filepath.Dir(targetData),
-		fmt.Sprintf("%s.borgmatic-manager-kept-%s-", filepath.Base(targetData), stamp))
+		scratchPattern(targetData, fmt.Sprintf(".borgmatic-manager-kept-%s-", stamp)))
 	if err != nil {
 		return "", fmt.Errorf("reserving a name to keep %s under: %w", from, err)
 	}
