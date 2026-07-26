@@ -30,6 +30,7 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/events"
 	"github.com/lugoues/borgmatic-manager/internal/lockfile"
+	"github.com/lugoues/borgmatic-manager/internal/metrics"
 	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/lugoues/borgmatic-manager/internal/orchestrator"
 	"github.com/lugoues/borgmatic-manager/internal/runner"
@@ -385,6 +386,25 @@ func (e *env) newRunner(logger *slog.Logger, configDir, borgmaticPath string, ru
 	return r
 }
 
+// recorderChain fans a run outcome out to several recorders (the schedule store
+// to persist it, the metrics emitter to count it).
+type recorderChain []runner.Recorder
+
+func (c recorderChain) RecordRun(group string, o state.RunOutcome) {
+	for _, rec := range c {
+		rec.RecordRun(group, o)
+	}
+}
+
+// metricsProtocol reports the OTLP transport for the startup log; empty config
+// defaults to http.
+func metricsProtocol(m config.MetricsSettings) string {
+	if m.Protocol == "" {
+		return "http"
+	}
+	return m.Protocol
+}
+
 // reapStalePendingRuns reaps dump helpers left by a manager process that died
 // mid-run. Liveness comes from the per-run advisory lock (kernel-dropped on
 // crash); no-lock-file records fall back to the stamped PID, biased to keep.
@@ -584,6 +604,27 @@ func runDaemon() error {
 	sweepOrphanedPendingLocks(locksDir, store)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
 	s.SetGroupCache(state.LoadGroupCache(e.stateDir, slog.Default()))
+
+	// Metrics are best-effort: a failed exporter must never stop backups. When
+	// enabled, the emitter both counts runs (composed onto the recorder) and
+	// feeds the offline-volume gauge from each cycle's inventory.
+	if e.cfg.Manager.Metrics.Enabled {
+		if emitter, err := metrics.New(ctx, e.cfg.Manager.Metrics, version, store, slog.Default()); err != nil {
+			slog.Warn("metrics disabled: exporter setup failed", "error", err)
+		} else {
+			r.SetRecorder(recorderChain{store, emitter})
+			s.SetCycleObserver(emitter.ObserveInventory)
+			defer func() {
+				sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := emitter.Shutdown(sctx); err != nil {
+					slog.Warn("flushing metrics on shutdown failed", "error", err)
+				}
+			}()
+			slog.Info("metrics enabled", "protocol", metricsProtocol(e.cfg.Manager.Metrics), "endpoint", e.cfg.Manager.Metrics.Endpoint)
+		}
+	}
+
 	l := events.NewListener(e.rt, slog.Default())
 	o := orchestrator.NewOrchestrator(s, l, slog.Default())
 
