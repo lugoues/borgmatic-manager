@@ -59,7 +59,7 @@ func TestRestoreWithSwapReplacesTheLiveData(t *testing.T) {
 
 	// Neither scratch directory outlives the operation.
 	assert.Empty(t, stagingDirsFor(t, data))
-	assert.NoDirExists(t, data+oldSuffix)
+	assert.Empty(t, displacedDirsFor(t, data))
 }
 
 // The whole point: a failed extract must cost the operator nothing. Before
@@ -141,7 +141,7 @@ func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "volume is unchanged")
 	require.DirExists(t, data, "the original was put back rather than left displaced")
 	assert.Equal(t, []string{"original.txt"}, names(t, data))
-	assert.NoDirExists(t, data+oldSuffix)
+	assert.Empty(t, displacedDirsFor(t, data))
 }
 
 // Reading a label must succeed on any host and report accurately. Whether one
@@ -264,7 +264,10 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 	// it clear of the staging path. Make it writable again wherever it ended up,
 	// or TempDir's own cleanup fails.
 	t.Cleanup(func() {
-		paths := []string{locked, filepath.Join(data+oldSuffix, "locked")}
+		paths := []string{locked}
+		for _, dd := range displacedDirsFor(t, data) {
+			paths = append(paths, filepath.Join(dd, "locked"))
+		}
 		for _, sd := range stagingDirsFor(t, data) {
 			paths = append(paths, filepath.Join(sd, "locked"))
 		}
@@ -290,7 +293,7 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 // know to go looking for it.
 func TestRecoverInterruptedSwapPutsTheDataBack(t *testing.T) {
 	data := liveVolume(t)
-	displaced := data + oldSuffix
+	displaced := data + oldPrefix + "interrupted"
 	require.NoError(t, os.Rename(data, displaced)) // interrupted between the renames
 	require.NoDirExists(t, data)
 
@@ -304,7 +307,7 @@ func TestRecoverInterruptedSwapPutsTheDataBack(t *testing.T) {
 func TestRecoverInterruptedSwapLeavesAHealthyVolumeAlone(t *testing.T) {
 	data := liveVolume(t)
 	// A displaced copy from some earlier run, with the volume perfectly fine.
-	displaced := data + oldSuffix
+	displaced := data + oldPrefix + "interrupted"
 	require.NoError(t, os.Mkdir(displaced, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(displaced, "stale.txt"), []byte("stale"), 0o644))
 
@@ -663,7 +666,7 @@ func TestResolveVolumeDataResolvesThroughADanglingLink(t *testing.T) {
 	assert.Equal(t, target, resolved, "an intact link resolves to what it names")
 
 	// The state an interrupted rename-pair swap leaves behind.
-	require.NoError(t, os.Rename(target, target+oldSuffix))
+	require.NoError(t, os.Rename(target, target+oldPrefix+"interrupted"))
 	require.NoFileExists(t, target)
 
 	resolved, err = resolveVolumeData(data)
@@ -672,7 +675,7 @@ func TestResolveVolumeDataResolvesThroughADanglingLink(t *testing.T) {
 
 	require.NoError(t, recoverInterruptedSwap(resolved, quietLogger()))
 	assert.DirExists(t, target, "the displaced backing directory was put back")
-	assert.NoDirExists(t, target+oldSuffix)
+	assert.Empty(t, displacedDirsFor(t, target))
 }
 
 // The wipe guard asks whether this is a container volume. Resolving the
@@ -1285,14 +1288,15 @@ func TestIsEncryptedDirIsFalseForAnOrdinaryDirectory(t *testing.T) {
 		"its parent":     filepath.Dir(t.TempDir()),
 		"a volume _data": liveVolume(t),
 	} {
-		got, err := isEncryptedDir(path)
+		blocks, reason, err := encryptionBlocksStaging(path)
 		require.NoError(t, err, "%s: reporting on encryption must not fail", name)
-		assert.False(t, got, "%s: an unencrypted directory must never be treated as encrypted", name)
+		assert.False(t, blocks, "%s: an unencrypted directory must never be pushed off the staged path", name)
+		assert.Empty(t, reason, "%s: and there is nothing to explain", name)
 	}
 }
 
 func TestIsEncryptedDirReportsAMissingPath(t *testing.T) {
-	_, err := isEncryptedDir(filepath.Join(t.TempDir(), "nope"))
+	_, _, err := encryptionBlocksStaging(filepath.Join(t.TempDir(), "nope"))
 	require.Error(t, err, "a path that cannot be inspected is not the same as one that is unencrypted")
 }
 
@@ -1503,7 +1507,7 @@ func TestProjectQuotaIDDoesNotInventOneForAnOrdinaryDirectory(t *testing.T) {
 // report, leaving _data missing again with nothing left explaining why.
 func TestRecoverInterruptedSwapFlushesTheRename(t *testing.T) {
 	data := liveVolume(t)
-	require.NoError(t, os.Rename(data, data+oldSuffix)) // interrupted between the renames
+	require.NoError(t, os.Rename(data, data+oldPrefix+"interrupted")) // interrupted between the renames
 
 	synced := make([]string, 0, 1)
 	realSync := syncDirFn
@@ -1523,7 +1527,7 @@ func TestRecoverInterruptedSwapFlushesTheRename(t *testing.T) {
 // loss can still take it away again.
 func TestRecoverInterruptedSwapReportsAFlushFailure(t *testing.T) {
 	data := liveVolume(t)
-	require.NoError(t, os.Rename(data, data+oldSuffix))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"interrupted"))
 
 	realSync := syncDirFn
 	syncDirFn = func(string) error { return errors.New("disk went away") }
@@ -1533,4 +1537,82 @@ func TestRecoverInterruptedSwapReportsAFlushFailure(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "may not survive a power loss")
 	assert.DirExists(t, data, "the data really was put back, which the message has to reflect")
+}
+
+// displacedDirsFor lists the directories a rename-pair swap displaced beside a
+// volume's data path. Unique per run, so tests look them up.
+func displacedDirsFor(t *testing.T, data string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(data + oldPrefix + "*")
+	require.NoError(t, err)
+	return matches
+}
+
+// The fallback swap used to clear a fixed displaced name before renaming onto
+// it, which recursively deleted whatever was there. For a symlink-backed volume
+// the resolved target sits in a directory an application owns, so a restore
+// could erase unrelated data before it had touched the volume at all.
+func TestSwapByRenamePairDoesNotDeleteAnUnrelatedSibling(t *testing.T) {
+	data := liveVolume(t)
+	bystander := data + ".borgmatic-manager-replaced" // the name the old scheme claimed
+	require.NoError(t, os.Mkdir(bystander, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bystander, "someone-elses.txt"), []byte("keep"), 0o644))
+
+	staging, err := createStagingLike(data, quietLogger())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
+
+	displaced, err := swapByRenamePair(staging, data)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the swap still happened")
+	assert.Equal(t, []string{"original.txt"}, names(t, displaced), "and the old data is where it says")
+	assert.FileExists(t, filepath.Join(bystander, "someone-elses.txt"),
+		"a directory this restore did not create was deleted")
+}
+
+// Recovery has to find a displaced copy whose name it no longer knows in
+// advance, and must not guess when there is more than one.
+func TestRecoverInterruptedSwapFindsAUniquelyNamedDisplacedCopy(t *testing.T) {
+	data := liveVolume(t)
+	displaced := data + oldPrefix + "abc123"
+	require.NoError(t, os.Rename(data, displaced))
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	require.DirExists(t, data)
+	assert.Equal(t, []string{"original.txt"}, names(t, data))
+	assert.Empty(t, displacedDirsFor(t, data))
+}
+
+func TestRecoverInterruptedSwapRefusesToGuessBetweenTwo(t *testing.T) {
+	data := liveVolume(t)
+	require.NoError(t, os.Rename(data, data+oldPrefix+"first"))
+	require.NoError(t, os.Mkdir(data+oldPrefix+"second", 0o755))
+
+	err := recoverInterruptedSwap(data, quietLogger())
+	require.Error(t, err, "picking one of two copies of a volume's data is not this program's call")
+	assert.Contains(t, err.Error(), "by hand")
+	assert.NoDirExists(t, data, "and nothing was moved")
+}
+
+// Staging an encrypted directory replaces it with plaintext and reports
+// success. Restoring in place unnecessarily only gives up the safety net. The
+// two are not symmetric, so anything undetermined must block staging.
+func TestEncryptionBlocksStagingWhenItCannotBeDetermined(t *testing.T) {
+	dir := t.TempDir()
+	blocks, reason, err := encryptionBlocksStaging(dir)
+	require.NoError(t, err)
+	require.False(t, blocks, "precondition: this host can answer the question")
+	require.Empty(t, reason)
+
+	// A kernel without statx, which is where fscrypt can exist unseen: fscrypt
+	// predates statx, so this is not hypothetical.
+	realStatx := statxFn
+	statxFn = func(int, string, int, int, *unix.Statx_t) error { return unix.ENOSYS }
+	defer func() { statxFn = realStatx }()
+
+	blocks, reason, err = encryptionBlocksStaging(dir)
+	require.NoError(t, err, "an unanswerable question is not an error, it is an answer of its own")
+	assert.True(t, blocks, "unknown must not be read as unencrypted")
+	assert.Contains(t, reason, "cannot be determined")
 }
