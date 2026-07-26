@@ -1256,8 +1256,14 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	// Armed before the child exists. A signal landing between Start and Notify
 	// would otherwise take the default action, killing the manager and leaving
 	// borgmatic writing into the volume with nothing supervising it.
+	//
+	// SIGHUP is on the list for that reason and not because anything here wants
+	// to reload: its default action is also to terminate, and it arrives on its
+	// own whenever a controlling terminal goes away, so leaving it unhandled
+	// means closing the terminal on a merge or forced in-place restore kills the
+	// manager while borgmatic keeps writing into the live volume.
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
 
 	if err := cmd.Start(); err != nil {
