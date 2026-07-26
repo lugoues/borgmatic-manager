@@ -59,12 +59,13 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		return fmt.Errorf("clearing a leftover staging directory %s: %w", staging, rmErr)
 	}
 
-	if createErr := createStagingLike(staging, targetData); createErr != nil {
-		return createErr
-	}
+	// Registered before the directory exists, so a createStagingLike that fails
+	// partway through its owner/mode/label work does not leave a half-built
+	// directory behind. RemoveAll on a path that was never created is a no-op.
+	//
 	// Any failure before the swap discards the staging directory and leaves the
-	// live data exactly as it was. The one exception is a stranded swap, where
-	// staging holds the only copy of the restored data.
+	// live data exactly as it was. The exceptions are a stranded swap and an
+	// aborted recheck, where staging holds the only copy of the restored data.
 	committed, keepStaging := false, false
 	defer func() {
 		if committed || keepStaging || errors.Is(err, errStranded) {
@@ -75,6 +76,10 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 				"staging", staging, "error", rmErr)
 		}
 	}()
+
+	if createErr := createStagingLike(staging, targetData); createErr != nil {
+		return createErr
+	}
 
 	if extractErr := extract(staging); extractErr != nil {
 		return fmt.Errorf("extracting into %s (the volume is untouched): %w", staging, extractErr)
