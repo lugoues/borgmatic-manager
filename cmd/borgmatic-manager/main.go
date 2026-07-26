@@ -733,9 +733,22 @@ func classifyAdhocOutcome(acquired bool, runErr error, interrupted bool) adhocOu
 // resolveAdhocTargets returns the groups to back up: all that generated a config
 // when none are named, otherwise the named ones, validated against refusals.
 func resolveAdhocTargets(backupState *models.BackupState, meta map[string]config.GroupRunMeta, requested []string) ([]string, error) {
+	// A group can reach here with no members: stripOfflineDatabases empties a
+	// database-only group whose every container is offline. Scheduler.RunAllGroups
+	// skips those, and so must this, or borgmatic is handed a config with no
+	// backup payload and either fails the whole ad-hoc command or records a
+	// meaningless empty archive.
+	empty := func(name string) bool {
+		g, ok := backupState.Groups[name]
+		return ok && len(g.Volumes) == 0 && len(g.Databases) == 0
+	}
+
 	if len(requested) == 0 {
 		names := make([]string, 0, len(meta))
 		for name := range meta {
+			if empty(name) {
+				continue
+			}
 			names = append(names, name)
 		}
 		sort.Strings(names)
@@ -746,6 +759,9 @@ func resolveAdhocTargets(backupState *models.BackupState, meta map[string]config
 	for _, name := range requested {
 		if _, ok := backupState.Groups[name]; !ok {
 			return nil, fmt.Errorf("unknown group %q; %s", name, discoveredGroupList(backupState))
+		}
+		if empty(name) {
+			return nil, fmt.Errorf("group %q has nothing to back up: no volumes, and no database whose container is running", name)
 		}
 		if _, ok := meta[name]; !ok {
 			return nil, fmt.Errorf("group %q was refused by generation (see warnings above) and cannot be run", name)
