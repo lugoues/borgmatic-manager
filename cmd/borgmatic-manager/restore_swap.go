@@ -2,9 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -77,7 +77,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		}
 	}()
 
-	if createErr := createStagingLike(staging, targetData); createErr != nil {
+	if createErr := createStagingLike(staging, targetData, logger); createErr != nil {
 		return createErr
 	}
 
@@ -96,7 +96,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// rename gives the namespace change atomically but says nothing about the
 	// contents being on disk. Persist them before the original, which is the
 	// only other durable copy, is deleted.
-	if syncErr := syncTree(staging); syncErr != nil {
+	if syncErr := syncStagedData(filepath.Dir(targetData)); syncErr != nil {
 		return fmt.Errorf("flushing the restored data to disk (the volume is untouched): %w", syncErr)
 	}
 
@@ -203,6 +203,41 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 // between the fallback path's two renames. Without this the next restore stops
 // at "data directory is not present" and the operator has to know to go looking
 // for a suffixed directory.
+// resolveVolumeData resolves a volume's _data to the directory it actually
+// names, so staging lands beside the real directory and the swap replaces that
+// rather than the link pointing at it.
+//
+// A missing final component is not an error here. When _data is a symlink into
+// a backing directory, an interrupted rename-pair swap leaves that directory
+// under its suffixed name and the link dangling, which is precisely the state
+// recovery exists to repair. EvalSymlinks fails outright on it, so the last
+// component is resolved by hand and only the path above it is required to
+// exist.
+func resolveVolumeData(targetData string) (string, error) {
+	if resolved, err := filepath.EvalSymlinks(targetData); err == nil {
+		return resolved, nil
+	}
+	info, err := os.Lstat(targetData)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		// Not a symlink, so there is nothing here to resolve. Whatever is wrong
+		// with the path is reported by the caller's own existence check, which
+		// can say more about it than this function can.
+		return targetData, nil
+	}
+	link, err := os.Readlink(targetData)
+	if err != nil {
+		return "", fmt.Errorf("reading the symlink at %s: %w", targetData, err)
+	}
+	if !filepath.IsAbs(link) {
+		link = filepath.Join(filepath.Dir(targetData), link)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(link))
+	if err != nil {
+		return "", fmt.Errorf("%s points into %s, which could not be resolved: %w", targetData, filepath.Dir(link), err)
+	}
+	return filepath.Join(parent, filepath.Base(link)), nil
+}
+
 func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 	if _, err := os.Lstat(targetData); err == nil || !os.IsNotExist(err) {
 		return nil // present, or unreadable for some other reason: nothing to do
@@ -225,7 +260,7 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 // SELinux context. A fresh directory would otherwise get the creating process's
 // defaults, and on an SELinux host a volume relabelled that way stops being
 // readable by the container that owns it.
-func createStagingLike(staging, model string) error {
+func createStagingLike(staging, model string, logger *slog.Logger) error {
 	info, err := os.Stat(model)
 	if err != nil {
 		return fmt.Errorf("inspecting %s: %w", model, err)
@@ -257,7 +292,10 @@ func createStagingLike(staging, model string) error {
 			return err
 		}
 	}
-	return copyAccessControlLists(model, staging)
+	if err := copyAccessControlLists(model, staging); err != nil {
+		return err
+	}
+	return copyRemainingXattrs(model, staging, logger)
 }
 
 // aclAttrs are the extended attributes POSIX ACLs live in. Dropping them on the
@@ -293,6 +331,10 @@ const seLinuxAttr = "security.selinux"
 // is not, and needs a real one.
 var setXattr = unix.Lsetxattr
 
+// listXattrsFn is the seam for enumerating attributes, so a test can present a
+// volume carrying attributes this filesystem cannot actually hold.
+var listXattrsFn = listXattrs
+
 // readXattrFn is the matching read seam, so a test can present a label on a
 // kernel that has none.
 var readXattrFn = readXattr
@@ -314,6 +356,87 @@ func readSELinuxContext(path string) (label string, present bool, err error) {
 // rather than truncating, and SELinux contexts with long MCS category sets do
 // overflow the obvious guesses. Absent, or a filesystem without xattr support,
 // is normal and not an error.
+// listXattrs names every extended attribute on path. A filesystem without
+// xattr support reports none rather than failing: there is then nothing to
+// preserve.
+func listXattrs(path string) ([]string, error) {
+	size, err := unix.Llistxattr(path, nil)
+	if err != nil {
+		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing the extended attributes on %s: %w", path, err)
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, size)
+	n, err := unix.Llistxattr(path, buf)
+	if err != nil {
+		return nil, fmt.Errorf("listing the extended attributes on %s: %w", path, err)
+	}
+	var names []string
+	for _, name := range bytes.Split(buf[:n], []byte{0}) {
+		if len(name) > 0 {
+			names = append(names, string(name))
+		}
+	}
+	return names, nil
+}
+
+// copyRemainingXattrs copies the extended attributes the SELinux and ACL steps
+// do not already set from the model.
+//
+// The in-place restore kept the directory's own inode, so anything an
+// application had labelled its volume root with survived by default. Building a
+// replacement directory means every attribute not copied here is silently
+// dropped, or worse, replaced by whatever the archive happened to carry.
+func copyRemainingXattrs(from, to string, logger *slog.Logger) error {
+	names, err := listXattrsFn(from)
+	if err != nil {
+		return err
+	}
+	for _, attr := range names {
+		if explicitlyHandledXattrs[attr] {
+			continue
+		}
+		value, present, readErr := readXattrFn(from, attr)
+		if readErr != nil {
+			return readErr
+		}
+		if !present {
+			continue
+		}
+		if setErr := setXattr(to, attr, value, 0); setErr != nil {
+			// trusted.* needs CAP_SYS_ADMIN, and a security.* attribute owned by
+			// some other LSM may be unwritable from here. Refusing to restore
+			// over an attribute the operator likely does not know exists is the
+			// worse failure, so name it and carry on.
+			if errors.Is(setErr, unix.EPERM) || errors.Is(setErr, unix.EACCES) ||
+				errors.Is(setErr, unix.ENOTSUP) || errors.Is(setErr, unix.EOPNOTSUPP) {
+				logger.Warn("could not copy an extended attribute from the volume to its replacement, "+
+					"so it will be missing after the restore",
+					"attribute", attr, "path", to, "error", setErr)
+				continue
+			}
+			return fmt.Errorf("copying the extended attribute %s onto %s (nothing was changed): %w", attr, to, setErr)
+		}
+	}
+	return nil
+}
+
+// explicitlyHandledXattrs are set from the model by their own steps, which
+// report their own failures in terms an operator can act on. Derived from those
+// steps' own lists rather than repeating them, so an attribute added to one
+// cannot silently start being written twice.
+var explicitlyHandledXattrs = func() map[string]bool {
+	handled := map[string]bool{seLinuxAttr: true}
+	for _, attr := range aclAttrs {
+		handled[attr] = true
+	}
+	return handled
+}()
+
 func readXattr(path, attr string) (value []byte, present bool, err error) {
 	size, err := unix.Lgetxattr(path, attr, nil)
 	if err != nil {
@@ -346,47 +469,28 @@ func applySELinuxContext(path, label string) error {
 	return nil
 }
 
-// syncTree flushes every file and directory under root, then root itself. A
-// restore is worth little if a power loss just after it can bring back a tree
-// that was never written, so this is deliberately thorough rather than cheap.
+// syncStagedData flushes the staged restore to disk. A restore is worth little
+// if a power loss just after it can bring back a tree that was never written,
+// and the copy it replaces is deleted on the strength of this.
 //
-// Every open goes through os.Root, which resolves relative to the staging
-// directory and refuses to escape it. The tree is extracted from an archive, so
-// its shape is not this program's to trust: a path that is a directory when
-// walked and a symlink by the time it is opened would otherwise follow it out.
-func syncTree(root string) error {
-	r, err := os.OpenRoot(root)
+// It syncs the whole filesystem rather than walking the tree, because the
+// contents of an archive are not this process's to open. A regular file
+// extracted with mode 000 is readable by root but not by the unprivileged user
+// a rootless Podman restore runs as, so opening it to flush it failed with
+// EACCES and took a valid restore down with it. A named pipe was worse: opening
+// it blocks until a writer appears, and borgmatic has already exited. One
+// syncfs needs no descriptor on any of them.
+//
+// dir must be on the same filesystem as the staged data, which the parent of
+// the target satisfies: staging is created as its sibling.
+func syncStagedData(dir string) error {
+	// #nosec G304 -- the parent of a directory this process is restoring into
+	f, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = r.Close() }()
-
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		// Only regular files and directories have contents to flush, and only
-		// they are safe to open: opening a FIFO blocks until a writer appears,
-		// and borgmatic has already exited, so an archive containing a named
-		// pipe would hang the restore here forever. Devices and sockets are
-		// skipped for the same reason.
-		if !d.IsDir() && !d.Type().IsRegular() {
-			return nil
-		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			return relErr
-		}
-		f, openErr := r.Open(rel)
-		if openErr != nil {
-			return openErr
-		}
-		syncErr := f.Sync()
-		if closeErr := f.Close(); syncErr == nil {
-			syncErr = closeErr
-		}
-		return syncErr
-	})
+	defer func() { _ = f.Close() }()
+	return unix.Syncfs(int(f.Fd()))
 }
 
 // syncDir flushes a directory entry so renames and creations within it survive

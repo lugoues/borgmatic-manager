@@ -1042,15 +1042,26 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if err != nil {
 		return err
 	}
+	// The volume's own path is what proves this is a container volume, and it is
+	// what the wipe guard has to judge. Keep it before resolution rewrites it
+	// into a backing directory that may sit nowhere near the volumes root:
+	// following a link the volume itself set up must not cost it the right to be
+	// mirror-restored.
+	volumeIdentity := plan.targetData
+
 	// Resolve before anything is derived from this path. A _data that is a
 	// symlink to a backing directory would otherwise get its staging sibling
 	// placed beside the link rather than beside the real directory, and the
 	// swap would replace the link itself with a directory, silently detaching
 	// the volume from what it pointed at.
-	if resolved, resErr := filepath.EvalSymlinks(plan.targetData); resErr == nil && resolved != plan.targetData {
+	resolvedData, resErr := resolveVolumeData(plan.targetData)
+	if resErr != nil {
+		return resErr
+	}
+	if resolvedData != plan.targetData {
 		logger.Warn("the volume's data directory is a symlink; restoring into what it points at",
-			"link", plan.targetData, "resolved", resolved)
-		plan.targetData = resolved
+			"link", plan.targetData, "resolved", resolvedData)
+		plan.targetData = resolvedData
 	}
 
 	// A previous restore killed between the two renames leaves the data under a
@@ -1140,6 +1151,21 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// and a mount point cannot be renamed at all.
 	switch {
 	case merge:
+		// Merge writes straight into the live directory, so a container that
+		// started while the configs were being generated is now being written
+		// underneath. There is no staging step here to abort at, and no wipe, so
+		// this is the only place left to notice. --force keeps its meaning.
+		if !force {
+			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+			if checkErr != nil {
+				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
+			}
+			if live {
+				return fmt.Errorf("a container started using volume %q while the restore was preparing, "+
+					"and a merge writes directly into the volume it is using; "+
+					"stop it and run the restore again, or pass --force to overrule", plan.targetVolume)
+			}
+		}
 		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (merge)\n", group, volume, archive, plan.targetData)
 		if err := extract(plan.targetData); err != nil {
 			return err
@@ -1174,7 +1200,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 			}
 		}
 		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (in place)\n", group, volume, archive, plan.targetData)
-		if wipeErr := emptyVolumeData(plan.targetData); wipeErr != nil {
+		if wipeErr := emptyVolumeData(plan.targetData, volumeIdentity); wipeErr != nil {
 			return fmt.Errorf("emptying the target before a mirror restore: %w", wipeErr)
 		}
 		if err := extract(plan.targetData); err != nil {
@@ -1286,6 +1312,11 @@ func waitOrKill(cmd *exec.Cmd, exited <-chan error, reason string) error {
 		signalExtractGroup(cmd, syscall.SIGKILL)
 		<-exited
 	}
+	// borgmatic exiting says nothing about the borg it spawned: a forwarded
+	// SIGINT that borgmatic honours promptly can leave borg still extracting
+	// into a destination this restore is about to clean up or swap away. Sweep
+	// the group on both paths, not just after the grace period expires.
+	signalExtractGroup(cmd, syscall.SIGKILL)
 	return fmt.Errorf("borgmatic extract did not finish: %s", reason)
 }
 
@@ -1539,9 +1570,14 @@ func firstNonEmptyLine(s string) string {
 // emptyVolumeData removes the contents of a volume's _data directory (keeping
 // the directory itself). It refuses paths that do not look like a container
 // volume, so a misconfigured host path cannot wipe something unrelated.
-func emptyVolumeData(hostPath string) error {
-	if !strings.Contains(hostPath, string(filepath.Separator)+"volumes"+string(filepath.Separator)) {
-		return fmt.Errorf("refusing to empty %q: not a recognizable container volume path", hostPath)
+//
+// identity is the volume's own _data path, which is what authorizes the wipe.
+// It differs from hostPath when _data is a symlink into a backing directory
+// elsewhere: the directory being emptied is then outside the volumes root, but
+// the volume that names it is not, and that is what the guard is asking about.
+func emptyVolumeData(hostPath, identity string) error {
+	if !strings.Contains(identity, string(filepath.Separator)+"volumes"+string(filepath.Separator)) {
+		return fmt.Errorf("refusing to empty %q: not a recognizable container volume path", identity)
 	}
 	entries, err := os.ReadDir(hostPath)
 	if err != nil {
