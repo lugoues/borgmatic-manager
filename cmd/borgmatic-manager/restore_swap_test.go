@@ -1227,7 +1227,7 @@ func TestExtractIsSuspendedAndResumedWithTheManager(t *testing.T) {
 	t.Cleanup(func() {
 		_ = child.Process.Signal(syscall.SIGCONT)
 		_ = child.Process.Kill()
-		_, _ = child.Process.Wait()
+		reapBounded(t, child)
 	})
 
 	grandchild := waitForPID(t, logPath)
@@ -1422,7 +1422,7 @@ func TestExtractDiesWithAKilledManager(t *testing.T) {
 
 	// No handler runs, and nothing is forwarded.
 	require.NoError(t, child.Process.Kill())
-	_, _ = child.Process.Wait()
+	reapBounded(t, child)
 
 	// The kernel guarantees this one: Pdeathsig is delivered to the direct child
 	// and needs no cooperation from it.
@@ -1615,4 +1615,26 @@ func TestEncryptionBlocksStagingWhenItCannotBeDetermined(t *testing.T) {
 	require.NoError(t, err, "an unanswerable question is not an error, it is an answer of its own")
 	assert.True(t, blocks, "unknown must not be read as unencrypted")
 	assert.Contains(t, reason, "cannot be determined")
+}
+
+// reapBounded reaps a helper that has just been killed, without waiting forever
+// for it.
+//
+// SIGKILL cannot be blocked, so this normally returns at once; a process stuck
+// in uninterruptible sleep is the case worth bounding. It exists for the same
+// reason as waitBounded, and separately from it because these callers have
+// already killed the process and want it reaped rather than judged: a wait that
+// blocks here would still turn a stuck helper into the suite timeout.
+func reapBounded(t *testing.T, child *exec.Cmd) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		_, _ = child.Process.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(helperGrace):
+		t.Errorf("a killed helper was not reaped within %s", helperGrace)
+	}
 }
