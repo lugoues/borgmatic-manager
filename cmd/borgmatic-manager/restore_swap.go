@@ -239,35 +239,46 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 // component is resolved by hand and only the path above it is required to
 // exist.
 func resolveVolumeData(targetData string) (string, error) {
-	if resolved, err := filepath.EvalSymlinks(targetData); err == nil {
-		return resolved, nil
+	// Bounded so a symlink loop cannot spin here. The kernel's own limit is 40.
+	const maxLinks = 40
+
+	current := targetData
+	for i := 0; i < maxLinks; i++ {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			return resolved, nil
+		}
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			// Not a symlink, so there is nothing here to resolve. Whatever is
+			// wrong with the path is reported by the caller's own existence
+			// check, which can say more about it than this function can.
+			return current, nil
+		}
+		link, err := os.Readlink(current)
+		if err != nil {
+			return "", fmt.Errorf("reading the symlink at %s: %w", current, err)
+		}
+		if !filepath.IsAbs(link) {
+			link = filepath.Join(filepath.Dir(current), link)
+		}
+		parent, err := filepath.EvalSymlinks(filepath.Dir(link))
+		if err != nil {
+			return "", fmt.Errorf("%s points into %s, which could not be resolved: %w", current, filepath.Dir(link), err)
+		}
+		// Loop rather than return: the thing this names may itself be another
+		// symlink, and only the final component is allowed to be missing. A
+		// chain that stops at an intermediate link leaves recovery looking for
+		// the displaced copy beside the wrong directory.
+		current = filepath.Join(parent, filepath.Base(link))
 	}
-	info, err := os.Lstat(targetData)
-	if err != nil || info.Mode()&os.ModeSymlink == 0 {
-		// Not a symlink, so there is nothing here to resolve. Whatever is wrong
-		// with the path is reported by the caller's own existence check, which
-		// can say more about it than this function can.
-		return targetData, nil
-	}
-	link, err := os.Readlink(targetData)
-	if err != nil {
-		return "", fmt.Errorf("reading the symlink at %s: %w", targetData, err)
-	}
-	if !filepath.IsAbs(link) {
-		link = filepath.Join(filepath.Dir(targetData), link)
-	}
-	parent, err := filepath.EvalSymlinks(filepath.Dir(link))
-	if err != nil {
-		return "", fmt.Errorf("%s points into %s, which could not be resolved: %w", targetData, filepath.Dir(link), err)
-	}
-	return filepath.Join(parent, filepath.Base(link)), nil
+	return "", fmt.Errorf("resolving %s followed more than %d symlinks; it is probably a loop", targetData, maxLinks)
 }
 
 func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 	if _, err := os.Lstat(targetData); err == nil || !os.IsNotExist(err) {
 		return nil // present, or unreadable for some other reason: nothing to do
 	}
-	matches, err := filepath.Glob(targetData + oldPrefix + "*")
+	matches, err := siblingsWithPrefix(targetData, oldPrefix)
 	if err != nil {
 		return fmt.Errorf("looking for data displaced by an interrupted restore beside %s: %w", targetData, err)
 	}
@@ -359,8 +370,91 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 	if err := copyRemainingXattrs(model, staging, logger); err != nil {
 		return "", err
 	}
+	if err := copyInodeFlags(model, staging, logger); err != nil {
+		return "", err
+	}
 	warnAboutProjectQuota(model, logger)
 	return staging, nil
+}
+
+// inheritableInodeFlags are the FS_IOC_GETFLAGS bits a directory passes on to
+// what is created inside it, so they have to be on staging *before* borg writes
+// anything: setting nodatacow afterwards does not convert files that already
+// exist. btrfs +C on a database volume is the case that matters, where losing
+// it silently restores copy-on-write behaviour the operator deliberately turned
+// off.
+//
+// Defined here because golang.org/x/sys/unix exports the ioctls but not the
+// flag bits. Values are from linux/fs.h and are stable ABI.
+const (
+	fsNoCoWFlag     = 0x00800000 // FS_NOCOW_FL
+	fsCompressFlag  = 0x00000004 // FS_COMPR_FL
+	fsNoAtimeFlag   = 0x00000080 // FS_NOATIME_FL
+	fsNoDumpFlag    = 0x00000040 // FS_NODUMP_FL
+	fsSyncFlag      = 0x00000008 // FS_SYNC_FL
+	fsDirSyncFlag   = 0x00010000 // FS_DIRSYNC_FL
+	inheritableMask = fsNoCoWFlag | fsCompressFlag | fsNoAtimeFlag | fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag
+)
+
+// copyInodeFlags carries the model's inheritable inode flags onto staging.
+//
+// These are ioctl state rather than extended attributes, so none of the xattr
+// copying reaches them. Only the inheritable ones are copied: flags like
+// immutable and append-only describe the directory itself rather than what goes
+// in it, and reproducing those on a directory about to be extracted into would
+// break the extract.
+func copyInodeFlags(model, staging string, logger *slog.Logger) error {
+	flags, ok, err := readInodeFlags(model)
+	if err != nil {
+		return err
+	}
+	if !ok || flags&inheritableMask == 0 {
+		return nil
+	}
+	if setErr := writeInodeFlags(staging, flags&inheritableMask); setErr != nil {
+		// Not fatal. The data lands correctly either way, and refusing to
+		// restore a volume over a storage-behaviour flag is the worse outcome;
+		// but it changes how every restored file is stored, so it is said out
+		// loud rather than dropped.
+		logger.Warn("could not apply the volume's inode flags to the directory replacing it, so the restored "+
+			"files will not inherit them (btrfs +C in particular cannot be applied after the files exist)",
+			"path", staging, "flags", fmt.Sprintf("%#x", flags&inheritableMask), "error", setErr)
+	}
+	return nil
+}
+
+// readInodeFlags reports a path's inode flags, and whether the filesystem
+// answers at all. A filesystem without the ioctl has no flags to lose.
+var readInodeFlags = func(path string) (int, bool, error) {
+	// #nosec G304 -- a directory this process is restoring
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return 0, false, fmt.Errorf("opening %s to read its inode flags: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	flags, err := unix.IoctlGetInt(int(f.Fd()), unix.FS_IOC_GETFLAGS)
+	if err != nil {
+		if errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.ENOSYS) ||
+			errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("reading the inode flags on %s: %w", path, err)
+	}
+	return flags, true, nil
+}
+
+var writeInodeFlags = func(path string, flags int) error {
+	// #nosec G304 -- a directory this process just created
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	current, err := unix.IoctlGetInt(int(f.Fd()), unix.FS_IOC_GETFLAGS)
+	if err != nil {
+		return err
+	}
+	return unix.IoctlSetPointerInt(int(f.Fd()), unix.FS_IOC_SETFLAGS, current|flags)
 }
 
 // warnAboutProjectQuota reports a project quota that the replacement directory
@@ -408,11 +502,58 @@ var projectQuotaID = func(path string) (uint64, bool) {
 	return id, true
 }
 
+// canCreateSibling reports whether a staging directory can be created beside
+// targetData.
+//
+// Answered by trying, not by inspecting permission bits: access(2) asks about
+// the real uid rather than the effective one, and a filesystem can refuse for
+// reasons no mode bit shows (read-only mount, an LSM, a full inode table). The
+// staged swap needs to create an entry in the *parent*, where the previous
+// in-place restore only ever wrote inside _data, so a volume whose parent is
+// not writable becomes impossible to mirror unless this is noticed first.
+func canCreateSibling(targetData string) (bool, error) {
+	probe, err := os.MkdirTemp(filepath.Dir(targetData), filepath.Base(targetData)+stagingPrefix)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking whether a staging directory can be created beside %s: %w", targetData, err)
+	}
+	if rmErr := os.Remove(probe); rmErr != nil {
+		return false, fmt.Errorf("removing the staging probe %s: %w", probe, rmErr)
+	}
+	return true, nil
+}
+
+// siblingsWithPrefix lists the paths beside targetData whose names begin with
+// targetData's own name plus prefix.
+//
+// Reading the directory rather than globbing, because targetData is not a
+// pattern this program chose: a symlink-backed volume resolves to whatever the
+// link names, and a literal *, ? or [ in that path would be read as glob
+// syntax. An unmatched bracket fails every staged restore, and a wildcard can
+// match a different volume's live staging directory and have it deleted.
+func siblingsWithPrefix(targetData, prefix string) ([]string, error) {
+	parent := filepath.Dir(targetData)
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return nil, err
+	}
+	want := filepath.Base(targetData) + prefix
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), want) {
+			out = append(out, filepath.Join(parent, e.Name()))
+		}
+	}
+	return out, nil
+}
+
 // clearStagingLeftovers removes staging directories a previous run died before
 // finishing. Every one of them was created by MkdirTemp under this tool's
 // prefix, so nothing else can own one.
 func clearStagingLeftovers(targetData string, logger *slog.Logger) error {
-	matches, err := filepath.Glob(targetData + stagingPrefix + "*")
+	matches, err := siblingsWithPrefix(targetData, stagingPrefix)
 	if err != nil {
 		return fmt.Errorf("looking for leftover staging directories beside %s: %w", targetData, err)
 	}
