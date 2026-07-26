@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -261,4 +262,63 @@ func TestRestoreWithSwapAcceptsAnArchivedEmptyDirectory(t *testing.T) {
 	require.NoError(t, err, "the archive holds this directory with no children")
 	assert.Empty(t, names(t, data), "the volume is restored to the empty state it was archived in")
 	assert.NoDirExists(t, data+stagingSuffix)
+}
+
+// posixACL builds a minimal POSIX access ACL granting a named user rwx, in the
+// on-disk xattr layout: a 4-byte version followed by 8-byte entries of
+// {tag, perm, id}. Built by hand so the test needs no acl tooling installed.
+func posixACL(uid uint32) []byte {
+	const (
+		tagUserObj  = 0x01
+		tagUser     = 0x02
+		tagGroupObj = 0x04
+		tagMask     = 0x10
+		tagOther    = 0x20
+		undefinedID = 0xFFFFFFFF
+	)
+	acl := binary.LittleEndian.AppendUint32(nil, 2) // version
+	for _, e := range []struct {
+		tag, perm uint16
+		id        uint32
+	}{
+		{tagUserObj, 7, undefinedID},
+		{tagUser, 5, uid},
+		{tagGroupObj, 5, undefinedID},
+		{tagMask, 7, undefinedID},
+		{tagOther, 5, undefinedID},
+	} {
+		acl = binary.LittleEndian.AppendUint16(acl, e.tag)
+		acl = binary.LittleEndian.AppendUint16(acl, e.perm)
+		acl = binary.LittleEndian.AppendUint32(acl, e.id)
+	}
+	return acl
+}
+
+// The in-place restore kept the inode and its ACLs for free. Promoting a new
+// directory loses anything not carried across, and a dropped access ACL
+// silently revokes access while a dropped default ACL changes what everything
+// created after the restore inherits.
+func TestCreateStagingLikeCopiesPOSIXACLs(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	access, dflt := posixACL(1001), posixACL(1002)
+	if err := unix.Lsetxattr(model, "system.posix_acl_access", access, 0); err != nil {
+		t.Skipf("POSIX ACLs unsupported here: %v", err)
+	}
+	require.NoError(t, unix.Lsetxattr(model, "system.posix_acl_default", dflt, 0))
+
+	staging := filepath.Join(dir, "_data"+stagingSuffix)
+	require.NoError(t, createStagingLike(staging, model))
+
+	for attr, want := range map[string][]byte{
+		"system.posix_acl_access":  access,
+		"system.posix_acl_default": dflt,
+	} {
+		got, present, err := readXattr(staging, attr)
+		require.NoError(t, err)
+		require.True(t, present, "%s was not carried to the replacement", attr)
+		assert.Equal(t, want, got, "%s differs from the original", attr)
+	}
 }
