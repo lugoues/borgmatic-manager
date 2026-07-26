@@ -40,6 +40,28 @@ if [ -n "$upgrade" ]; then
     exit 0
 fi
 
+# A reinstall after a plain "remove" keeps the enablement symlink, since only
+# purge drops it. But preremove stopped the service, and nothing above starts it
+# again, so the package would come back enabled and inactive: the same silently
+# stopped backups that preserving the enablement exists to prevent. Start it only
+# when it is already enabled, which a genuinely fresh install never is, so
+# enabling stays the operator's call.
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl is-enabled --quiet borgmatic-manager 2>/dev/null \
+   && ! systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
+    # deb-systemd-invoke honors policy-rc.d, so chroot and container builds
+    # still get to refuse.
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke start borgmatic-manager.service || true
+    else
+        systemctl start borgmatic-manager.service || true
+    fi
+    if systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
+        echo "borgmatic-manager reinstalled; it was still enabled, so the service was started again."
+        exit 0
+    fi
+fi
+
 cat <<'EOF'
 borgmatic-manager installed.
 
