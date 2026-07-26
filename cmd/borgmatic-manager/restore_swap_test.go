@@ -832,3 +832,30 @@ func waitForPID(t *testing.T, logPath string) int {
 	}, 20*time.Second, 50*time.Millisecond, "the fake borgmatic never recorded its grandchild")
 	return pid
 }
+
+// A copy that cannot be moved clear of the staging path still exists, so this
+// must not fail the operation. It must not be silent either: the operator is
+// about to be pointed at a path the next restore deletes as its first act.
+func TestRetainOrWarnReportsAFailureRatherThanHidingIt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into an unwritable directory anyway")
+	}
+	data := liveVolume(t)
+	staging := data + stagingSuffix
+	require.NoError(t, os.Mkdir(staging, 0o755))
+
+	// Retention creates its destination beside the target, so a parent that
+	// cannot be written to is what makes it fail.
+	parent := filepath.Dir(data)
+	before, err := os.Stat(parent)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(parent, 0o500))
+	defer func() { _ = os.Chmod(parent, before.Mode().Perm()) }()
+
+	logs, logger := capturedWarnLogger()
+	got := retainOrWarn(staging, data, logger)
+
+	assert.Equal(t, staging, got, "the caller is pointed at where the copy actually is")
+	assert.Contains(t, logs.String(), "later restore may delete it", "the risk is stated")
+	assert.DirExists(t, staging, "and the copy itself is still there")
+}
