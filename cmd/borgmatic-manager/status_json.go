@@ -46,12 +46,7 @@ type statusRunning struct {
 }
 
 func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline, now time.Time) statusDoc {
-	running := map[string]time.Time{}
-	for _, p := range store.PendingSnapshot() {
-		if started, ok := running[p.Group]; !ok || p.Started.Before(started) {
-			running[p.Group] = p.Started
-		}
-	}
+	running := runningGroups(store)
 
 	names := make([]string, 0, len(bs.Groups))
 	for name := range bs.Groups {

@@ -229,14 +229,8 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, run
 	now := time.Now()
 	fmt.Println()
 
-	// A group in the pending set is mid-run. Keep the earliest start per group so
-	// a stale-plus-fresh pair surfaces the longer-running one.
-	running := map[string]time.Time{}
-	for _, p := range store.PendingSnapshot() {
-		if started, ok := running[p.Group]; !ok || p.Started.Before(started) {
-			running[p.Group] = p.Started
-		}
-	}
+	// A group with a live pending record is mid-run.
+	running := runningGroups(store)
 
 	type row struct {
 		name, last, result, files, size, next string

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +116,74 @@ func TestStatusShowsRunningGroup(t *testing.T) {
 	assert.Contains(t, out, "running", "an in-flight group shows as running")
 	assert.Contains(t, out, "1 group running", "the header reflects the running count")
 	assert.NotContains(t, out, "due now", "a running group is not also shown as due")
+}
+
+// deadPID returns a PID that cannot name a live process: one past the kernel's
+// pid_max, for which kill(2) is guaranteed ESRCH. Reusing a just-exited child's
+// PID would race the kernel's recycling.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	raw, err := os.ReadFile("/proc/sys/kernel/pid_max")
+	require.NoError(t, err)
+	max, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, err)
+	pid := max + 1
+	require.False(t, processAlive(pid), "pid %d must not be live", pid)
+	return pid
+}
+
+// recordDeadPending writes a pending record whose owner is gone, the state a
+// SIGKILLed run leaves behind: the deferred ClearPending never runs. It writes
+// schedule.json directly because RecordPending stamps the live test process.
+func recordDeadPending(t *testing.T, stateDir, runID, group string, started time.Time) {
+	t.Helper()
+	doc := map[string]any{
+		"version": 1,
+		"groups":  map[string]any{},
+		"pending_runs": map[string]any{
+			runID: map[string]any{"group": group, "started": started, "pid": deadPID(t)},
+		},
+	}
+	data, err := json.Marshal(doc)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "schedule.json"), data, 0o600))
+}
+
+// A run killed outright (SIGKILL, OOM, power loss) never clears its pending
+// record, and only the daemon reaps those at startup. Until this filter, such a
+// record pinned its group at "running" forever and hid the real due state.
+func TestStatusIgnoresPendingRunWhoseProcessIsGone(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	dir := t.TempDir()
+	recordDeadPending(t, dir, "run-1", "demo", time.Now().Add(-3*time.Minute))
+	store := state.LoadSchedule(dir, nil)
+
+	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) })
+
+	assert.NotContains(t, out, "running", "a dead owner's record is not an in-flight run")
+	assert.Contains(t, out, "due now", "and the group's real due state is visible again")
+
+	doc := buildStatusDoc(bs, store, time.Hour, 0, nil, nil, nil, time.Now())
+	require.Len(t, doc.Groups, 1)
+	assert.Nil(t, doc.Groups[0].Running, "status --json agrees with the table")
+	require.NotNil(t, doc.Groups[0].Due)
+	assert.True(t, *doc.Groups[0].Due)
+}
+
+// A record with no stamped PID (written by a pre-PID binary) cannot be proven
+// dead, so it stays visible: this is a display filter, not a reaper.
+func TestStatusKeepsPendingRunWithNoStampedPID(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	dir := t.TempDir()
+	doc := `{"version":1,"groups":{},"pending_runs":{"run-1":{"group":"demo","started":"` +
+		time.Now().Add(-3*time.Minute).Format(time.RFC3339) + `"}}}`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schedule.json"), []byte(doc), 0o600))
+
+	out := captureStdout(t, func() { printStatus(bs, state.LoadSchedule(dir, nil), time.Hour, 0, nil, nil, nil) })
+
+	assert.Contains(t, out, "running", "unprovable liveness keeps the record visible")
 }
 
 func TestStatusFlagsStaleRunningPastTimeout(t *testing.T) {
