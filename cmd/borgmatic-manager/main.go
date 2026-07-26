@@ -396,6 +396,34 @@ func (c recorderChain) RecordRun(group string, o state.RunOutcome) {
 	}
 }
 
+// enableMetrics wires the OTLP emitter onto the runner's recorder when metrics
+// are enabled, so both the daemon and a one-shot `run` emit (a manual backup is
+// a valid data point). It returns a shutdown func that flushes on exit (a no-op
+// when disabled or setup fails) and the emitter (nil unless enabled) so the
+// daemon can also feed it per-cycle inventory. Best-effort: a broken exporter
+// never fails a backup.
+func enableMetrics(ctx context.Context, e *env, store *state.ScheduleStore, r *runner.Runner, logger *slog.Logger) (shutdown func(), emitter *metrics.Emitter) {
+	noop := func() {}
+	if !e.cfg.Manager.Metrics.Enabled {
+		return noop, nil
+	}
+	em, err := metrics.New(ctx, e.cfg.Manager.Metrics, version, store, logger)
+	if err != nil {
+		logger.Warn("metrics disabled: exporter setup failed", "error", err)
+		return noop, nil
+	}
+	r.SetRecorder(recorderChain{store, em})
+	logger.Info("metrics enabled",
+		"protocol", metricsProtocol(e.cfg.Manager.Metrics), "endpoint", e.cfg.Manager.Metrics.Endpoint)
+	return func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := em.Shutdown(sctx); err != nil {
+			logger.Warn("flushing metrics on shutdown failed", "error", err)
+		}
+	}, em
+}
+
 // metricsProtocol reports the OTLP transport for the startup log; empty config
 // defaults to http.
 func metricsProtocol(m config.MetricsSettings) string {
@@ -605,24 +633,13 @@ func runDaemon() error {
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
 	s.SetGroupCache(state.LoadGroupCache(e.stateDir, slog.Default()))
 
-	// Metrics are best-effort: a failed exporter must never stop backups. When
-	// enabled, the emitter both counts runs (composed onto the recorder) and
-	// feeds the offline-volume gauge from each cycle's inventory.
-	if e.cfg.Manager.Metrics.Enabled {
-		if emitter, err := metrics.New(ctx, e.cfg.Manager.Metrics, version, store, slog.Default()); err != nil {
-			slog.Warn("metrics disabled: exporter setup failed", "error", err)
-		} else {
-			r.SetRecorder(recorderChain{store, emitter})
-			s.SetCycleObserver(emitter.ObserveInventory)
-			defer func() {
-				sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if err := emitter.Shutdown(sctx); err != nil {
-					slog.Warn("flushing metrics on shutdown failed", "error", err)
-				}
-			}()
-			slog.Info("metrics enabled", "protocol", metricsProtocol(e.cfg.Manager.Metrics), "endpoint", e.cfg.Manager.Metrics.Endpoint)
-		}
+	// Metrics are best-effort: a failed exporter must never stop backups. The
+	// emitter counts runs (composed onto the recorder) and, in the daemon, feeds
+	// the offline-volume gauge from each cycle's inventory.
+	shutdownMetrics, emitter := enableMetrics(ctx, e, store, r, slog.Default())
+	defer shutdownMetrics()
+	if emitter != nil {
+		s.SetCycleObserver(emitter.ObserveInventory)
 	}
 
 	l := events.NewListener(e.rt, slog.Default())
@@ -704,6 +721,10 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	// still land in the shared schedule state.
 	store := state.LoadSchedule(e.stateDir, logger)
 	r := e.newRunner(progressLogger(), configsDir, pf.borgmaticPath, pf.runTimeout, store)
+
+	// A manual run is a valid data point: emit and flush before returning.
+	shutdownMetrics, _ := enableMetrics(ctx, e, store, r, logger)
+	defer shutdownMetrics()
 
 	now := time.Now()
 	var failed, locked, unattempted []string
