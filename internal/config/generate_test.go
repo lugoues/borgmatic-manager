@@ -720,3 +720,45 @@ func TestSnapshotBoundaryWarning(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+// A run id scopes dump-helper reaping to one actual run. Plan and RenderGroup
+// start no run, so a freshly minted id there is an identifier no helper will
+// ever carry: it reads as the current run's while never matching it. Both use a
+// visible placeholder instead.
+func TestPlanAndRenderGroupDoNotMintRealRunIDs(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddDatabases("db-group", []models.DatabaseConfig{
+		{Type: "postgresql", Name: "postgres", Container: "pg-svc", Image: "postgres:17-alpine",
+			Username: "postgres", Password: "s3cret", Mode: "helper"},
+	})
+	g, _ := newTestGenerator(t, &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/srv/repo"}},
+	}}, nil, config.GeneratorOptions{RuntimeDir: "/run/borgmatic-manager", ContainerCLI: "docker"})
+
+	meta, _, err := g.Plan(state)
+	require.NoError(t, err)
+	assert.Equal(t, config.PlaceholderRunID, meta["db-group"].RunID, "Plan starts no run, so it mints no run id")
+
+	// Stable across calls: two inspects of an unchanged group must not disagree.
+	meta2, _, err := g.Plan(state)
+	require.NoError(t, err)
+	assert.Equal(t, meta["db-group"].RunID, meta2["db-group"].RunID)
+
+	rendered, refusal, err := g.RenderGroup(state, "db-group")
+	require.NoError(t, err)
+	require.Empty(t, refusal)
+	assert.Contains(t, rendered, "borgmatic-manager.run="+config.PlaceholderRunID,
+		"the displayed config labels helpers with the placeholder")
+	assert.NotRegexp(t, `borgmatic-manager\.run=[0-9a-f]{16}`, rendered,
+		"and never with a real-looking hex id that would not match the one on disk")
+
+	rendered2, _, err := g.RenderGroup(state, "db-group")
+	require.NoError(t, err)
+	assert.Equal(t, rendered, rendered2, "rendering twice gives the same config")
+
+	// Generate still mints a real one: reaping depends on it.
+	gen, err := g.Generate(state)
+	require.NoError(t, err)
+	assert.NotEqual(t, config.PlaceholderRunID, gen["db-group"].RunID)
+	assert.Regexp(t, `^[0-9a-f]{16}$`, gen["db-group"].RunID)
+}

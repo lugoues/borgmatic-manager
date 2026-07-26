@@ -99,7 +99,7 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 		return nil, fmt.Errorf("creating output directory: %w", err)
 	}
 
-	entries, _, err := g.plan(state, sortedGroupNames(state))
+	entries, _, err := g.plan(state, sortedGroupNames(state), newRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -133,8 +133,12 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 
 // Plan runs generation's build and safety passes without writing anything,
 // returning scheduling metadata and refusals.
+//
+// The returned GroupRunMeta.RunID is placeholderRunID, not a real one: run IDs
+// scope dump-helper reaping to one actual run, and Plan starts none. Minting a
+// real one here would hand callers an identifier no helper will ever carry.
 func (g *Generator) Plan(state *models.BackupState) (map[string]GroupRunMeta, []Refusal, error) {
-	entries, refusals, err := g.plan(state, sortedGroupNames(state))
+	entries, refusals, err := g.plan(state, sortedGroupNames(state), placeholderRunIDFunc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,8 +152,13 @@ func (g *Generator) Plan(state *models.BackupState) (map[string]GroupRunMeta, []
 // RenderGroup compiles one group's config without writing. It runs the full
 // plan so the shared-repo check sees every group; returns a refusal reason if
 // the group was refused, and ("", "", nil) for an unknown group.
+//
+// Dump-helper labels carry placeholderRunID rather than a freshly minted one.
+// The rendered config is what the next run will look like, not the file on
+// disk, and a real-looking hex id here would read as the current run's while
+// never matching it.
 func (g *Generator) RenderGroup(state *models.BackupState, groupName string) (configYAML, refusal string, err error) {
-	entries, refusals, err := g.plan(state, sortedGroupNames(state))
+	entries, refusals, err := g.plan(state, sortedGroupNames(state), placeholderRunIDFunc)
 	if err != nil {
 		return "", "", err
 	}
@@ -194,7 +203,7 @@ type pending struct {
 
 // plan builds every group's final config in memory (pass 1) and applies
 // cross-group safety checks (pass 2), returning survivors and refusals.
-func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pending, []Refusal, error) {
+func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRunID func() (string, error)) ([]*pending, []Refusal, error) {
 	// Pass 1: build every group's final config in memory.
 	entries := make([]*pending, 0, len(groupNames))
 
@@ -227,7 +236,7 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string) ([]*pen
 
 		// 3. Build discovered data. Volume-named /./ paths are disabled when
 		// snapshot hooks are enabled: borg allows only one /./ marker per path.
-		runID, err := newRunID()
+		runID, err := mintRunID()
 		if err != nil {
 			return nil, nil, fmt.Errorf("minting run id for group %s: %w", groupName, err)
 		}
@@ -365,6 +374,14 @@ func hasGeneratedHeader(path string) bool {
 	n, _ := io.ReadFull(f, buf)
 	return string(buf[:n]) == headerComment
 }
+
+// placeholderRunID stands in for a run identifier in configs that are compiled
+// but never run: Plan's metadata and RenderGroup's display output. It is
+// deliberately not hex, so it cannot be mistaken for a real id at a glance.
+const placeholderRunID = "not-a-run-id-rendered-only"
+
+// placeholderRunIDFunc is the mintRunID for those non-writing passes.
+func placeholderRunIDFunc() (string, error) { return placeholderRunID, nil }
 
 // newRunID mints a random 16-hex-char run identifier from crypto/rand.
 func newRunID() (string, error) {
