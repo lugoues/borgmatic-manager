@@ -762,8 +762,7 @@ func TestExtractForwardsSIGHUPToTheWholeGroup(t *testing.T) {
 	grandchild := waitForPID(t, logPath)
 	require.NoError(t, child.Process.Signal(syscall.SIGHUP))
 
-	waitErr := child.Wait()
-	require.Error(t, waitErr, "the extract must report that it did not finish")
+	require.Error(t, waitBounded(t, child), "the extract must report that it did not finish")
 	logged, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(logged), "hangup", "the reason reaches the operator")
@@ -926,12 +925,23 @@ func TestExtractRunsWithNoControllingTerminal(t *testing.T) {
 		}
 	}()
 
-	_ = child.Wait()
+	// Started before the read so a helper that never reports is still reaped.
+	waited := make(chan error, 1)
+	go func() { waited <- child.Wait() }()
+
 	var out string
 	select {
 	case out = <-read:
-	case <-time.After(20 * time.Second):
+	case <-time.After(helperGrace):
+		_ = child.Process.Kill()
 		t.Fatal("the helper never reported")
+	}
+	select {
+	case waitErr := <-waited:
+		require.NoError(t, waitErr, "the helper exited badly")
+	case <-time.After(helperGrace):
+		_ = child.Process.Kill()
+		t.Fatal("the helper reported but never exited")
 	}
 
 	assert.Contains(t, out, "MANAGER-HAS-TTY=true", "the fixture must give the manager a controlling terminal")
@@ -1019,7 +1029,7 @@ func TestExtractForwardsSIGQUITToTheWholeGroup(t *testing.T) {
 	grandchild := waitForPID(t, logPath)
 	require.NoError(t, child.Process.Signal(syscall.SIGQUIT))
 
-	require.Error(t, child.Wait(), "the extract must report that it did not finish")
+	require.Error(t, waitBounded(t, child), "the extract must report that it did not finish")
 	logged, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(logged), "quit", "the reason reaches the operator")
@@ -1039,4 +1049,30 @@ func TestExtractForwardsSIGQUITToTheWholeGroup(t *testing.T) {
 func minimalEnv(extra ...string) []string {
 	env := []string{"PATH=" + os.Getenv("PATH")}
 	return append(env, extra...)
+}
+
+// helperGrace bounds every wait on a re-exec'd helper. It is generous, because
+// the point is not speed: it is that a hang fails as a named assertion rather
+// than as the suite timeout and a panic dump.
+const helperGrace = 20 * time.Second
+
+// waitBounded waits for a signalled helper to exit and fails instead of
+// blocking.
+//
+// A regression in signal forwarding is precisely the case where the helper does
+// not exit, so an unbounded Wait makes these tests useless exactly when they
+// matter. One of them took two minutes to report a failure before this, because
+// Wait was blocked on a pipe the helper's own child still held open.
+func waitBounded(t *testing.T, child *exec.Cmd) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(helperGrace):
+		_ = child.Process.Kill()
+		t.Fatalf("the helper did not exit within %s", helperGrace)
+		return nil
+	}
 }
