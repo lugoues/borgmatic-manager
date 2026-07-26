@@ -130,3 +130,53 @@ func TestRestoreWithSwapIsQuietAboutQgroupsWhenQuotasAreOff(t *testing.T) {
 	}, nil))
 	assert.NotContains(t, logs.String(), "qgroup")
 }
+
+// btrfs +C (nodatacow) is inheritable inode state reached by ioctl, not an
+// extended attribute, so nothing else copies it. It has to be on staging before
+// borg writes: setting it afterwards does not convert files that already exist.
+// Database volumes turn CoW off deliberately, and losing it silently changes
+// how every restored file is stored.
+func TestRestoreWithSwapKeepsNoCoWOnTheVolume(t *testing.T) {
+	data := btrfsVolume(t)
+	if err := writeInodeFlags(data, fsNoCoWFlag); err != nil {
+		t.Skipf("cannot set +C here: %v", err)
+	}
+	flags, ok, err := readInodeFlags(data)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotZero(t, flags&fsNoCoWFlag, "precondition: the volume really is +C")
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		staged, _, flagErr := readInodeFlags(dest)
+		require.NoError(t, flagErr)
+		assert.NotZero(t, staged&fsNoCoWFlag,
+			"the flag must be on staging before anything is written, or the files never inherit it")
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	after, ok, err := readInodeFlags(data)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.NotZero(t, after&fsNoCoWFlag, "the volume silently lost nodatacow")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data))
+}
+
+// A flag that cannot be applied is worth saying out loud, not worth refusing a
+// restore over: the data lands correctly either way.
+func TestRestoreWithSwapWarnsWhenInodeFlagsCannotBeApplied(t *testing.T) {
+	data := btrfsVolume(t)
+	if err := writeInodeFlags(data, fsNoCoWFlag); err != nil {
+		t.Skipf("cannot set +C here: %v", err)
+	}
+
+	realWrite := writeInodeFlags
+	writeInodeFlags = func(string, int) error { return errors.New("refused") }
+	defer func() { writeInodeFlags = realWrite }()
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, restoreWithSwap(data, logger, false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+	assert.Contains(t, logs.String(), "inode flags")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "and the restore still happened")
+}

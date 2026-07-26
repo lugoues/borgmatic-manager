@@ -1231,12 +1231,23 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return encErr
 	}
 
+	// Staging is a sibling, so it needs to create an entry in the parent
+	// directory. The previous in-place restore only ever wrote inside _data, so
+	// a volume whose parent is not writable by this process was restorable
+	// before and would not be now. Noticed here rather than as an EACCES partway
+	// through, and it is a "cannot stage" condition like the others.
+	stageable, stageErr := canCreateSibling(plan.targetData)
+	if stageErr != nil {
+		return stageErr
+	}
+
 	// Mirror restores stage and swap, so the live data is never destroyed
-	// before its replacement exists on disk. Four cases cannot: --merge is
+	// before its replacement exists on disk. Five cases cannot: --merge is
 	// additive and has nothing to replace, --force means a container is running
 	// with this directory bind-mounted and pins the inode a swap would move, a
-	// mount point cannot be renamed at all, and an encrypted directory cannot
-	// have its policy reproduced on a sibling.
+	// mount point cannot be renamed at all, an encrypted directory cannot have
+	// its policy reproduced on a sibling, and an unwritable parent has nowhere
+	// to put the sibling in the first place.
 	switch {
 	case merge:
 		// Merge writes straight into the live directory, so a container that
@@ -1261,8 +1272,13 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		logger.Info("restore complete", "path", plan.targetData)
 		return nil
 
-	case (force && running) || mounted || encrypted:
+	case (force && running) || mounted || encrypted || !stageable:
 		switch {
+		case !stageable:
+			logger.Warn("a staging directory cannot be created beside this volume's data directory, so the restore "+
+				"writes in place instead: the data is replaced as borgmatic extracts, and a failure can leave it "+
+				"partially restored. Grant write access to the parent directory to get the safer staged restore",
+				"path", plan.targetData, "parent", filepath.Dir(plan.targetData))
 		case mounted:
 			logger.Warn("this volume's data directory is its own mount point, so it cannot be swapped into place "+
 				"and the restore writes in place instead: the data is replaced as borgmatic extracts, "+
@@ -1282,7 +1298,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// anyway" and keeps its meaning; a volume pushed onto this path by its
 		// own nature rather than by the operator has given no such consent, so
 		// ask again after the probe.
-		if (mounted || encrypted) && !force {
+		if (mounted || encrypted || !stageable) && !force {
 			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
 			if checkErr != nil {
 				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)

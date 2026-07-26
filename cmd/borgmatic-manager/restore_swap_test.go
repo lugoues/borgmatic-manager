@@ -1305,7 +1305,7 @@ func TestIsEncryptedDirReportsAMissingPath(t *testing.T) {
 // them.
 func stagingDirsFor(t *testing.T, data string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(data + stagingPrefix + "*")
+	matches, err := siblingsWithPrefix(data, stagingPrefix)
 	require.NoError(t, err)
 	return matches
 }
@@ -1543,7 +1543,7 @@ func TestRecoverInterruptedSwapReportsAFlushFailure(t *testing.T) {
 // volume's data path. Unique per run, so tests look them up.
 func displacedDirsFor(t *testing.T, data string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(data + oldPrefix + "*")
+	matches, err := siblingsWithPrefix(data, oldPrefix)
 	require.NoError(t, err)
 	return matches
 }
@@ -1637,4 +1637,116 @@ func reapBounded(t *testing.T, child *exec.Cmd) {
 	case <-time.After(helperGrace):
 		t.Errorf("a killed helper was not reaped within %s", helperGrace)
 	}
+}
+
+// The target path is not a pattern this program chose: a symlink-backed volume
+// resolves to whatever the link names. A literal bracket in that path made
+// every staged restore fail, and a wildcard could match a different volume's
+// live staging directory and have it deleted.
+func TestRestoreWithSwapHandlesGlobCharactersInTheTargetPath(t *testing.T) {
+	for _, name := range []string{"weird[name", "star*name", "question?name"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			data := filepath.Join(root, "volumes", name, "_data")
+			require.NoError(t, os.MkdirAll(data, 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(data, "original.txt"), []byte("original"), 0o644))
+
+			require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+				return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+			}, nil))
+			assert.Equal(t, []string{"restored.txt"}, names(t, data))
+			assert.Empty(t, stagingDirsFor(t, data))
+		})
+	}
+}
+
+// A wildcard in one volume's path must not reach another volume's staging
+// directory, which is the dangerous half of the same defect.
+func TestSiblingsWithPrefixDoesNotMatchAcrossVolumes(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	greedy := filepath.Join(root, "_data*")
+	other := filepath.Join(root, "_data-other")
+	require.NoError(t, os.Mkdir(other+stagingPrefix+"live", 0o755))
+
+	matches, err := siblingsWithPrefix(greedy, stagingPrefix)
+	require.NoError(t, err)
+	assert.Empty(t, matches, "a wildcard in one volume's name must not reach another volume's staging directory")
+}
+
+// _data -> /mnt/link -> /real/data, interrupted after /real/data was moved
+// aside. Stopping at the first link leaves recovery looking beside the wrong
+// directory and the volume unrecoverable.
+func TestResolveVolumeDataFollowsAChainOfDanglingLinks(t *testing.T) {
+	root := t.TempDir()
+	backing := filepath.Join(root, "backing")
+	require.NoError(t, os.Mkdir(backing, 0o755))
+	real := filepath.Join(backing, "data")
+	require.NoError(t, os.Mkdir(real, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(real, "original.txt"), []byte("original"), 0o644))
+
+	mid := filepath.Join(root, "link")
+	require.NoError(t, os.Symlink(real, mid))
+	volume := filepath.Join(root, "volumes", "myvol")
+	require.NoError(t, os.MkdirAll(volume, 0o755))
+	data := filepath.Join(volume, "_data")
+	require.NoError(t, os.Symlink(mid, data))
+
+	resolved, err := resolveVolumeData(data)
+	require.NoError(t, err)
+	assert.Equal(t, real, resolved, "an intact chain resolves to the end of it")
+
+	// Interrupted mid-swap: the real directory is displaced, both links remain.
+	displaced := real + oldPrefix + "interrupted"
+	require.NoError(t, os.Rename(real, displaced))
+
+	resolved, err = resolveVolumeData(data)
+	require.NoError(t, err, "a dangling end of the chain is the state recovery exists to repair")
+	assert.Equal(t, real, resolved, "the chain must be followed past the intermediate link")
+
+	require.NoError(t, recoverInterruptedSwap(resolved, quietLogger()))
+	assert.DirExists(t, real)
+	assert.Equal(t, []string{"original.txt"}, names(t, real))
+}
+
+func TestResolveVolumeDataRefusesASymlinkLoop(t *testing.T) {
+	root := t.TempDir()
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	require.NoError(t, os.Symlink(b, a))
+	require.NoError(t, os.Symlink(a, b))
+
+	_, err := resolveVolumeData(a)
+	require.Error(t, err, "a loop must terminate rather than spin")
+	assert.Contains(t, err.Error(), "loop")
+}
+
+// Staging is a sibling, so it needs to create an entry in the parent. The old
+// in-place restore only wrote inside _data, so a volume with an unwritable
+// parent was restorable before and must not stop being so.
+func TestCanCreateSiblingReportsAnUnwritableParent(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into an unwritable directory anyway")
+	}
+	data := liveVolume(t)
+	ok, err := canCreateSibling(data)
+	require.NoError(t, err)
+	assert.True(t, ok, "an ordinary volume can be staged beside")
+
+	parent := filepath.Dir(data)
+	before, err := os.Stat(parent)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(parent, 0o555))
+	defer func() { _ = os.Chmod(parent, before.Mode().Perm()) }()
+
+	ok, err = canCreateSibling(data)
+	require.NoError(t, err, "an unwritable parent is an answer, not a failure")
+	assert.False(t, ok)
+}
+
+func TestCanCreateSiblingLeavesNothingBehind(t *testing.T) {
+	data := liveVolume(t)
+	ok, err := canCreateSibling(data)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Empty(t, stagingDirsFor(t, data), "the probe must not survive itself")
 }
