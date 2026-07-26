@@ -1587,7 +1587,11 @@ func TestRecoverInterruptedSwapFindsAUniquelyNamedDisplacedCopy(t *testing.T) {
 func TestRecoverInterruptedSwapRefusesToGuessBetweenTwo(t *testing.T) {
 	data := liveVolume(t)
 	require.NoError(t, os.Rename(data, data+oldPrefix+"first"))
-	require.NoError(t, os.Mkdir(data+oldPrefix+"second", 0o755))
+	// A second one that also holds data: two real candidates, which is the only
+	// genuinely ambiguous case.
+	second := data + oldPrefix + "second"
+	require.NoError(t, os.Mkdir(second, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(second, "also-data.txt"), []byte("data"), 0o644))
 
 	err := recoverInterruptedSwap(data, quietLogger())
 	require.Error(t, err, "picking one of two copies of a volume's data is not this program's call")
@@ -1749,4 +1753,67 @@ func TestCanCreateSiblingLeavesNothingBehind(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Empty(t, stagingDirsFor(t, data), "the probe must not survive itself")
+}
+
+// The fallback reserves a name and then renames onto it. A process that dies in
+// between leaves an empty reservation, and the volume is untouched. Left in
+// place they accumulate, and a later genuine interruption then produces two
+// matches and a refusal to choose, turning a recoverable volume into a manual
+// job.
+func TestRecoverInterruptedSwapReapsAbandonedReservations(t *testing.T) {
+	data := liveVolume(t)
+	stale := data + oldPrefix + "abandoned"
+	require.NoError(t, os.Mkdir(stale, 0o755))
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	assert.NoDirExists(t, stale, "an empty reservation beside an intact volume is rubbish")
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "and the volume is untouched")
+
+	// The scenario the reaping exists to prevent: a later interruption must
+	// still be recoverable rather than ambiguous.
+	require.NoError(t, os.Rename(data, data+oldPrefix+"real"))
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume came back")
+	assert.Empty(t, displacedDirsFor(t, data))
+}
+
+// A directory beside an intact volume that holds data is not this function's to
+// delete, and not the operator's to discover months later.
+func TestRecoverInterruptedSwapKeepsAndReportsDisplacedDataBesideALiveVolume(t *testing.T) {
+	data := liveVolume(t)
+	leftover := data + oldPrefix + "holdsdata"
+	require.NoError(t, os.Mkdir(leftover, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(leftover, "something.txt"), []byte("x"), 0o644))
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, recoverInterruptedSwap(data, logger))
+	assert.DirExists(t, leftover, "data is never removed by recovery")
+	assert.Contains(t, logs.String(), "holds data")
+}
+
+// A volume is allowed to be empty, so an empty displaced copy is the volume
+// when the target is gone. Reaping it because it looks like a reservation would
+// throw away the very directory recovery exists to put back.
+func TestRecoverInterruptedSwapRestoresAnEmptyVolume(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "volumes", "myvol", "_data")
+	require.NoError(t, os.MkdirAll(data, 0o755))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"interrupted"))
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	require.DirExists(t, data, "an empty volume is still a volume")
+	assert.Empty(t, names(t, data))
+	assert.Empty(t, displacedDirsFor(t, data))
+}
+
+// One real copy plus an older abandoned reservation is not ambiguous: the
+// reservation is provably not the volume.
+func TestRecoverInterruptedSwapIgnoresAReservationAlongsideRealData(t *testing.T) {
+	data := liveVolume(t)
+	require.NoError(t, os.Mkdir(data+oldPrefix+"abandoned", 0o755))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"real"))
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	assert.Equal(t, []string{"original.txt"}, names(t, data))
+	assert.Empty(t, displacedDirsFor(t, data), "and the reservation went with it")
 }

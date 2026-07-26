@@ -27,6 +27,29 @@ import (
 // skips. The exchange happily trades a plain directory for a subvolume root, so
 // nothing fails and nothing warns: the only way to catch the loss is to look at
 // what the volume is afterwards.
+// btrfsPlainVolume returns a volume data dir that is an ordinary directory on
+// btrfs, so a staging sibling inherits the parent's inode flags the way it does
+// on any other filesystem.
+func btrfsPlainVolume(t *testing.T) string {
+	t.Helper()
+	root := os.Getenv("BM_BTRFS_DIR")
+	if root == "" {
+		t.Skip("set BM_BTRFS_DIR to a writable btrfs mount to run this")
+	}
+	base, err := os.MkdirTemp(root, "bm-plain-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+
+	data := filepath.Join(base, "volumes", "myvol", "_data")
+	require.NoError(t, os.MkdirAll(data, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(data, "original.txt"), []byte("original"), 0o644))
+
+	subvol, err := isBtrfsSubvolumeRoot(data)
+	require.NoError(t, err)
+	require.False(t, subvol, "the fixture must be an ordinary directory")
+	return data
+}
+
 func btrfsVolume(t *testing.T) string {
 	t.Helper()
 	root := os.Getenv("BM_BTRFS_DIR")
@@ -138,7 +161,7 @@ func TestRestoreWithSwapIsQuietAboutQgroupsWhenQuotasAreOff(t *testing.T) {
 // how every restored file is stored.
 func TestRestoreWithSwapKeepsNoCoWOnTheVolume(t *testing.T) {
 	data := btrfsVolume(t)
-	if err := writeInodeFlags(data, fsNoCoWFlag); err != nil {
+	if err := setInodeFlagsExactly(data, fsNoCoWFlag); err != nil {
 		t.Skipf("cannot set +C here: %v", err)
 	}
 	flags, ok, err := readInodeFlags(data)
@@ -165,13 +188,13 @@ func TestRestoreWithSwapKeepsNoCoWOnTheVolume(t *testing.T) {
 // restore over: the data lands correctly either way.
 func TestRestoreWithSwapWarnsWhenInodeFlagsCannotBeApplied(t *testing.T) {
 	data := btrfsVolume(t)
-	if err := writeInodeFlags(data, fsNoCoWFlag); err != nil {
+	if err := setInodeFlagsExactly(data, fsNoCoWFlag); err != nil {
 		t.Skipf("cannot set +C here: %v", err)
 	}
 
-	realWrite := writeInodeFlags
-	writeInodeFlags = func(string, int) error { return errors.New("refused") }
-	defer func() { writeInodeFlags = realWrite }()
+	realWrite := setInodeFlagsExactly
+	setInodeFlagsExactly = func(string, int) error { return errors.New("refused") }
+	defer func() { setInodeFlagsExactly = realWrite }()
 
 	logs, logger := capturedWarnLogger()
 	require.NoError(t, restoreWithSwap(data, logger, false, func(dest string) error {
@@ -179,4 +202,42 @@ func TestRestoreWithSwapWarnsWhenInodeFlagsCannotBeApplied(t *testing.T) {
 	}, nil))
 	assert.Contains(t, logs.String(), "inode flags")
 	assert.Equal(t, []string{"restored.txt"}, names(t, data), "and the restore still happened")
+}
+
+// The staging sibling inherits these flags from the parent directory, so one the
+// target does *not* have can arrive on its own. Only replacing the masked bits
+// takes it back off; adding bits leaves an inherited nodatacow in place and the
+// restored files silently stop being copy-on-write when the original was.
+func TestRestoreWithSwapClearsAFlagInheritedFromTheParent(t *testing.T) {
+	// A plain directory rather than a subvolume: staging for a subvolume target
+	// is made by "btrfs subvolume create", which does not inherit the parent's
+	// flags, so the fixture would never reproduce the inheritance this is about.
+	// The first version of this test used btrfsVolume and passed against the
+	// broken implementation for exactly that reason.
+	data := btrfsPlainVolume(t)
+	parent := filepath.Dir(data)
+
+	// The parent is +C, so anything created in it inherits nodatacow.
+	if err := setInodeFlagsExactly(parent, fsNoCoWFlag); err != nil {
+		t.Skipf("cannot set +C on the parent here: %v", err)
+	}
+	// The volume itself deliberately is not.
+	require.NoError(t, setInodeFlagsExactly(data, 0))
+	flags, ok, err := readInodeFlags(data)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Zero(t, flags&fsNoCoWFlag, "precondition: the volume is copy-on-write")
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		staged, _, flagErr := readInodeFlags(dest)
+		require.NoError(t, flagErr)
+		assert.Zero(t, staged&fsNoCoWFlag,
+			"staging inherited nodatacow from the parent and it was not cleared before the extract")
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	after, ok, err := readInodeFlags(data)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Zero(t, after&fsNoCoWFlag, "the volume silently gained nodatacow it never had")
 }

@@ -275,25 +275,79 @@ func resolveVolumeData(targetData string) (string, error) {
 }
 
 func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
-	if _, err := os.Lstat(targetData); err == nil || !os.IsNotExist(err) {
-		return nil // present, or unreadable for some other reason: nothing to do
-	}
 	matches, err := siblingsWithPrefix(targetData, oldPrefix)
 	if err != nil {
 		return fmt.Errorf("looking for data displaced by an interrupted restore beside %s: %w", targetData, err)
 	}
 	if len(matches) == 0 {
-		return nil // nothing to recover from
+		return nil
 	}
-	if len(matches) > 1 {
-		// Never expected: the window is two syscalls wide and only one restore
-		// of a volume runs at a time. Guessing which copy is the volume's is not
-		// this program's to do.
-		return fmt.Errorf("%s is missing and more than one displaced copy is beside it (%s); "+
+
+	targetPresent := true
+	if _, statErr := os.Lstat(targetData); statErr != nil && os.IsNotExist(statErr) {
+		targetPresent = false
+	}
+
+	// Whether an empty match is rubbish or is the volume depends entirely on
+	// this. While the target is there, an empty one can only be a name the
+	// fallback reserved and never renamed onto, left by a process that died in
+	// the two syscalls between; nothing was displaced, because the volume is
+	// still in place. Once the target is gone, an empty one may be the volume
+	// itself, because a volume is allowed to be empty. Reaping those
+	// unconditionally would throw away the very directory recovery exists to put
+	// back.
+	if targetPresent {
+		for _, m := range matches {
+			empty, emptyErr := isEmptyDir(m)
+			if emptyErr != nil {
+				return emptyErr
+			}
+			if !empty {
+				logger.Warn("a directory displaced by an earlier restore is beside this volume and holds data; "+
+					"the volume itself is fine, so remove it once you have looked at it",
+					"path", m, "volume", targetData)
+				continue
+			}
+			// Left in place these accumulate, and a later genuine interruption
+			// then produces two matches and a refusal to choose, turning a
+			// recoverable volume into a manual job.
+			if rmErr := os.Remove(m); rmErr != nil {
+				return fmt.Errorf("removing an abandoned reservation %s: %w", m, rmErr)
+			}
+			logger.Warn("removed a name reserved by a restore that did not finish", "path", m)
+		}
+		return nil
+	}
+
+	// The target is gone, so one of these is the volume. A non-empty one is
+	// certainly it; an empty one alongside can only be an earlier abandoned
+	// reservation, since a swap displaces exactly one directory.
+	var withData []string
+	for _, m := range matches {
+		empty, emptyErr := isEmptyDir(m)
+		if emptyErr != nil {
+			return emptyErr
+		}
+		if !empty {
+			withData = append(withData, m)
+		}
+	}
+	if len(withData) > 1 {
+		// Never expected: the window is two syscalls wide and one restore of a
+		// volume runs at a time. Choosing between two copies of a volume's data
+		// is not this program's to do.
+		return fmt.Errorf("%s is missing and more than one displaced copy beside it holds data (%s); "+
 			"a restore was interrupted more than once, so move the one you want to %s by hand",
-			targetData, strings.Join(matches, ", "), targetData)
+			targetData, strings.Join(withData, ", "), targetData)
 	}
+
+	// With no non-empty candidate every match is empty, and the volume was
+	// empty too: any of them restores the same directory.
 	displaced := matches[0]
+	if len(withData) == 1 {
+		displaced = withData[0]
+	}
+
 	if err := os.Rename(displaced, targetData); err != nil {
 		return fmt.Errorf("a previous restore was interrupted mid-swap and %s could not be moved back to %s: %w",
 			displaced, targetData, err)
@@ -309,7 +363,36 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 	}
 	logger.Warn("a previous restore was interrupted mid-swap; the volume's data has been put back",
 		"path", targetData, "recovered_from", displaced)
+
+	// Anything still beside it was an abandoned reservation, now provably so.
+	for _, m := range matches {
+		if m == displaced {
+			continue
+		}
+		if rmErr := os.Remove(m); rmErr != nil {
+			logger.Warn("could not remove a name reserved by a restore that did not finish",
+				"path", m, "error", rmErr)
+		}
+	}
 	return nil
+}
+
+// isEmptyDir reports whether path is a directory with no entries. A non
+// directory is never empty in the sense this asks about: it is something this
+// program did not create and must not remove.
+func isEmptyDir(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) == 0, nil
 }
 
 // createStagingLike makes the staging directory carry the same identity as the
@@ -393,7 +476,9 @@ const (
 	fsNoDumpFlag    = 0x00000040 // FS_NODUMP_FL
 	fsSyncFlag      = 0x00000008 // FS_SYNC_FL
 	fsDirSyncFlag   = 0x00010000 // FS_DIRSYNC_FL
-	inheritableMask = fsNoCoWFlag | fsCompressFlag | fsNoAtimeFlag | fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag
+	fsCasefoldFlag  = 0x40000000 // FS_CASEFOLD_FL
+	inheritableMask = fsNoCoWFlag | fsCompressFlag | fsNoAtimeFlag | fsNoDumpFlag |
+		fsSyncFlag | fsDirSyncFlag | fsCasefoldFlag
 )
 
 // copyInodeFlags carries the model's inheritable inode flags onto staging.
@@ -408,10 +493,17 @@ func copyInodeFlags(model, staging string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if !ok || flags&inheritableMask == 0 {
-		return nil
+	if !ok {
+		return nil // this filesystem has no inode flags to carry
 	}
-	if setErr := writeInodeFlags(staging, flags&inheritableMask); setErr != nil {
+	// The target's exact state across the mask, not merely its set bits. A fresh
+	// directory inherits these from its parent, so one the target does *not*
+	// have can arrive on staging by itself: a parent marked nodatacow gives it
+	// to a staging sibling even where _data was deliberately left copy-on-write,
+	// and only replacing the masked bits can take it back off. That also means
+	// there is no shortcut for a target with none of them set, which is exactly
+	// the case where an inherited flag would otherwise survive unnoticed.
+	if setErr := setInodeFlagsExactly(staging, flags&inheritableMask); setErr != nil {
 		// Not fatal. The data lands correctly either way, and refusing to
 		// restore a volume over a storage-behaviour flag is the worse outcome;
 		// but it changes how every restored file is stored, so it is said out
@@ -443,7 +535,9 @@ var readInodeFlags = func(path string) (int, bool, error) {
 	return flags, true, nil
 }
 
-var writeInodeFlags = func(path string, flags int) error {
+// setInodeFlagsExactly makes the masked bits on path equal want, leaving every
+// flag outside the mask as it is.
+var setInodeFlagsExactly = func(path string, want int) error {
 	// #nosec G304 -- a directory this process just created
 	f, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
@@ -454,7 +548,11 @@ var writeInodeFlags = func(path string, flags int) error {
 	if err != nil {
 		return err
 	}
-	return unix.IoctlSetPointerInt(int(f.Fd()), unix.FS_IOC_SETFLAGS, current|flags)
+	desired := (current &^ inheritableMask) | (want & inheritableMask)
+	if desired == current {
+		return nil
+	}
+	return unix.IoctlSetPointerInt(int(f.Fd()), unix.FS_IOC_SETFLAGS, desired)
 }
 
 // warnAboutProjectQuota reports a project quota that the replacement directory
