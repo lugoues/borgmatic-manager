@@ -24,29 +24,18 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
 fi
 
-if [ -n "$upgrade" ]; then
-    # try-restart: restarts only if currently active, never starts a
-    # service the operator left stopped or disabled. An in-flight backup
-    # receives SIGTERM and exits cleanly (borg checkpoints; the next cycle
-    # resumes). deb-systemd-invoke honors policy-rc.d in chroots/containers.
-    if command -v deb-systemd-invoke >/dev/null 2>&1; then
-        deb-systemd-invoke try-restart borgmatic-manager.service || true
-    elif command -v systemctl >/dev/null 2>&1; then
-        systemctl try-restart borgmatic-manager.service || true
-    fi
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
-        echo "borgmatic-manager upgraded; service restarted on the new binary."
-    fi
-    exit 0
-fi
-
-# A reinstall after a plain "remove" keeps the enablement symlink, since only
-# purge drops it. But preremove stopped the service, and nothing above starts it
-# again, so the package would come back enabled and inactive: the same silently
-# stopped backups that preserving the enablement exists to prevent.
+# The stamp is read before the upgrade branch, because $1/$2 cannot tell a
+# reinstall from an upgrade. `dpkg -r` leaves the package in config-files state,
+# so a later `dpkg -i` calls "configure <old-version>" exactly as an upgrade
+# does. Testing the arguments alone sent reinstalls down the try-restart path,
+# which does nothing to a service preremove had just stopped, and the package
+# came back enabled and dead: the silent stop this whole split exists to avoid.
 #
-# Two independent conditions have to agree, and the service is started only in
-# their intersection:
+# The stamp is the discriminator the arguments cannot provide. A true upgrade
+# never has one, because preremove exits before stopping anything.
+#
+# Two independent conditions then have to agree, and the service is started only
+# in their intersection:
 #
 #   the stamp   preremove stopped a service that was really running, so a fresh
 #               install has none, and neither does one the operator had already
@@ -80,6 +69,24 @@ if [ -n "$stamped" ] \
         echo "borgmatic-manager reinstalled; the removal had stopped a running service, so it was started again."
         exit 0
     fi
+fi
+
+# A reinstall that did not start anything (disabled, or policy-rc.d refused)
+# still must not print first-install instructions: this host is already set up.
+if [ -n "$upgrade" ] || [ -n "$stamped" ]; then
+    # try-restart: restarts only if currently active, never starts a
+    # service the operator left stopped or disabled. An in-flight backup
+    # receives SIGTERM and exits cleanly (borg checkpoints; the next cycle
+    # resumes). deb-systemd-invoke honors policy-rc.d in chroots/containers.
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke try-restart borgmatic-manager.service || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl try-restart borgmatic-manager.service || true
+    fi
+    if [ -n "$upgrade" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
+        echo "borgmatic-manager upgraded; service restarted on the new binary."
+    fi
+    exit 0
 fi
 
 cat <<'EOF'
