@@ -218,9 +218,11 @@ func runDoctor(ctx context.Context) error {
 			}
 
 			// Generation and borgmatic's own schema validation, in a throwaway dir.
-			if borgmaticPath != "" {
-				r.checkGenerate(ctx, e, backupState, borgmaticPath)
-			}
+			// Not gated on borgmatic being installed: label and config-shape
+			// problems are exactly what an operator is running doctor for, and
+			// they are diagnosable without it. Only the `config validate`
+			// sub-step needs the binary, and it says so when it is missing.
+			r.checkGenerate(ctx, e, backupState, borgmaticPath)
 		}
 	}
 
@@ -297,6 +299,18 @@ func (r *doctorReport) checkGenerate(ctx context.Context, e *env, backupState *m
 		return
 	}
 	r.pass("generate", fmt.Sprintf("%d config(s) compiled", len(files)))
+	r.validateGeneratedConfigs(ctx, files, borgmaticPath)
+}
+
+// validateGeneratedConfigs runs borgmatic's own schema check over each compiled
+// config. Everything before this point is the manager's own doing and needs no
+// borgmatic; only borgmatic can judge borgmatic's schema, so an absent binary
+// skips this step loudly rather than silently shortening the report.
+func (r *doctorReport) validateGeneratedConfigs(ctx context.Context, files []string, borgmaticPath string) {
+	if borgmaticPath == "" {
+		r.warn("validate", "skipped: borgmatic is not installed, so its schema check cannot run (the configs above still compiled)")
+		return
+	}
 
 	for _, file := range files {
 		group := strings.TrimSuffix(filepath.Base(file), ".yaml")
