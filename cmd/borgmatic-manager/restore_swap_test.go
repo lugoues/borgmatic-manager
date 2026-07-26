@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -424,8 +425,9 @@ func TestSyncTreeSkipsFIFOs(t *testing.T) {
 }
 
 // A completed extract can represent hours of work. When the safety recheck
-// aborts the swap, the error points the operator at that copy, so it has to
-// still be there.
+// aborts the swap, that copy is kept and named in the error, and it has to be
+// kept somewhere the operator's very next attempt will not delete: a retry
+// clears the staging path as its first act.
 func TestRestoreWithSwapKeepsTheExtractWhenTheRecheckAborts(t *testing.T) {
 	data := liveVolume(t)
 	appeared := errors.New("a container started using the volume")
@@ -435,11 +437,47 @@ func TestRestoreWithSwapKeepsTheExtractWhenTheRecheckAborts(t *testing.T) {
 	}, func() error { return appeared })
 
 	require.Error(t, err)
-	staging := data + stagingSuffix
-	require.DirExists(t, staging, "the completed extract must not be discarded")
-	assert.Contains(t, err.Error(), staging, "and the operator is told where it is")
-	assert.Equal(t, []string{"restored.txt"}, names(t, staging))
+	assert.NoDirExists(t, data+stagingSuffix, "not left on the path a retry clears first")
+
+	kept := keptDirsFor(t, data)
+	require.Len(t, kept, 1, "the completed extract is kept under a name later runs do not reuse")
+	assert.Contains(t, err.Error(), kept[0], "and the error points at where it actually is")
+	assert.Equal(t, []string{"restored.txt"}, names(t, kept[0]))
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume is untouched")
+}
+
+// A retry after that abort must not destroy the kept copy.
+func TestRestoreWithSwapRetryDoesNotDeleteAKeptExtract(t *testing.T) {
+	data := liveVolume(t)
+	appeared := errors.New("a container started using the volume")
+
+	require.Error(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, func() error { return appeared }))
+	kept := keptDirsFor(t, data)
+	require.Len(t, kept, 1)
+
+	// The operator stops the container and runs it again.
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "second.txt"), []byte("second"), 0o644)
+	}, func() error { return nil }))
+
+	assert.DirExists(t, kept[0], "the retry must not delete what the previous run deliberately kept")
+	assert.Equal(t, []string{"second.txt"}, names(t, data))
+}
+
+// keptDirsFor lists the retained copies beside a volume's data directory.
+func keptDirsFor(t *testing.T, data string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(data))
+	require.NoError(t, err)
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), filepath.Base(data)+".borgmatic-manager-kept-") {
+			out = append(out, filepath.Join(filepath.Dir(data), e.Name()))
+		}
+	}
+	return out
 }
 
 // A bind mount whose source shares the filesystem has the same device number as
