@@ -236,6 +236,7 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, lockDir str
 		name, last, result, files, size, next string
 		reason                                string // captured cause, failed runs only
 		failed                                bool
+		partial                               bool // group failed but some destinations backed up
 	}
 	rows := make([]row, 0, len(bs.Groups))
 	var soonest time.Duration = -1
@@ -271,8 +272,15 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, lockDir str
 				r.result = fmt.Sprintf("%s (exit %d)", o.Result, o.ExitCode)
 			}
 			if o.Result == state.ResultFailed {
-				r.failed = true
-				r.reason = o.LastError
+				// A fan-out where some destinations still backed up is partial, not
+				// a flat failure: surface it, but distinctly from 0-of-N.
+				if okN, total := runRepoHealth(o, rec); total > 1 && okN > 0 {
+					r.result = fmt.Sprintf("partial (%d/%d ok)", okN, total)
+					r.partial = true
+				} else {
+					r.failed = true
+					r.reason = o.LastError
+				}
 			}
 			if o.Files > 0 || o.OriginalBytes > 0 {
 				r.files = fmt.Sprintf("%d", o.Files)
@@ -346,6 +354,9 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, lockDir str
 				if strings.HasPrefix(r.result, "ok") {
 					return base.Inherit(styleName)
 				}
+				if r.partial {
+					return base.Inherit(styleWarn) // some destinations backed up
+				}
 				if r.result != "-" {
 					return base.Inherit(styleBad)
 				}
@@ -370,16 +381,26 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, lockDir str
 	printTable(tbl)
 
 	// Failed groups get a pointer to inspect; status stays a dashboard.
-	var failed []string
+	var failed, partial []string
 	for _, r := range rows {
-		if r.failed {
+		switch {
+		case r.failed:
 			failed = append(failed, r.name)
+		case r.partial:
+			partial = append(partial, r.name)
 		}
+	}
+	if len(partial) > 0 {
+		fmt.Println()
+		fmt.Println(edgePad + styleWarn.Render(plural(len(partial), "group")+" partial") +
+			styleDetail.Render(": "+strings.Join(partial, ", ")+" (some destinations failed, others backed up)"))
 	}
 	if len(failed) > 0 {
 		fmt.Println()
 		fmt.Println(edgePad + styleBad.Render(plural(len(failed), "group")+" failed") +
 			styleDetail.Render(": "+strings.Join(failed, ", ")))
+	}
+	if len(failed) > 0 || len(partial) > 0 {
 		fmt.Println(edgePad + styleDetail.Render("Run ") +
 			styleName.Render("borgmatic-manager inspect <group>") +
 			styleDetail.Render(" to see why, or ") +
@@ -620,6 +641,15 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 		}
 	}
 
+	// A fan-out to several repositories tracks each destination's freshness
+	// separately: one can fail (or its host go offline) while the others keep
+	// backing up, so a single group-level result would hide a dead destination.
+	if len(rec.Repositories) > 1 {
+		section("Repositories")
+		fmt.Println()
+		printRepoRows(rec.Repositories, now)
+	}
+
 	// Two axes: "total" is each archive's full logical size, "new" is the data
 	// added after deduplication. Same runs in both, so the shapes are comparable.
 	times, totals, deltas := trendSeries(rec.History)
@@ -684,6 +714,81 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	for _, line := range lines {
 		fmt.Println(edgePad + "  " + styleDetail.Render(line))
 	}
+}
+
+// runRepoHealth reports how many destinations this run confirmed ok (okN) out
+// of the group's tracked total. total comes from the persisted per-repo records
+// (every configured destination), falling back to the run's own set.
+func runRepoHealth(o *state.RunOutcome, rec state.GroupRecord) (okN, total int) {
+	for _, ro := range o.Repositories {
+		if ro.Result == state.ResultOK {
+			okN++
+		}
+	}
+	total = len(rec.Repositories)
+	if total == 0 {
+		total = len(o.Repositories)
+	}
+	return okN, total
+}
+
+// printRepoRows renders one row per repository in a fan-out group: each
+// destination's most recent result, when it last succeeded, and its last size.
+// A repo can be fresh (last success recent) even when its last_run shows a
+// failure it recovered from, or stale (last success old) while a sibling is fine.
+func printRepoRows(repos map[string]state.RepoRecord, now time.Time) {
+	ids := make([]string, 0, len(repos))
+	for id := range repos {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	type rrow struct{ id, result, lastOK, size string }
+	display := make([]rrow, 0, len(ids))
+	for _, id := range ids {
+		rr := repos[id]
+		result := "-"
+		if rr.LastRun != nil {
+			result = rr.LastRun.Result
+		}
+		lastOK := "never"
+		if !rr.LastSuccess.IsZero() {
+			lastOK = humanTime(rr.LastSuccess, now)
+		}
+		size := "-"
+		if rr.LastRun != nil && rr.LastRun.Result == state.ResultOK && (rr.LastRun.Files > 0 || rr.LastRun.OriginalBytes > 0) {
+			s := humanBytes(rr.LastRun.OriginalBytes)
+			if rr.LastRun.DeduplicatedBytes > 0 {
+				s += fmt.Sprintf(" (+%s dedup)", humanBytes(rr.LastRun.DeduplicatedBytes))
+			}
+			size = fmt.Sprintf("%d files, %s", rr.LastRun.Files, s)
+		}
+		display = append(display, rrow{id, result, lastOK, size})
+	}
+
+	tbl := borderlessTable(
+		func(row, col int) lipgloss.Style {
+			base := lipgloss.NewStyle().PaddingRight(2)
+			switch {
+			case row == table.HeaderRow:
+				return base.Inherit(styleKind)
+			case col == 0:
+				return base.Inherit(styleName)
+			case col == 1:
+				if strings.HasPrefix(display[row].result, state.ResultOK) {
+					return base.Inherit(styleName)
+				}
+				if display[row].result != "-" {
+					return base.Inherit(styleBad)
+				}
+			}
+			return base
+		},
+		"repository", "result", "last success", "size")
+	for _, r := range display {
+		tbl.Row(r.id, r.result, r.lastOK, r.size)
+	}
+	printTable(tbl)
 }
 
 // printRecentRuns renders a compact table of past run outcomes, newest first.
