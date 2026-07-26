@@ -48,24 +48,26 @@ func TestArchiveEntryPathSeparatesEntriesFromBanner(t *testing.T) {
 	lines := strings.Split(strings.TrimRight(listStdoutPathPresent, "\n"), "\n")
 	require.Len(t, lines, 3)
 
-	_, ok := archiveEntryPath([]byte(lines[0]))
+	_, ok := archiveEntryOf([]byte(lines[0]))
 	assert.False(t, ok, "the banner is not an entry")
 
-	dir, ok := archiveEntryPath([]byte(lines[1]))
+	dir, ok := archiveEntryOf([]byte(lines[1]))
 	require.True(t, ok)
-	assert.Equal(t, "myvol/_data", dir, "the directory lists as its own entry")
+	assert.Equal(t, "myvol/_data", dir.Path, "the directory lists as its own entry")
+	assert.Equal(t, archiveEntryDir, dir.Type, "and its type is what licenses an empty restore")
 
-	child, ok := archiveEntryPath([]byte(lines[2]))
+	child, ok := archiveEntryOf([]byte(lines[2]))
 	require.True(t, ok)
-	assert.Equal(t, "myvol/_data/file.txt", child, "and its contents below it")
+	assert.Equal(t, "myvol/_data/file.txt", child.Path, "and its contents below it")
 
-	_, ok = archiveEntryPath(nil)
+	_, ok = archiveEntryOf(nil)
 	assert.False(t, ok, "no output is not a match")
-	_, ok = archiveEntryPath([]byte("{not json"))
+	_, ok = archiveEntryOf([]byte("{not json"))
 	assert.False(t, ok, "a malformed line is not an entry")
-	got, ok := archiveEntryPath([]byte("  {\"path\": \"x\"}  "))
+	got, ok := archiveEntryOf([]byte("  {\"path\": \"x\", \"type\": \"-\"}  "))
 	require.True(t, ok, "surrounding whitespace is tolerated")
-	assert.Equal(t, "x", got)
+	assert.Equal(t, "x", got.Path)
+	assert.Equal(t, "-", got.Type, "a non-directory reports its own type rather than looking like one")
 }
 
 // headWriter caps what a chatty failure can cost in memory while keeping the
@@ -92,7 +94,7 @@ func TestFirstNonEmptyLinePicksTheCause(t *testing.T) {
 // The probe must treat a failed borgmatic as "cannot tell", never as "nothing
 // there": returning false with no error would let the caller wipe the target.
 func TestArchivePathPopulatedErrorsWhenBorgmaticFails(t *testing.T) {
-	found, _, err := archivePathPopulated(context.Background(), "/bin/false", "cfg.yaml", "latest", "myvol/_data")
+	found, _, _, err := archivePathPopulated(context.Background(), "/bin/false", "cfg.yaml", "latest", "myvol/_data")
 	require.Error(t, err, "a non-zero exit is an error, not an empty result")
 	assert.False(t, found)
 }
@@ -102,7 +104,7 @@ func TestArchivePathPopulatedReadsEntriesFromStdout(t *testing.T) {
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathPresent+"EOF\n"), 0o700))
 
-	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.NoError(t, err)
 	assert.True(t, found, "entries under the path mean the extract has something to write")
 }
@@ -112,7 +114,7 @@ func TestArchivePathPopulatedReportsBannerOnlyAsEmpty(t *testing.T) {
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathAbsent+"EOF\n"), 0o700))
 
-	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.NoError(t, err, "borgmatic exited 0: this is a real answer, not a probe failure")
 	assert.False(t, found, "an archive predating the volume must not be mirrored over live data")
 }
@@ -139,7 +141,7 @@ func TestArchivePathPopulatedStreamsALargeListing(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	runtime.GC()
 	runtime.ReadMemStats(&after)
 
@@ -163,7 +165,7 @@ func TestArchivePathPopulatedFailsWhenListingDiesAfterAnEntry(t *testing.T) {
 		"exit 2\n"
 	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
 
-	found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.Error(t, err, "an entry seen before a failure is not a confirmation")
 	assert.False(t, found)
 	assert.Contains(t, err.Error(), "chunk id mismatch", "the cause reaches the operator")
@@ -189,7 +191,7 @@ func TestArchivePathPopulatedErrorsOnUnreadableStreamWithoutHanging(t *testing.T
 	}
 	done := make(chan result, 1)
 	go func() {
-		found, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+		found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 		done <- result{found, err}
 	}()
 
@@ -210,7 +212,7 @@ func TestArchivePathPopulatedPassesExtractArguments(t *testing.T) {
 	argsFile := filepath.Join(dir, "args")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\necho \"$@\" > "+argsFile+"\n"), 0o700))
 
-	_, _, err := archivePathPopulated(context.Background(), stub, "/tmp/cfg.yaml", "weekly-1", "myvol/_data")
+	_, _, _, err := archivePathPopulated(context.Background(), stub, "/tmp/cfg.yaml", "weekly-1", "myvol/_data")
 	require.NoError(t, err)
 	recorded, err := os.ReadFile(argsFile)
 	require.NoError(t, err)
@@ -350,10 +352,11 @@ func TestArchivePathPopulatedDistinguishesAnEmptyArchivedDirectory(t *testing.T)
 `
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+onlyTheDirectory+"EOF\n"), 0o700))
 
-	found, hasChildren, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, hasChildren, rootIsDir, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.NoError(t, err)
 	assert.True(t, found, "the path is in the archive")
-	assert.False(t, hasChildren, "but it held nothing, so restoring to empty is correct")
+	assert.False(t, hasChildren, "but it held nothing")
+	assert.True(t, rootIsDir, "and it really is a directory, which is what licenses restoring to empty")
 }
 
 func TestArchivePathPopulatedReportsChildren(t *testing.T) {
@@ -361,8 +364,33 @@ func TestArchivePathPopulatedReportsChildren(t *testing.T) {
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathPresent+"EOF\n"), 0o700))
 
-	found, hasChildren, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	found, hasChildren, rootIsDir, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.True(t, hasChildren, "the archive holds files under the path")
+	assert.True(t, rootIsDir)
+}
+
+// An archive holding a symlink or a regular file where the volume directory
+// should be lists exactly like a directory with nothing in it. Only the type
+// separates them, and mistaking one for the other licenses swapping an empty
+// directory over a volume that has data in it.
+func TestArchivePathPopulatedDoesNotMistakeANonDirectoryForAnEmptyOne(t *testing.T) {
+	for name, line := range map[string]string{
+		"a symlink":      `{"type": "l", "mode": "lrwxrwxrwx", "path": "myvol/_data", "linktarget": "/elsewhere", "size": 0}`,
+		"a regular file": `{"type": "-", "mode": "-rw-r--r--", "path": "myvol/_data", "size": 12}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			stub := filepath.Join(dir, "borgmatic")
+			out := "/srv/repo: Listing archive host-1\n" + line + "\n"
+			require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+out+"EOF\n"), 0o700))
+
+			found, hasChildren, rootIsDir, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "host-1", "myvol/_data")
+			require.NoError(t, err)
+			assert.True(t, found, "it is in the archive")
+			assert.False(t, hasChildren)
+			assert.False(t, rootIsDir, "but it is not a directory, so an empty restore must not be licensed")
+		})
+	}
 }

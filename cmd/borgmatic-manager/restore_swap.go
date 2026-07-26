@@ -121,6 +121,13 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		return fmt.Errorf("flushing the restored data to disk (the volume is untouched): %w", syncErr)
 	}
 
+	// After the extract, before the swap: borg has to be able to write into
+	// staging, so this is the last moment it can be made read-only and the
+	// first at which doing so is harmless.
+	if roErr := matchSubvolumeReadOnly(targetData, staging, logger); roErr != nil {
+		return roErr
+	}
+
 	// Last check before the only destructive step.
 	if stillSafe != nil {
 		if safeErr := stillSafe(); safeErr != nil {
@@ -275,9 +282,17 @@ func resolveVolumeData(targetData string) (string, error) {
 }
 
 func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
-	matches, err := siblingsWithPrefix(targetData, oldPrefix)
+	matches, enumerable, err := siblingsWithPrefix(targetData, oldPrefix)
 	if err != nil {
 		return fmt.Errorf("looking for data displaced by an interrupted restore beside %s: %w", targetData, err)
+	}
+	if !enumerable {
+		// Recovery cannot help here, but a merge or in-place restore never
+		// needed it, so this is a warning rather than the end of the run.
+		logger.Warn("the volume's parent directory cannot be listed, so data displaced by an interrupted "+
+			"restore cannot be found; if the volume is missing, look beside it by hand",
+			"parent", filepath.Dir(targetData))
+		return nil
 	}
 	if len(matches) == 0 {
 		return nil
@@ -470,15 +485,16 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 // Defined here because golang.org/x/sys/unix exports the ioctls but not the
 // flag bits. Values are from linux/fs.h and are stable ABI.
 const (
-	fsNoCoWFlag     = 0x00800000 // FS_NOCOW_FL
-	fsCompressFlag  = 0x00000004 // FS_COMPR_FL
-	fsNoAtimeFlag   = 0x00000080 // FS_NOATIME_FL
-	fsNoDumpFlag    = 0x00000040 // FS_NODUMP_FL
-	fsSyncFlag      = 0x00000008 // FS_SYNC_FL
-	fsDirSyncFlag   = 0x00010000 // FS_DIRSYNC_FL
-	fsCasefoldFlag  = 0x40000000 // FS_CASEFOLD_FL
-	inheritableMask = fsNoCoWFlag | fsCompressFlag | fsNoAtimeFlag | fsNoDumpFlag |
-		fsSyncFlag | fsDirSyncFlag | fsCasefoldFlag
+	fsNoCoWFlag      = 0x00800000 // FS_NOCOW_FL
+	fsCompressFlag   = 0x00000004 // FS_COMPR_FL
+	fsNoAtimeFlag    = 0x00000080 // FS_NOATIME_FL
+	fsNoDumpFlag     = 0x00000040 // FS_NODUMP_FL
+	fsSyncFlag       = 0x00000008 // FS_SYNC_FL
+	fsDirSyncFlag    = 0x00010000 // FS_DIRSYNC_FL
+	fsNoCompressFlag = 0x00000400 // FS_NOCOMP_FL
+	fsCasefoldFlag   = 0x40000000 // FS_CASEFOLD_FL
+	inheritableMask  = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
+		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsCasefoldFlag
 )
 
 // copyInodeFlags carries the model's inheritable inode flags onto staging.
@@ -631,29 +647,61 @@ func canCreateSibling(targetData string) (bool, error) {
 // link names, and a literal *, ? or [ in that path would be read as glob
 // syntax. An unmatched bracket fails every staged restore, and a wildcard can
 // match a different volume's live staging directory and have it deleted.
-func siblingsWithPrefix(targetData, prefix string) ([]string, error) {
+func siblingsWithPrefix(targetData, prefix string) (siblings []string, enumerable bool, err error) {
 	parent := filepath.Dir(targetData)
 	entries, err := os.ReadDir(parent)
 	if err != nil {
-		return nil, err
+		// Write and search without read is a real mode (0300), and the previous
+		// in-place restore needed no permission to enumerate the parent at all.
+		// Not being able to look is not the same as there being nothing there,
+		// and it must not stop a restore that does not depend on looking.
+		if errors.Is(err, os.ErrPermission) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
 	want := filepath.Base(targetData) + prefix
 	var out []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), want) {
+		if madeByMkdirTemp(e.Name(), want) {
 			out = append(out, filepath.Join(parent, e.Name()))
 		}
 	}
-	return out, nil
+	return out, true, nil
+}
+
+// madeByMkdirTemp reports whether name is one MkdirTemp could have produced for
+// this prefix: the prefix followed by its random digits and nothing else.
+//
+// A bare prefix test is not enough. The prefix is public and predictable, so a
+// directory an application happens to call <volume>.borgmatic-manager-restoring-cache
+// matches it, and cleanup deletes whatever it matches. Requiring the exact shape
+// MkdirTemp produces is what makes "this is ours" a fact rather than a guess.
+func madeByMkdirTemp(name, prefix string) bool {
+	suffix, found := strings.CutPrefix(name, prefix)
+	if !found || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // clearStagingLeftovers removes staging directories a previous run died before
 // finishing. Every one of them was created by MkdirTemp under this tool's
 // prefix, so nothing else can own one.
 func clearStagingLeftovers(targetData string, logger *slog.Logger) error {
-	matches, err := siblingsWithPrefix(targetData, stagingPrefix)
+	matches, enumerable, err := siblingsWithPrefix(targetData, stagingPrefix)
 	if err != nil {
 		return fmt.Errorf("looking for leftover staging directories beside %s: %w", targetData, err)
+	}
+	if !enumerable {
+		logger.Warn("the volume's parent directory cannot be listed, so leftovers from an unfinished restore "+
+			"cannot be found; the restore itself is unaffected", "parent", filepath.Dir(targetData))
+		return nil
 	}
 	for _, stale := range matches {
 		if rmErr := os.RemoveAll(stale); rmErr != nil {
@@ -677,6 +725,16 @@ func copyAccessControlLists(from, to string) error {
 			return err
 		}
 		if !present {
+			// Absent on the model means absent on the replacement, not "leave
+			// whatever is there". Staging is created inside the parent, so a
+			// default ACL on the parent lands on it by inheritance, and copying
+			// only present values would promote a root granting access the
+			// volume never granted and passing it on to everything created
+			// under it afterwards.
+			if rmErr := removeXattr(to, attr); rmErr != nil {
+				return fmt.Errorf("the volume has no %s but one inherited onto %s could not be removed, "+
+					"so a swap would change who can reach the restored data (nothing was changed): %w", attr, to, rmErr)
+			}
 			continue
 		}
 		if err := setXattr(to, attr, value, 0); err != nil {
@@ -696,6 +754,16 @@ const seLinuxAttr = "security.selinux"
 // without SELinux; whether a copied label is *sufficient* on an enforcing host
 // is not, and needs a real one.
 var setXattr = unix.Lsetxattr
+
+// removeXattr deletes an extended attribute, treating "it was not there" as
+// success: the caller only wants it gone.
+var removeXattr = func(path, attr string) error {
+	err := unix.Lremovexattr(path, attr)
+	if err == nil || errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+		return nil
+	}
+	return err
+}
 
 // listXattrsFn is the seam for enumerating attributes, so a test can present a
 // volume carrying attributes this filesystem cannot actually hold.
@@ -831,6 +899,58 @@ func createStagingDir(model string, logger *slog.Logger) (string, error) {
 		return "", err
 	}
 	return staging, nil
+}
+
+// matchSubvolumeReadOnly makes the replacement subvolume read-only when the one
+// it replaces is.
+//
+// A read-only subvolume or snapshot is a deliberate protection, and the
+// in-place restore could not write through it at all. The staged swap builds a
+// writable replacement and promotes it, so an immutable volume quietly becomes
+// writable while the restore reports success.
+//
+// Only ever adds the restriction, never removes it: a writable target gets a
+// writable replacement by construction, so there is nothing to clear.
+func matchSubvolumeReadOnly(targetData, staging string, logger *slog.Logger) error {
+	subvolume, err := isBtrfsSubvolumeRoot(targetData)
+	if err != nil || !subvolume {
+		return err
+	}
+	readOnly, known := btrfsSubvolumeReadOnly(targetData)
+	if !known || !readOnly {
+		return nil
+	}
+	if setErr := setBtrfsSubvolumeReadOnly(staging, true); setErr != nil {
+		logger.Warn("this volume is a read-only btrfs subvolume, but the subvolume replacing it could not be "+
+			"made read-only, so the restored volume will be writable; set it back with "+
+			"\"btrfs property set -ts <path> ro true\"",
+			"path", staging, "error", setErr)
+	}
+	return nil
+}
+
+// btrfsSubvolumeReadOnly reports a subvolume's read-only property, and whether
+// it could be established at all.
+var btrfsSubvolumeReadOnly = func(path string) (bool, bool) {
+	// #nosec G204 -- fixed argv over a path this process derived
+	out, err := exec.Command("btrfs", "property", "get", "-ts", path, "ro").Output()
+	if err != nil {
+		return false, false
+	}
+	return strings.TrimSpace(string(out)) == "ro=true", true
+}
+
+var setBtrfsSubvolumeReadOnly = func(path string, readOnly bool) error {
+	value := "false"
+	if readOnly {
+		value = "true"
+	}
+	// #nosec G204 -- fixed argv over a path this process derived
+	out, err := exec.Command("btrfs", "property", "set", "-ts", path, "ro", value).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs property set ro=%s: %w: %s", value, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // btrfsQuotaEnabled reports whether qgroup accounting may apply to the

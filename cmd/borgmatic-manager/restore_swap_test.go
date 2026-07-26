@@ -99,7 +99,7 @@ func TestRestoreWithSwapRefusesAnEmptyExtract(t *testing.T) {
 // restore must start clean rather than promote a mixture of two restores.
 func TestRestoreWithSwapDiscardsLeftoverStaging(t *testing.T) {
 	data := liveVolume(t)
-	stale := data + stagingPrefix + "fromacrash"
+	stale := data + stagingPrefix + "2001"
 	require.NoError(t, os.MkdirAll(stale, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(stale, "from-a-previous-run.txt"), []byte("stale"), 0o644))
 
@@ -133,7 +133,7 @@ func TestRestoreWithSwapPreservesDirectoryMode(t *testing.T) {
 // directly, since a kernel with RENAME_EXCHANGE never reaches this path.
 func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	data := liveVolume(t)
-	missingStaging := data + stagingPrefix + "gone" // deliberately never created
+	missingStaging := data + stagingPrefix + "4001" // deliberately never created
 
 	_, err := swapByRenamePair(missingStaging, data)
 
@@ -293,7 +293,7 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 // know to go looking for it.
 func TestRecoverInterruptedSwapPutsTheDataBack(t *testing.T) {
 	data := liveVolume(t)
-	displaced := data + oldPrefix + "interrupted"
+	displaced := data + oldPrefix + "1001"
 	require.NoError(t, os.Rename(data, displaced)) // interrupted between the renames
 	require.NoDirExists(t, data)
 
@@ -307,7 +307,7 @@ func TestRecoverInterruptedSwapPutsTheDataBack(t *testing.T) {
 func TestRecoverInterruptedSwapLeavesAHealthyVolumeAlone(t *testing.T) {
 	data := liveVolume(t)
 	// A displaced copy from some earlier run, with the volume perfectly fine.
-	displaced := data + oldPrefix + "interrupted"
+	displaced := data + oldPrefix + "1001"
 	require.NoError(t, os.Mkdir(displaced, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(displaced, "stale.txt"), []byte("stale"), 0o644))
 
@@ -666,7 +666,7 @@ func TestResolveVolumeDataResolvesThroughADanglingLink(t *testing.T) {
 	assert.Equal(t, target, resolved, "an intact link resolves to what it names")
 
 	// The state an interrupted rename-pair swap leaves behind.
-	require.NoError(t, os.Rename(target, target+oldPrefix+"interrupted"))
+	require.NoError(t, os.Rename(target, target+oldPrefix+"1001"))
 	require.NoFileExists(t, target)
 
 	resolved, err = resolveVolumeData(data)
@@ -707,13 +707,13 @@ func TestEmptyVolumeDataJudgesTheVolumeNotItsBackingDirectory(t *testing.T) {
 func TestRetainOutOfTheWayDoesNotCollideWithinASecond(t *testing.T) {
 	data := liveVolume(t)
 
-	first := data + stagingPrefix + "one"
+	first := data + stagingPrefix + "3001"
 	require.NoError(t, os.Mkdir(first, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(first, "first.txt"), []byte("first"), 0o644))
 	keptFirst, err := retainOutOfTheWay(first, data)
 	require.NoError(t, err)
 
-	second := data + stagingPrefix + "two"
+	second := data + stagingPrefix + "3002"
 	require.NoError(t, os.Mkdir(second, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(second, "second.txt"), []byte("second"), 0o644))
 	keptSecond, err := retainOutOfTheWay(second, data)
@@ -732,7 +732,7 @@ func TestRetainOutOfTheWayDoesNotCollideWithinASecond(t *testing.T) {
 func TestRetainOutOfTheWayRemovesItsPlaceholderOnFailure(t *testing.T) {
 	data := liveVolume(t)
 
-	_, err := retainOutOfTheWay(data+stagingPrefix+"gone", data) // never created
+	_, err := retainOutOfTheWay(data+stagingPrefix+"4001", data) // never created
 	require.Error(t, err)
 	assert.Empty(t, keptDirsFor(t, data), "no empty placeholder was left behind")
 }
@@ -864,7 +864,7 @@ func TestRetainOrWarnReportsAFailureRatherThanHidingIt(t *testing.T) {
 		t.Skip("root writes into an unwritable directory anyway")
 	}
 	data := liveVolume(t)
-	staging := data + stagingPrefix + "one"
+	staging := data + stagingPrefix + "3001"
 	require.NoError(t, os.Mkdir(staging, 0o755))
 
 	// Retention creates its destination beside the target, so a parent that
@@ -1131,7 +1131,7 @@ func TestCreateStagingLikeCarriesAZeroLengthAttribute(t *testing.T) {
 // error still points at the kept one, and the next attempt deletes it.
 func TestRetainOutOfTheWayFlushesTheRename(t *testing.T) {
 	data := liveVolume(t)
-	staging := data + stagingPrefix + "one"
+	staging := data + stagingPrefix + "3001"
 	require.NoError(t, os.Mkdir(staging, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "kept.txt"), []byte("kept"), 0o644))
 
@@ -1153,7 +1153,7 @@ func TestRetainOutOfTheWayFlushesTheRename(t *testing.T) {
 // data really has moved by then, it just is not durable yet.
 func TestRetainOrWarnStillReportsThePathWhenTheFlushFails(t *testing.T) {
 	data := liveVolume(t)
-	staging := data + stagingPrefix + "one"
+	staging := data + stagingPrefix + "3001"
 	require.NoError(t, os.Mkdir(staging, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "kept.txt"), []byte("kept"), 0o644))
 
@@ -1305,7 +1305,7 @@ func TestIsEncryptedDirReportsAMissingPath(t *testing.T) {
 // them.
 func stagingDirsFor(t *testing.T, data string) []string {
 	t.Helper()
-	matches, err := siblingsWithPrefix(data, stagingPrefix)
+	matches, _, err := siblingsWithPrefix(data, stagingPrefix)
 	require.NoError(t, err)
 	return matches
 }
@@ -1342,7 +1342,7 @@ func TestRestoreWithSwapDoesNotDeleteAnUnrelatedSibling(t *testing.T) {
 // per-volume lock means no live run holds one, so they are cleared.
 func TestRestoreWithSwapClearsItsOwnLeftovers(t *testing.T) {
 	data := liveVolume(t)
-	stale := data + stagingPrefix + "fromadeadrun"
+	stale := data + stagingPrefix + "2002"
 	require.NoError(t, os.Mkdir(stale, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(stale, "partial.txt"), []byte("partial"), 0o644))
 
@@ -1507,7 +1507,7 @@ func TestProjectQuotaIDDoesNotInventOneForAnOrdinaryDirectory(t *testing.T) {
 // report, leaving _data missing again with nothing left explaining why.
 func TestRecoverInterruptedSwapFlushesTheRename(t *testing.T) {
 	data := liveVolume(t)
-	require.NoError(t, os.Rename(data, data+oldPrefix+"interrupted")) // interrupted between the renames
+	require.NoError(t, os.Rename(data, data+oldPrefix+"1001")) // interrupted between the renames
 
 	synced := make([]string, 0, 1)
 	realSync := syncDirFn
@@ -1527,7 +1527,7 @@ func TestRecoverInterruptedSwapFlushesTheRename(t *testing.T) {
 // loss can still take it away again.
 func TestRecoverInterruptedSwapReportsAFlushFailure(t *testing.T) {
 	data := liveVolume(t)
-	require.NoError(t, os.Rename(data, data+oldPrefix+"interrupted"))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"1001"))
 
 	realSync := syncDirFn
 	syncDirFn = func(string) error { return errors.New("disk went away") }
@@ -1543,7 +1543,7 @@ func TestRecoverInterruptedSwapReportsAFlushFailure(t *testing.T) {
 // volume's data path. Unique per run, so tests look them up.
 func displacedDirsFor(t *testing.T, data string) []string {
 	t.Helper()
-	matches, err := siblingsWithPrefix(data, oldPrefix)
+	matches, _, err := siblingsWithPrefix(data, oldPrefix)
 	require.NoError(t, err)
 	return matches
 }
@@ -1575,7 +1575,7 @@ func TestSwapByRenamePairDoesNotDeleteAnUnrelatedSibling(t *testing.T) {
 // advance, and must not guess when there is more than one.
 func TestRecoverInterruptedSwapFindsAUniquelyNamedDisplacedCopy(t *testing.T) {
 	data := liveVolume(t)
-	displaced := data + oldPrefix + "abc123"
+	displaced := data + oldPrefix + "6001"
 	require.NoError(t, os.Rename(data, displaced))
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
@@ -1586,10 +1586,10 @@ func TestRecoverInterruptedSwapFindsAUniquelyNamedDisplacedCopy(t *testing.T) {
 
 func TestRecoverInterruptedSwapRefusesToGuessBetweenTwo(t *testing.T) {
 	data := liveVolume(t)
-	require.NoError(t, os.Rename(data, data+oldPrefix+"first"))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"7001"))
 	// A second one that also holds data: two real candidates, which is the only
 	// genuinely ambiguous case.
-	second := data + oldPrefix + "second"
+	second := data + oldPrefix + "7002"
 	require.NoError(t, os.Mkdir(second, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(second, "also-data.txt"), []byte("data"), 0o644))
 
@@ -1671,9 +1671,9 @@ func TestSiblingsWithPrefixDoesNotMatchAcrossVolumes(t *testing.T) {
 	require.NoError(t, os.MkdirAll(root, 0o755))
 	greedy := filepath.Join(root, "_data*")
 	other := filepath.Join(root, "_data-other")
-	require.NoError(t, os.Mkdir(other+stagingPrefix+"live", 0o755))
+	require.NoError(t, os.Mkdir(other+stagingPrefix+"9002", 0o755))
 
-	matches, err := siblingsWithPrefix(greedy, stagingPrefix)
+	matches, _, err := siblingsWithPrefix(greedy, stagingPrefix)
 	require.NoError(t, err)
 	assert.Empty(t, matches, "a wildcard in one volume's name must not reach another volume's staging directory")
 }
@@ -1701,7 +1701,7 @@ func TestResolveVolumeDataFollowsAChainOfDanglingLinks(t *testing.T) {
 	assert.Equal(t, real, resolved, "an intact chain resolves to the end of it")
 
 	// Interrupted mid-swap: the real directory is displaced, both links remain.
-	displaced := real + oldPrefix + "interrupted"
+	displaced := real + oldPrefix + "1001"
 	require.NoError(t, os.Rename(real, displaced))
 
 	resolved, err = resolveVolumeData(data)
@@ -1762,7 +1762,7 @@ func TestCanCreateSiblingLeavesNothingBehind(t *testing.T) {
 // job.
 func TestRecoverInterruptedSwapReapsAbandonedReservations(t *testing.T) {
 	data := liveVolume(t)
-	stale := data + oldPrefix + "abandoned"
+	stale := data + oldPrefix + "8001"
 	require.NoError(t, os.Mkdir(stale, 0o755))
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
@@ -1771,7 +1771,7 @@ func TestRecoverInterruptedSwapReapsAbandonedReservations(t *testing.T) {
 
 	// The scenario the reaping exists to prevent: a later interruption must
 	// still be recoverable rather than ambiguous.
-	require.NoError(t, os.Rename(data, data+oldPrefix+"real"))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"8002"))
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume came back")
 	assert.Empty(t, displacedDirsFor(t, data))
@@ -1781,7 +1781,7 @@ func TestRecoverInterruptedSwapReapsAbandonedReservations(t *testing.T) {
 // delete, and not the operator's to discover months later.
 func TestRecoverInterruptedSwapKeepsAndReportsDisplacedDataBesideALiveVolume(t *testing.T) {
 	data := liveVolume(t)
-	leftover := data + oldPrefix + "holdsdata"
+	leftover := data + oldPrefix + "9001"
 	require.NoError(t, os.Mkdir(leftover, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(leftover, "something.txt"), []byte("x"), 0o644))
 
@@ -1798,7 +1798,7 @@ func TestRecoverInterruptedSwapRestoresAnEmptyVolume(t *testing.T) {
 	root := t.TempDir()
 	data := filepath.Join(root, "volumes", "myvol", "_data")
 	require.NoError(t, os.MkdirAll(data, 0o755))
-	require.NoError(t, os.Rename(data, data+oldPrefix+"interrupted"))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"1001"))
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	require.DirExists(t, data, "an empty volume is still a volume")
@@ -1810,10 +1810,92 @@ func TestRecoverInterruptedSwapRestoresAnEmptyVolume(t *testing.T) {
 // reservation is provably not the volume.
 func TestRecoverInterruptedSwapIgnoresAReservationAlongsideRealData(t *testing.T) {
 	data := liveVolume(t)
-	require.NoError(t, os.Mkdir(data+oldPrefix+"abandoned", 0o755))
-	require.NoError(t, os.Rename(data, data+oldPrefix+"real"))
+	require.NoError(t, os.Mkdir(data+oldPrefix+"8001", 0o755))
+	require.NoError(t, os.Rename(data, data+oldPrefix+"8002"))
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	assert.Equal(t, []string{"original.txt"}, names(t, data))
 	assert.Empty(t, displacedDirsFor(t, data), "and the reservation went with it")
+}
+
+// The prefix is public and predictable, so matching on it alone means cleanup
+// deletes anything an application happens to name that way. Only the exact
+// shape MkdirTemp produces is provably this tool's.
+func TestOnlyMkdirTempShapedNamesCountAsOurs(t *testing.T) {
+	const prefix = "_data.borgmatic-manager-restoring-"
+	for name, want := range map[string]bool{
+		"_data.borgmatic-manager-restoring-123456": true,
+		"_data.borgmatic-manager-restoring-0":      true,
+		"_data.borgmatic-manager-restoring-cache":  false,
+		"_data.borgmatic-manager-restoring-":       false,
+		"_data.borgmatic-manager-restoring-12a":    false,
+		"_data.borgmatic-manager-restoring-1-2":    false,
+		"_data.borgmatic-manager-restoring":        false,
+		"something-else":                           false,
+	} {
+		assert.Equal(t, want, madeByMkdirTemp(name, prefix), "%s", name)
+	}
+}
+
+func TestRestoreWithSwapDoesNotDeleteALookalikeSibling(t *testing.T) {
+	data := liveVolume(t)
+	lookalike := data + stagingPrefix + "cache" // shares the prefix, not the shape
+	require.NoError(t, os.Mkdir(lookalike, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(lookalike, "someone-elses.txt"), []byte("keep"), 0o644))
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restore still happened")
+	assert.FileExists(t, filepath.Join(lookalike, "someone-elses.txt"),
+		"a directory sharing the prefix but not the shape was deleted")
+}
+
+// Write and search without read is a real mode, and the in-place restore needed
+// no permission to enumerate the parent at all. Not being able to look must not
+// stop a restore that does not depend on looking.
+func TestSiblingsWithPrefixReportsAnUnlistableParentRatherThanFailing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads regardless of the directory mode")
+	}
+	data := liveVolume(t)
+	parent := filepath.Dir(data)
+	before, err := os.Stat(parent)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(parent, 0o300)) // write + search, no read
+	defer func() { _ = os.Chmod(parent, before.Mode().Perm()) }()
+
+	matches, enumerable, err := siblingsWithPrefix(data, stagingPrefix)
+	require.NoError(t, err, "an unlistable parent is an answer, not a failure")
+	assert.False(t, enumerable)
+	assert.Empty(t, matches)
+
+	// And the callers carry on rather than aborting the run.
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	require.NoError(t, clearStagingLeftovers(data, quietLogger()))
+}
+
+// A default ACL on the parent lands on staging by inheritance. Copying only
+// present values would promote a root granting access the volume never granted,
+// and passing it to everything created under it afterwards.
+func TestCreateStagingLikeRemovesAnAclTheVolumeDoesNotHave(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	removed := map[string]bool{}
+	restore := swapXattrSeams(t,
+		func(string) ([]string, error) { return nil, nil },
+		func(string, string) ([]byte, bool, error) { return nil, false, nil }, // the volume has no ACLs
+		func(string, string, []byte, int) error { return nil })
+	defer restore()
+	realRemove := removeXattr
+	removeXattr = func(_, attr string) error { removed[attr] = true; return nil }
+	defer func() { removeXattr = realRemove }()
+
+	_, err := createStagingLike(model, quietLogger())
+	require.NoError(t, err)
+	assert.True(t, removed["system.posix_acl_access"], "an inherited access ACL must be cleared")
+	assert.True(t, removed["system.posix_acl_default"], "and an inherited default ACL with it")
 }

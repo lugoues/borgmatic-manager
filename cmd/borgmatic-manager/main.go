@@ -1168,7 +1168,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// any, so it has nothing to lose and skips the probe.
 	archivedEmpty := false
 	if !merge {
-		found, hasChildren, probeErr := archivePathPopulated(ctx, borgmaticPath, configPath, archive, plan.archivePath)
+		found, hasChildren, rootIsDir, probeErr := archivePathPopulated(ctx, borgmaticPath, configPath, archive, plan.archivePath)
 		// Only when the operator named the archive. "latest" is not a name: borg
 		// resolves it per invocation, so the archive this probe examined and the
 		// one the extract restores are two separate answers to the same
@@ -1176,7 +1176,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// other disagreement is caught downstream by the empty-extract refusal;
 		// this one would license it instead, and erase a volume the archive it
 		// actually extracted never claimed was empty.
-		archivedEmpty = found && !hasChildren && archive != latestArchive
+		archivedEmpty = found && rootIsDir && !hasChildren && archive != latestArchive
 		if probeErr != nil {
 			return fmt.Errorf("cannot verify archive %q before emptying %s (nothing was changed): %w", archive, plan.targetData, probeErr)
 		}
@@ -1187,7 +1187,15 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// Say so here rather than letting the extract produce an empty directory
 		// and fail with "borgmatic reported success but extracted nothing",
 		// which describes a symptom and not the reason.
-		if found && !hasChildren && archive == latestArchive {
+		// Not a directory in the archive, so there is nothing to rebuild the
+		// volume from. Without this it lists exactly like an empty directory and
+		// would license swapping an empty one over the live data.
+		if found && !rootIsDir {
+			return fmt.Errorf("archive %q holds %q but it is not a directory, so a mirror restore has nothing to "+
+				"rebuild %s from (nothing was changed); check the archive with: borgmatic-manager borgmatic %s list",
+				archive, plan.archivePath, plan.targetData, group)
+		}
+		if found && rootIsDir && !hasChildren && archive == latestArchive {
 			return fmt.Errorf("the newest archive holds %q with nothing in it, so this restore would empty %s (nothing was changed); "+
 				"%q is resolved again when the extract runs and may not be this archive by then, so name the one you mean: "+
 				"borgmatic-manager borgmatic %s list", plan.archivePath, plan.targetData, latestArchive, group)
@@ -1584,7 +1592,7 @@ const (
 // it has children. A volume that was empty when it was backed up is in the
 // archive as a bare directory, and restoring it back to empty is correct, so
 // the caller needs to tell that apart from an extract that matched nothing.
-func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archive, archivePath string) (found, hasChildren bool, err error) {
+func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archive, archivePath string) (found, hasChildren, rootIsDir bool, err error) {
 	// borg's --json-lines emits one object per file, so a volume with millions
 	// of them would be a multi-gigabyte buffer. Stream it instead: memory stays
 	// flat regardless of archive size.
@@ -1607,12 +1615,12 @@ func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archiv
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return false, false, err
+		return false, false, false, err
 	}
 	stderr := &headWriter{maxBytes: maxProbeStderrBytes}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
-		return false, false, err
+		return false, false, false, err
 	}
 
 	// Read to the end even once an entry is found. The scanner discards each
@@ -1630,16 +1638,18 @@ func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archiv
 		if found && hasChildren {
 			continue
 		}
-		entryPath, ok := archiveEntryPath(scanner.Bytes())
+		entry, ok := archiveEntryOf(scanner.Bytes())
 		if !ok {
 			continue
 		}
 		found = true
 		// The directory itself lists as its own entry; anything below it is a
 		// child, and one child is enough to know the archive is not empty here.
-		if entryPath != archivePath && entryPath != strings.TrimSuffix(archivePath, "/") {
+		if entry.Path != archivePath && entry.Path != strings.TrimSuffix(archivePath, "/") {
 			hasChildren = true
+			continue
 		}
+		rootIsDir = entry.Type == archiveEntryDir
 	}
 	scanErr := scanner.Err()
 
@@ -1653,33 +1663,43 @@ func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archiv
 	// A truncated or unreadable stream is "cannot tell", never "nothing there":
 	// the caller must refuse to wipe rather than act on a half-read listing.
 	if scanErr != nil {
-		return false, false, fmt.Errorf("reading the archive listing: %w", scanErr)
+		return false, false, false, fmt.Errorf("reading the archive listing: %w", scanErr)
 	}
 	if waitErr != nil {
 		if msg := firstNonEmptyLine(stderr.String()); msg != "" {
-			return false, false, fmt.Errorf("%w: %s", waitErr, msg)
+			return false, false, false, fmt.Errorf("%w: %s", waitErr, msg)
 		}
-		return false, false, waitErr
+		return false, false, false, waitErr
 	}
-	return found, hasChildren, nil
+	return found, hasChildren, rootIsDir, nil
 }
 
 // archiveEntryPath returns the path from one of borg's --json-lines entries.
 // Lines that are not entries, notably borgmatic's human "<repo>: Listing
 // archive <name>" banner on stdout ahead of them, report false: non-empty
 // stdout is not by itself a match.
-func archiveEntryPath(line []byte) (string, bool) {
+// archiveEntry is one line of borgmatic's listing. The type is as load-bearing
+// as the path: an archive holding a symlink or a regular file where the volume
+// directory should be lists exactly like a directory with nothing in it, and
+// that is the one shape that licenses replacing a volume with an empty one.
+type archiveEntry struct {
+	Path string `json:"path"`
+	Type string `json:"type"`
+}
+
+// archiveEntryDir is borg's type letter for a directory.
+const archiveEntryDir = "d"
+
+func archiveEntryOf(line []byte) (archiveEntry, bool) {
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return "", false
+		return archiveEntry{}, false
 	}
-	var entry struct {
-		Path string `json:"path"`
-	}
+	var entry archiveEntry
 	if err := json.Unmarshal(trimmed, &entry); err != nil {
-		return "", false
+		return archiveEntry{}, false
 	}
-	return entry.Path, true
+	return entry, true
 }
 
 // headWriter keeps the first maxBytes written and silently drops the rest, so a
