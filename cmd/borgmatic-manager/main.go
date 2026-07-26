@@ -1113,11 +1113,20 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return runBorgmaticExtract(ctx, borgmaticPath, configPath, archive, plan.archivePath, destination)
 	}
 
+	// A _data that is its own mount point (an NFS, CIFS, or bind-backed volume)
+	// cannot be renamed, and its staging sibling would land on the parent
+	// filesystem. Decide that here rather than after a full extract that would
+	// then fail at the swap.
+	mounted, mountErr := isOwnMountPoint(plan.targetData)
+	if mountErr != nil {
+		return mountErr
+	}
+
 	// Mirror restores stage and swap, so the live data is never destroyed
-	// before its replacement exists on disk. Two cases cannot: --merge is
-	// additive and has nothing to replace, and --force means a container is
-	// running with this directory bind-mounted, which pins the inode a swap
-	// would move out from under it.
+	// before its replacement exists on disk. Three cases cannot: --merge is
+	// additive and has nothing to replace, --force means a container is running
+	// with this directory bind-mounted and pins the inode a swap would move,
+	// and a mount point cannot be renamed at all.
 	switch {
 	case merge:
 		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (merge)\n", group, volume, archive, plan.targetData)
@@ -1127,11 +1136,18 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		logger.Info("restore complete", "path", plan.targetData)
 		return nil
 
-	case force && running:
-		logger.Warn("a running container has this volume mounted, so the restore writes in place: "+
-			"the data is replaced as borgmatic extracts, and a failure can leave it partially restored",
-			"path", plan.targetData)
-		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (in place, --force)\n", group, volume, archive, plan.targetData)
+	case (force && running) || mounted:
+		if mounted {
+			logger.Warn("this volume's data directory is its own mount point, so it cannot be swapped into place "+
+				"and the restore writes in place instead: the data is replaced as borgmatic extracts, "+
+				"and a failure can leave it partially restored. Take your own copy first if that matters",
+				"path", plan.targetData)
+		} else {
+			logger.Warn("a running container has this volume mounted, so the restore writes in place: "+
+				"the data is replaced as borgmatic extracts, and a failure can leave it partially restored",
+				"path", plan.targetData)
+		}
+		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (in place)\n", group, volume, archive, plan.targetData)
 		if wipeErr := emptyVolumeData(plan.targetData); wipeErr != nil {
 			return fmt.Errorf("emptying the target before a mirror restore: %w", wipeErr)
 		}
@@ -1144,7 +1160,22 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	default:
 		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (mirror, staged at %s)\n",
 			group, volume, archive, plan.targetData, stagingPathFor(plan.targetData))
-		return restoreWithSwap(plan.targetData, logger, archivedEmpty, extract)
+		// The extract can run for a long time. A container started in the
+		// meantime has mounted the very inode the swap is about to move, so ask
+		// again at the last moment rather than trusting the earlier answer.
+		stillSafe := func() error {
+			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+			if checkErr != nil {
+				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
+			}
+			if live {
+				return fmt.Errorf("a container started using volume %q while the restore was running, "+
+					"so swapping the data now would leave it writing into an orphaned directory; "+
+					"stop it and run the restore again", plan.targetVolume)
+			}
+			return nil
+		}
+		return restoreWithSwap(plan.targetData, logger, archivedEmpty, extract, stillSafe)
 	}
 }
 

@@ -43,7 +43,10 @@ var errStranded = errors.New("restore stranded mid-swap")
 // error if it did not complete.
 // allowEmpty says the archive holds this directory but no children, so an empty
 // extract is the correct result rather than a sign that nothing matched.
-func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, extract func(destination string) error) (err error) {
+// stillSafe is checked again immediately before the swap. The extract can take
+// a long time, and a container started meanwhile would have mounted the very
+// inode the swap is about to move out from under it.
+func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, extract func(destination string) error, stillSafe func() error) (err error) {
 	staging := targetData + stagingSuffix
 
 	// A previous run killed between extract and swap leaves this behind. It is
@@ -89,18 +92,27 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		return fmt.Errorf("flushing the restored data to disk (the volume is untouched): %w", syncErr)
 	}
 
+	// Last check before the only destructive step.
+	if stillSafe != nil {
+		if safeErr := stillSafe(); safeErr != nil {
+			return fmt.Errorf("%w (the volume is untouched; the restored copy is at %s)", safeErr, staging)
+		}
+	}
+
 	displaced, swapErr := swapIntoPlace(staging, targetData)
 	if swapErr != nil {
 		return swapErr
 	}
 	committed = true
 	// Persist the swap itself before removing the copy it replaced, or a power
-	// loss here could replay the deletion without the rename.
+	// loss could replay the deletion without the rename and lose both.
 	if syncErr := syncDir(filepath.Dir(targetData)); syncErr != nil {
-		logger.Warn("could not flush the volume directory after the swap; the restore is in place but not yet durable",
-			"path", filepath.Dir(targetData), "error", syncErr)
+		logger.Warn("the restore is in place but the swap could not be flushed to disk, so the copy it replaced is being kept; "+
+			"delete it once the volume looks right",
+			"path", filepath.Dir(targetData), "kept", displaced, "error", syncErr)
+		return nil
 	}
-	// The restore is done and live. Failing to delete the copy it replaced is
+	// The restore is done and durable. Failing to delete the copy it replaced is
 	// wasted disk, not a failed restore, so it must not become a nonzero exit
 	// for an operation that succeeded.
 	if rmErr := os.RemoveAll(displaced); rmErr != nil {
@@ -229,14 +241,14 @@ var aclAttrs = []string{"system.posix_acl_access", "system.posix_acl_default"}
 
 func copyAccessControlLists(from, to string) error {
 	for _, attr := range aclAttrs {
-		value, present, err := readXattr(from, attr)
+		value, present, err := readXattrFn(from, attr)
 		if err != nil {
 			return err
 		}
 		if !present {
 			continue
 		}
-		if err := unix.Lsetxattr(to, attr, value, 0); err != nil {
+		if err := setXattr(to, attr, value, 0); err != nil {
 			return fmt.Errorf("the volume has a POSIX ACL (%s) that could not be applied to %s, "+
 				"so a swap would change who can reach the restored data (nothing was changed); "+
 				"run the restore as root, or use --merge to write in place: %w", attr, to, err)
@@ -247,11 +259,22 @@ func copyAccessControlLists(from, to string) error {
 
 const seLinuxAttr = "security.selinux"
 
+// setXattr is the seam for the one operation this package cannot exercise on a
+// non-SELinux kernel. The decision it feeds (an existing label that will not
+// apply must stop the restore) is the part worth testing, and it is testable
+// without SELinux; whether a copied label is *sufficient* on an enforcing host
+// is not, and needs a real one.
+var setXattr = unix.Lsetxattr
+
+// readXattrFn is the matching read seam, so a test can present a label on a
+// kernel that has none.
+var readXattrFn = readXattr
+
 // readSELinuxContext returns the directory's SELinux label and whether it had
 // one at all. A host without SELinux, or a filesystem without extended
 // attributes, has nothing to copy and is not an error.
 func readSELinuxContext(path string) (label string, present bool, err error) {
-	value, present, err := readXattr(path, seLinuxAttr)
+	value, present, err := readXattrFn(path, seLinuxAttr)
 	if err != nil || !present {
 		return "", false, err
 	}
@@ -288,7 +311,7 @@ func readXattr(path, attr string) (value []byte, present bool, err error) {
 // restored volume its own container can no longer read, and the wrong moment to
 // find that out is after the original has been removed.
 func applySELinuxContext(path, label string) error {
-	if err := unix.Lsetxattr(path, seLinuxAttr, []byte(label), 0); err != nil {
+	if err := setXattr(path, seLinuxAttr, []byte(label), 0); err != nil {
 		return fmt.Errorf("the volume carries the SELinux label %q, which could not be applied to %s, "+
 			"so a swap would leave the volume unreadable by its container (nothing was changed); "+
 			"run the restore as root, or use --merge to write in place: %w", label, path, err)
@@ -315,8 +338,12 @@ func syncTree(root string) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		// A symlink has no contents of its own to flush.
-		if d.Type()&fs.ModeSymlink != 0 {
+		// Only regular files and directories have contents to flush, and only
+		// they are safe to open: opening a FIFO blocks until a writer appears,
+		// and borgmatic has already exited, so an archive containing a named
+		// pipe would hang the restore here forever. Devices and sockets are
+		// skipped for the same reason.
+		if !d.IsDir() && !d.Type().IsRegular() {
 			return nil
 		}
 		rel, relErr := filepath.Rel(root, path)
@@ -348,6 +375,21 @@ func syncDir(path string) error {
 		syncErr = closeErr
 	}
 	return syncErr
+}
+
+// isOwnMountPoint reports whether path is the root of a mount, which is what a
+// volume backed by NFS, CIFS, or a bind looks like. Such a directory cannot be
+// renamed (EBUSY) and its staging sibling would land on the parent filesystem,
+// so the stage-and-swap strategy does not apply to it at all.
+func isOwnMountPoint(path string) (bool, error) {
+	var self, parent unix.Stat_t
+	if err := unix.Lstat(path, &self); err != nil {
+		return false, fmt.Errorf("inspecting %s: %w", path, err)
+	}
+	if err := unix.Lstat(filepath.Dir(path), &parent); err != nil {
+		return false, fmt.Errorf("inspecting %s: %w", filepath.Dir(path), err)
+	}
+	return self.Dev != parent.Dev, nil
 }
 
 // stagingPathFor is the staging sibling for a target, exposed so callers can

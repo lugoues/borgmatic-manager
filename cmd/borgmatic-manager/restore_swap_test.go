@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,7 +40,7 @@ func TestRestoreWithSwapReplacesTheLiveData(t *testing.T) {
 
 	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
-	})
+	}, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"restored.txt"}, names(t, data), "mirror semantics: the old contents are gone")
@@ -63,7 +64,7 @@ func TestRestoreWithSwapLeavesLiveDataIntactWhenExtractFails(t *testing.T) {
 		// A partial extract, then failure: the realistic shape.
 		require.NoError(t, os.WriteFile(filepath.Join(dest, "half.txt"), []byte("partial"), 0o644))
 		return boom
-	})
+	}, nil)
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, boom, "the cause reaches the operator")
@@ -77,7 +78,7 @@ func TestRestoreWithSwapLeavesLiveDataIntactWhenExtractFails(t *testing.T) {
 func TestRestoreWithSwapRefusesAnEmptyExtract(t *testing.T) {
 	data := liveVolume(t)
 
-	err := restoreWithSwap(data, quietLogger(), false, func(string) error { return nil })
+	err := restoreWithSwap(data, quietLogger(), false, func(string) error { return nil }, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "extracted nothing")
@@ -96,7 +97,7 @@ func TestRestoreWithSwapDiscardsLeftoverStaging(t *testing.T) {
 	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		assert.Empty(t, names(t, dest), "the staging directory starts empty")
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
-	})
+	}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"restored.txt"}, names(t, data))
 }
@@ -111,7 +112,7 @@ func TestRestoreWithSwapPreservesDirectoryMode(t *testing.T) {
 
 	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("x"), 0o644)
-	}))
+	}, nil))
 
 	after, err := os.Stat(data)
 	require.NoError(t, err)
@@ -145,26 +146,44 @@ func TestReadSELinuxContextTreatsAbsentLabelsAsAbsent(t *testing.T) {
 	assert.Empty(t, label)
 }
 
-// A label that exists but cannot be applied must stop the restore. Promoting a
-// mislabelled directory hands back a volume the container cannot read, and the
-// original is gone by the time anyone finds out.
+// A label that exists but cannot be applied must stop the restore before the
+// swap. Promoting a mislabelled directory hands back a volume its own container
+// cannot read, and the original is gone by the time anyone finds out. Driven
+// through the xattr seam, because this kernel has no SELinux to refuse for real
+// (Ubuntu ships AppArmor, and an LSM is not something a container can supply).
 func TestCreateStagingLikeRefusesWhenTheLabelCannotBeApplied(t *testing.T) {
 	dir := t.TempDir()
 	model := filepath.Join(dir, "_data")
 	require.NoError(t, os.Mkdir(model, 0o755))
 
-	if err := unix.Lsetxattr(model, seLinuxAttr, []byte("system_u:object_r:container_file_t:s0"), 0); err != nil {
-		t.Skipf("cannot set an SELinux label here: %v", err)
-	}
+	const label = "system_u:object_r:container_file_t:s0"
+	// Pretend the volume is labelled, and that applying it is refused, which is
+	// what an unprivileged restore on an enforcing host actually sees.
+	restore := stubXattr(t, map[string][]byte{seLinuxAttr: []byte(label)}, unix.EPERM)
+	defer restore()
 
-	// Applying is only reachable when reading found one; if this host let us
-	// write the label it will let us copy it, so assert the copy instead.
 	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	require.NoError(t, createStagingLike(staging, model))
-	got, present, err := readSELinuxContext(staging)
-	require.NoError(t, err)
-	require.True(t, present, "the label was carried to the replacement")
-	assert.Equal(t, "system_u:object_r:container_file_t:s0", got)
+	err := createStagingLike(staging, model)
+
+	require.Error(t, err, "an unappliable label must stop the restore, not be ignored")
+	require.ErrorIs(t, err, unix.EPERM)
+	assert.Contains(t, err.Error(), label, "the operator is told which label")
+	assert.Contains(t, err.Error(), "nothing was changed")
+	assert.Contains(t, err.Error(), "--merge", "and how to proceed anyway")
+}
+
+// A volume with no label at all must not be blocked: that is every non-SELinux
+// host, and the overwhelmingly common case.
+func TestCreateStagingLikeProceedsWithoutALabel(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	// Refuses every write, but there is nothing to write.
+	restore := stubXattr(t, nil, unix.EPERM)
+	defer restore()
+
+	assert.NoError(t, createStagingLike(filepath.Join(dir, "_data"+stagingSuffix), model))
 }
 
 // The special bits carry semantics a volume can depend on: setgid decides
@@ -215,7 +234,7 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 
 	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
-	})
+	}, nil)
 
 	require.NoError(t, err, "a cleanup failure must not fail a restore that landed")
 	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restored data is live")
@@ -257,7 +276,7 @@ func TestRecoverInterruptedSwapLeavesAHealthyVolumeAlone(t *testing.T) {
 func TestRestoreWithSwapAcceptsAnArchivedEmptyDirectory(t *testing.T) {
 	data := liveVolume(t)
 
-	err := restoreWithSwap(data, quietLogger(), true, func(string) error { return nil })
+	err := restoreWithSwap(data, quietLogger(), true, func(string) error { return nil }, nil)
 
 	require.NoError(t, err, "the archive holds this directory with no children")
 	assert.Empty(t, names(t, data), "the volume is restored to the empty state it was archived in")
@@ -320,5 +339,57 @@ func TestCreateStagingLikeCopiesPOSIXACLs(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, present, "%s was not carried to the replacement", attr)
 		assert.Equal(t, want, got, "%s differs from the original", attr)
+	}
+}
+
+// stubXattr makes the model directory appear to carry present, and makes every
+// attempt to write an attribute fail with writeErr. Returns a restore func.
+func stubXattr(t *testing.T, present map[string][]byte, writeErr error) func() {
+	t.Helper()
+	realRead, realWrite := readXattrFn, setXattr
+	readXattrFn = func(path, attr string) ([]byte, bool, error) {
+		v, ok := present[attr]
+		return v, ok, nil
+	}
+	setXattr = func(string, string, []byte, int) error { return writeErr }
+	return func() { readXattrFn, setXattr = realRead, realWrite }
+}
+
+// The extract can run for a long time, and a container started meanwhile has
+// mounted the very inode the swap is about to move. The last-moment recheck
+// must stop the swap, and the restored copy must be kept rather than discarded.
+func TestRestoreWithSwapAbortsIfTheVolumeBecameLiveDuringTheExtract(t *testing.T) {
+	data := liveVolume(t)
+	appeared := errors.New("a container started using the volume")
+
+	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, func() error { return appeared })
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, appeared)
+	assert.Contains(t, err.Error(), "volume is untouched")
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "the live data was not swapped")
+}
+
+// A named pipe in the archive would block a read-only open forever, and
+// borgmatic has already exited by then, so the restore would hang just before
+// the swap. Only regular files and directories are opened.
+func TestSyncTreeSkipsFIFOs(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "regular.txt"), []byte("x"), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "sub"), 0o755))
+	if err := unix.Mkfifo(filepath.Join(dir, "pipe"), 0o644); err != nil {
+		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- syncTree(dir) }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("syncTree blocked, almost certainly opening the FIFO and waiting for a writer")
 	}
 }
