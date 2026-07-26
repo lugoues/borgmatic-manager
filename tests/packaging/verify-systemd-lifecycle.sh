@@ -67,6 +67,22 @@ ck() {
   if [ "$2" = "$3" ]; then echo "  ok    $1 ($3)"; PASS=$((PASS+1))
   else echo "  FAIL  $1: expected '$2' got '$3'"; FAIL=$((FAIL+1)); fi
 }
+# Every dpkg invocation is itself an assertion. A maintainer script that does
+# the right thing and then exits nonzero leaves state the checks below would
+# happily accept, so discarding these statuses would let that ship. There is no
+# `set -e` here on purpose: one failure should not abort the remaining
+# scenarios. Removing or purging a package that is not installed exits 0, so
+# teardown can be checked on the same footing as the scenario steps.
+dpkg_run() {
+  local label="$1"; shift
+  local out rc
+  out=$("$@" 2>&1); rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "  FAIL  $label exited $rc"
+    printf '%s\n' "$out" | tail -3 | sed 's/^/          /'
+    FAIL=$((FAIL+1))
+  fi
+}
 active()  { systemctl is-active borgmatic-manager 2>/dev/null || true; }
 # Wait for a settled state rather than sleeping a guessed interval: on a loaded
 # CI runner a fixed sleep is the difference between a green suite and a flake.
@@ -102,11 +118,11 @@ dropin() {
   systemctl daemon-reload
 }
 reset() {
-  dpkg --purge borgmatic-manager >/dev/null 2>&1
+  dpkg_run "reset: dpkg --purge" dpkg --purge borgmatic-manager
   rm -rf /var/lib/borgmatic-manager /etc/borgmatic-manager
   systemctl daemon-reload
 }
-install_pkg() { dpkg -i /root/bm.deb >/dev/null 2>&1; dropin; }
+install_pkg() { dpkg_run "dpkg -i" dpkg -i /root/bm.deb; dropin; }
 
 # A real Debian host has no policy-rc.d. This image ships one that denies
 # everything, which is its own test case at the end.
@@ -124,7 +140,7 @@ ck "enabled" enabled "$(enabled)"
 ck "active" active "$(active)"
 
 echo "--- dpkg -r stops it but keeps the operator's choices"
-dpkg -r borgmatic-manager >/dev/null 2>&1; settle inactive
+dpkg_run "dpkg -r" dpkg -r borgmatic-manager; settle inactive
 ck "stopped" inactive "$(active)"
 ck "enablement preserved" yes "$(linked $WANTS)"
 ck "recorded that it stopped a running service" yes "$(exists $STAMP)"
@@ -136,7 +152,7 @@ ck "running again" active "$(active)"
 ck "record consumed" no "$(exists $STAMP)"
 
 echo "--- purge forgets the enablement"
-dpkg --purge borgmatic-manager >/dev/null 2>&1; systemctl daemon-reload
+dpkg_run "dpkg --purge" dpkg --purge borgmatic-manager; systemctl daemon-reload
 ck "enablement dropped" no "$(linked $WANTS)"
 ck "record dropped" no "$(exists $STAMP)"
 
@@ -158,7 +174,7 @@ echo "--- a deliberately stopped service is left stopped"
 reset; install_pkg
 systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; settle active
 systemctl stop borgmatic-manager; settle inactive
-dpkg -r borgmatic-manager >/dev/null 2>&1
+dpkg_run "dpkg -r" dpkg -r borgmatic-manager
 ck "nothing was running, so nothing recorded" no "$(exists $STAMP)"
 install_pkg; sleep 2  # a negative needs a real pause: nothing to settle toward
 ck "operator's choice respected" inactive "$(active)"
@@ -167,14 +183,14 @@ echo "--- purge clears a --runtime enablement too"
 reset; install_pkg
 systemctl enable --runtime --quiet borgmatic-manager
 ck "runtime enablement present" yes "$(linked $RUNTIME_WANTS)"
-dpkg --purge borgmatic-manager >/dev/null 2>&1
+dpkg_run "dpkg --purge" dpkg --purge borgmatic-manager
 ck "runtime enablement dropped" no "$(linked $RUNTIME_WANTS)"
 
 echo "--- policy-rc.d can still refuse the restart"
 [ -e "$POLICY.off" ] && mv "$POLICY.off" "$POLICY"
 reset; install_pkg
 systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; settle active
-dpkg -r borgmatic-manager >/dev/null 2>&1
+dpkg_run "dpkg -r" dpkg -r borgmatic-manager
 ck "stop was recorded" yes "$(exists $STAMP)"
 install_pkg; sleep 2  # a negative needs a real pause: nothing to settle toward
 ck "policy refused the start" inactive "$(active)"
