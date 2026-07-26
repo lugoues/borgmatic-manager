@@ -259,13 +259,16 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 	require.NoError(t, os.Mkdir(locked, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(locked, "pinned.txt"), []byte("pinned"), 0o644))
 	require.NoError(t, os.Chmod(locked, 0o500))
-	// The swap moves it to the displaced path, and it has to be writable again
-	// for TempDir's own cleanup to succeed; chmod wherever it ended up.
-	// The swap moves it, and where depends on whether the filesystem supports an
-	// atomic exchange, so make it writable again wherever it ended up or
-	// TempDir's own cleanup fails.
+	// The swap moves it, and where it lands depends on whether the filesystem
+	// supports an atomic exchange and on whether the failed cleanup then moved
+	// it clear of the staging path. Make it writable again wherever it ended up,
+	// or TempDir's own cleanup fails.
 	t.Cleanup(func() {
-		for _, p := range []string{locked, filepath.Join(data+oldSuffix, "locked"), filepath.Join(data+stagingSuffix, "locked")} {
+		paths := []string{locked, filepath.Join(data+oldSuffix, "locked"), filepath.Join(data+stagingSuffix, "locked")}
+		for _, kept := range keptDirsFor(t, data) {
+			paths = append(paths, filepath.Join(kept, "locked"))
+		}
+		for _, p := range paths {
 			_ = os.Chmod(p, 0o755)
 		}
 	})
@@ -748,7 +751,7 @@ func TestExtractForwardsSIGHUPToTheWholeGroup(t *testing.T) {
 
 	// #nosec G204 -- re-execs this test binary
 	child := exec.Command(os.Args[0], "-test.run=TestExtractSignalHelper")
-	child.Env = append(os.Environ(), "BM_EXTRACT_SIGNAL_HELPER=1")
+	child.Env = minimalEnv("BM_EXTRACT_SIGNAL_HELPER=1")
 	child.Stdout, child.Stderr = logFile, logFile
 	require.NoError(t, child.Start())
 
@@ -777,6 +780,11 @@ func TestExtractSignalHelper(t *testing.T) {
 	if os.Getenv("BM_EXTRACT_SIGNAL_HELPER") != "1" {
 		t.Skip("child half of TestExtractForwardsSIGHUPToTheWholeGroup")
 	}
+	// SIGQUIT's default action is terminate *and dump core*, and a core holds
+	// this process's whole address space, environment included. The mutation run
+	// that checks this test can fail did exactly that and wrote credentials to
+	// disk. Refuse to dump, and see minimalEnv for the other half.
+	require.NoError(t, unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{Cur: 0, Max: 0}))
 	// MkdirTemp rather than t.TempDir: this process leaves via os.Exit, so the
 	// registered cleanup would never run anyway, and saying so is clearer than
 	// appearing to rely on it.
@@ -893,7 +901,7 @@ func TestExtractRunsWithNoControllingTerminal(t *testing.T) {
 	// operator's shell gives the manager.
 	// #nosec G204 -- re-execs this test binary
 	child := exec.Command(os.Args[0], "-test.run=TestControllingTerminalHelper")
-	child.Env = append(os.Environ(), "BM_TTY_HELPER=1")
+	child.Env = minimalEnv("BM_TTY_HELPER=1")
 	child.Stdin, child.Stdout, child.Stderr = pts, pts, pts
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	require.NoError(t, child.Start())
@@ -959,4 +967,76 @@ func canOpenTTY() bool {
 	}
 	_ = f.Close()
 	return true
+}
+
+// A restore that succeeds but cannot delete the copy it replaced must not leave
+// that copy on the staging path. The next restore clears staging as its first
+// act and refuses to start if it cannot, so a success today would become the
+// reason the next one fails.
+func TestRestoreWithSwapDoesNotBlockTheNextRestoreWhenCleanupFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root deletes regardless of the directory mode")
+	}
+	data := liveVolume(t)
+	require.NoError(t, os.Mkdir(filepath.Join(data, "sub"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(data, "sub", "pinned.txt"), []byte("x"), 0o644))
+	// Unreadable and unwritable contents: RemoveAll cannot empty it.
+	require.NoError(t, os.Chmod(filepath.Join(data, "sub"), 0o000))
+	t.Cleanup(func() {
+		for _, k := range keptDirsFor(t, data) {
+			_ = os.Chmod(filepath.Join(k, "sub"), 0o755)
+		}
+	})
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restore itself succeeded")
+	assert.NoDirExists(t, data+stagingSuffix, "the undeletable copy was moved off the staging path")
+	assert.Len(t, keptDirsFor(t, data), 1, "and kept where the operator can find it")
+
+	// The real assertion: another restore can still run.
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "second.txt"), []byte("second"), 0o644)
+	}, nil), "the next restore must not be blocked by the last one's leftovers")
+	assert.Equal(t, []string{"second.txt"}, names(t, data))
+}
+
+// Ctrl-\ reaches only this process now that the extract has its own session, so
+// an unforwarded SIGQUIT kills the manager and leaves borgmatic writing.
+func TestExtractForwardsSIGQUITToTheWholeGroup(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "child.log")
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer func() { _ = logFile.Close() }()
+
+	// #nosec G204 -- re-execs this test binary
+	child := exec.Command(os.Args[0], "-test.run=TestExtractSignalHelper")
+	child.Env = minimalEnv("BM_EXTRACT_SIGNAL_HELPER=1")
+	child.Stdout, child.Stderr = logFile, logFile
+	require.NoError(t, child.Start())
+
+	grandchild := waitForPID(t, logPath)
+	require.NoError(t, child.Process.Signal(syscall.SIGQUIT))
+
+	require.Error(t, child.Wait(), "the extract must report that it did not finish")
+	logged, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(logged), "quit", "the reason reaches the operator")
+
+	assert.Eventually(t, func() bool {
+		return syscall.Kill(grandchild, 0) != nil
+	}, 10*time.Second, 50*time.Millisecond, "borg was left alive after the manager exited")
+}
+
+// minimalEnv builds the environment for a re-exec'd helper from scratch rather
+// than inheriting this process's.
+//
+// These helpers are signalled on purpose, and a signal that dumps core writes
+// the whole address space to disk. Whatever is in the parent's environment,
+// tokens included, would land in that file next to the source tree. Passing
+// only what the helper needs to run means there is nothing there worth writing.
+func minimalEnv(extra ...string) []string {
+	env := []string{"PATH=" + os.Getenv("PATH")}
+	return append(env, extra...)
 }

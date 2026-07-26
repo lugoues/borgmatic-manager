@@ -2,3 +2,8 @@ bin/
 dist/
 config.local.toml/core
 .mise/config.local.toml
+
+# Core dumps. The signal tests are deliberately killed, and a core holds the
+# dumping process's whole address space, so these must never be committed.
+core
+core.*

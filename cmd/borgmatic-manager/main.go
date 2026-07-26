@@ -962,7 +962,7 @@ refuses unless the container is stopped or --force.`,
 			return runRestoreVolume(cmd.Context(), args[0], args[1], archive, into, force, merge, snapshot)
 		},
 	}
-	cmd.Flags().StringVar(&archive, "archive", "latest", "archive to restore from")
+	cmd.Flags().StringVar(&archive, "archive", latestArchive, "archive to restore from")
 	cmd.Flags().StringVar(&into, "into", "", "restore into this volume instead of the source (must already exist)")
 	cmd.Flags().BoolVar(&force, "force", false, "extract even if a running container is using the target volume")
 	cmd.Flags().BoolVar(&merge, "merge", false, "keep files added since the backup instead of emptying the target first")
@@ -974,6 +974,11 @@ refuses unless the container is stopped or --force.`,
 
 // volumeRestorePlan is the resolved borg geometry for a restore: what to pull
 // from the archive and where to land it.
+// latestArchive is borg's pseudo-archive for "whichever is newest". It is
+// resolved separately by every invocation, so it names a different archive
+// before and after a backup completes.
+const latestArchive = "latest"
+
 type volumeRestorePlan struct {
 	volumesRoot  string // e.g. /var/lib/docker/volumes
 	archivePath  string // path prefix in the archive: <sourceVolume>/_data
@@ -1107,13 +1112,28 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	archivedEmpty := false
 	if !merge {
 		found, hasChildren, probeErr := archivePathPopulated(ctx, borgmaticPath, configPath, archive, plan.archivePath)
-		archivedEmpty = found && !hasChildren
+		// Only when the operator named the archive. "latest" is not a name: borg
+		// resolves it per invocation, so the archive this probe examined and the
+		// one the extract restores are two separate answers to the same
+		// question, and a backup finishing in between makes them differ. Every
+		// other disagreement is caught downstream by the empty-extract refusal;
+		// this one would license it instead, and erase a volume the archive it
+		// actually extracted never claimed was empty.
+		archivedEmpty = found && !hasChildren && archive != latestArchive
 		if probeErr != nil {
 			return fmt.Errorf("cannot verify archive %q before emptying %s (nothing was changed): %w", archive, plan.targetData, probeErr)
 		}
 		if !found {
 			return fmt.Errorf("archive %q contains nothing under %q, so a mirror restore would empty %s and put nothing back (nothing was changed); "+
 				"check the archive name with: borgmatic-manager borgmatic %s list", archive, plan.archivePath, plan.targetData, group)
+		}
+		// Say so here rather than letting the extract produce an empty directory
+		// and fail with "borgmatic reported success but extracted nothing",
+		// which describes a symptom and not the reason.
+		if found && !hasChildren && archive == latestArchive {
+			return fmt.Errorf("the newest archive holds %q with nothing in it, so this restore would empty %s (nothing was changed); "+
+				"%q is resolved again when the extract runs and may not be this archive by then, so name the one you mean: "+
+				"borgmatic-manager borgmatic %s list", plan.archivePath, plan.targetData, latestArchive, group)
 		}
 	}
 
@@ -1285,8 +1305,15 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	// own whenever a controlling terminal goes away, so leaving it unhandled
 	// means closing the terminal on a merge or forced in-place restore kills the
 	// manager while borgmatic keeps writing into the live volume.
+	// The extract runs in its own session, so the terminal can no longer signal
+	// it directly: every terminal-generated signal arrives here and nowhere
+	// else. Anything whose default action would kill this process therefore has
+	// to be caught and forwarded, or the manager dies and leaves borgmatic
+	// writing into the volume unsupervised. That is the whole list of them a
+	// restore can realistically meet: Ctrl-C, Ctrl-\, a supervisor's terminate,
+	// and a closing terminal.
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
 
 	if err := cmd.Start(); err != nil {
