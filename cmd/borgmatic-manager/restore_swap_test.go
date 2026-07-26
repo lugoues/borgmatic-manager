@@ -422,3 +422,59 @@ func TestSyncTreeSkipsFIFOs(t *testing.T) {
 		t.Fatal("syncTree blocked, almost certainly opening the FIFO and waiting for a writer")
 	}
 }
+
+// A completed extract can represent hours of work. When the safety recheck
+// aborts the swap, the error points the operator at that copy, so it has to
+// still be there.
+func TestRestoreWithSwapKeepsTheExtractWhenTheRecheckAborts(t *testing.T) {
+	data := liveVolume(t)
+	appeared := errors.New("a container started using the volume")
+
+	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, func() error { return appeared })
+
+	require.Error(t, err)
+	staging := data + stagingSuffix
+	require.DirExists(t, staging, "the completed extract must not be discarded")
+	assert.Contains(t, err.Error(), staging, "and the operator is told where it is")
+	assert.Equal(t, []string{"restored.txt"}, names(t, staging))
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume is untouched")
+}
+
+// A bind mount whose source shares the filesystem has the same device number as
+// its parent, so a st_dev comparison misses it. That is exactly how a
+// local-driver bind volume looks, and renaming it would fail with EBUSY after a
+// full extract had already run.
+func TestIsOwnMountPointDetectsASameFilesystemBind(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("bind mounting needs root")
+	}
+	root := t.TempDir()
+	src, dst := filepath.Join(root, "src"), filepath.Join(root, "dst")
+	require.NoError(t, os.Mkdir(src, 0o755))
+	require.NoError(t, os.Mkdir(dst, 0o755))
+	if err := unix.Mount(src, dst, "", unix.MS_BIND, ""); err != nil {
+		t.Skipf("cannot bind mount here: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(dst, unix.MNT_DETACH) })
+
+	var self, parent unix.Stat_t
+	require.NoError(t, unix.Lstat(dst, &self))
+	require.NoError(t, unix.Lstat(root, &parent))
+	require.Equal(t, parent.Dev, self.Dev, "precondition: the device number is identical, which is why st_dev is not enough")
+
+	mounted, err := isOwnMountPoint(dst)
+	require.NoError(t, err)
+	assert.True(t, mounted, "mountinfo sees the bind that st_dev cannot")
+
+	plain, err := isOwnMountPoint(src)
+	require.NoError(t, err)
+	assert.False(t, plain, "an ordinary directory is not a mount point")
+}
+
+func TestUnescapeMountField(t *testing.T) {
+	assert.Equal(t, "/var/lib/docker/volumes/v/_data", unescapeMountField("/var/lib/docker/volumes/v/_data"))
+	assert.Equal(t, "/mnt/with space", unescapeMountField(`/mnt/with\040space`), "the kernel octal-escapes spaces")
+	assert.Equal(t, "/mnt/tab\tsep", unescapeMountField(`/mnt/tab\011sep`))
+}

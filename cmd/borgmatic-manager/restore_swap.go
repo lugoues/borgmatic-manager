@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -62,9 +65,9 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// Any failure before the swap discards the staging directory and leaves the
 	// live data exactly as it was. The one exception is a stranded swap, where
 	// staging holds the only copy of the restored data.
-	committed := false
+	committed, keepStaging := false, false
 	defer func() {
-		if committed || errors.Is(err, errStranded) {
+		if committed || keepStaging || errors.Is(err, errStranded) {
 			return
 		}
 		if rmErr := os.RemoveAll(staging); rmErr != nil {
@@ -95,7 +98,11 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// Last check before the only destructive step.
 	if stillSafe != nil {
 		if safeErr := stillSafe(); safeErr != nil {
-			return fmt.Errorf("%w (the volume is untouched; the restored copy is at %s)", safeErr, staging)
+			// The extract is complete and may have taken hours. Keep it: the
+			// message points the operator at it, and deleting it here would
+			// make that a lie as well as a waste.
+			keepStaging = true
+			return fmt.Errorf("%w (the volume is untouched; the completed restore is kept at %s)", safeErr, staging)
 		}
 	}
 
@@ -107,9 +114,19 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// Persist the swap itself before removing the copy it replaced, or a power
 	// loss could replay the deletion without the rename and lose both.
 	if syncErr := syncDir(filepath.Dir(targetData)); syncErr != nil {
+		// Move it off the staging path before reporting it. The next restore
+		// clears staging as its first act, which would silently delete the very
+		// copy this branch is telling the operator to keep.
+		kept := displaced
+		if moved, moveErr := retainOutOfTheWay(displaced, targetData); moveErr == nil {
+			kept = moved
+		} else {
+			logger.Warn("could not move the retained copy out of the staging path; a later restore may clear it",
+				"path", displaced, "error", moveErr)
+		}
 		logger.Warn("the restore is in place but the swap could not be flushed to disk, so the copy it replaced is being kept; "+
 			"delete it once the volume looks right",
-			"path", filepath.Dir(targetData), "kept", displaced, "error", syncErr)
+			"path", filepath.Dir(targetData), "kept", kept, "error", syncErr)
 		return nil
 	}
 	// The restore is done and durable. Failing to delete the copy it replaced is
@@ -379,17 +396,71 @@ func syncDir(path string) error {
 
 // isOwnMountPoint reports whether path is the root of a mount, which is what a
 // volume backed by NFS, CIFS, or a bind looks like. Such a directory cannot be
-// renamed (EBUSY) and its staging sibling would land on the parent filesystem,
-// so the stage-and-swap strategy does not apply to it at all.
+// renamed (EBUSY) and its staging sibling would land elsewhere, so the
+// stage-and-swap strategy does not apply to it.
+//
+// /proc/self/mountinfo, not a st_dev comparison against the parent: a bind
+// mount whose source is on the same filesystem has an identical device number
+// and would be missed, and that is exactly how a local-driver bind volume
+// looks. Verified: a same-filesystem bind reports st_dev 47 on both sides.
 func isOwnMountPoint(path string) (bool, error) {
-	var self, parent unix.Stat_t
-	if err := unix.Lstat(path, &self); err != nil {
-		return false, fmt.Errorf("inspecting %s: %w", path, err)
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false, fmt.Errorf("resolving %s: %w", path, err)
 	}
-	if err := unix.Lstat(filepath.Dir(path), &parent); err != nil {
-		return false, fmt.Errorf("inspecting %s: %w", filepath.Dir(path), err)
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		// Without mountinfo there is nothing to consult. Treat it as not a
+		// mount: the swap then fails loudly at the rename rather than silently
+		// taking the destructive path.
+		return false, nil
 	}
-	return self.Dev != parent.Dev, nil
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for scanner.Scan() {
+		// Fields: id parent major:minor root mountpoint ...
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		// Mount points are octal-escaped for spaces and friends.
+		if unescapeMountField(fields[4]) == resolved {
+			return true, nil
+		}
+	}
+	return false, scanner.Err()
+}
+
+// unescapeMountField decodes the \OOO octal escapes the kernel uses for
+// characters that would otherwise break mountinfo's field separation.
+func unescapeMountField(field string) string {
+	if !strings.Contains(field, "\\") {
+		return field
+	}
+	var b strings.Builder
+	for i := 0; i < len(field); i++ {
+		if field[i] == '\\' && i+3 < len(field) {
+			if v, err := strconv.ParseUint(field[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(field[i])
+	}
+	return b.String()
+}
+
+// retainOutOfTheWay moves a copy that must outlive this run to a uniquely named
+// sibling, away from the staging and displaced paths that later runs reuse.
+func retainOutOfTheWay(from, targetData string) (string, error) {
+	kept := fmt.Sprintf("%s.borgmatic-manager-kept-%s", targetData, time.Now().Format("20060102-150405"))
+	if err := os.Rename(from, kept); err != nil {
+		return "", err
+	}
+	return kept, nil
 }
 
 // stagingPathFor is the staging sibling for a target, exposed so callers can

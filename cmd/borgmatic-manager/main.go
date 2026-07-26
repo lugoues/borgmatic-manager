@@ -1147,6 +1147,21 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 				"the data is replaced as borgmatic extracts, and a failure can leave it partially restored",
 				"path", plan.targetData)
 		}
+		// The in-place path empties before extracting, so it destroys on the
+		// same race the staged path aborts on. --force is an explicit "do it
+		// anyway" and keeps its meaning; a mount-point volume without --force
+		// has no such consent, so ask again after the probe.
+		if mounted && !force {
+			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+			if checkErr != nil {
+				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
+			}
+			if live {
+				return fmt.Errorf("a container started using volume %q while the restore was preparing, "+
+					"and this volume can only be restored in place, which would empty it underneath that container; "+
+					"stop it and run the restore again, or pass --force to overrule", plan.targetVolume)
+			}
+		}
 		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (in place)\n", group, volume, archive, plan.targetData)
 		if wipeErr := emptyVolumeData(plan.targetData); wipeErr != nil {
 			return fmt.Errorf("emptying the target before a mirror restore: %w", wipeErr)
