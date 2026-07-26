@@ -1041,6 +1041,12 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if err != nil {
 		return err
 	}
+	// A previous restore killed between the two renames leaves the data under a
+	// suffixed name and nothing at targetData. Put it back before concluding the
+	// volume has no data directory.
+	if recErr := recoverInterruptedSwap(plan.targetData, logger); recErr != nil {
+		return recErr
+	}
 	if _, statErr := os.Stat(plan.targetData); statErr != nil {
 		return fmt.Errorf("target volume data directory %s is not present; create the volume first (docker/podman volume create %s): %w", plan.targetData, plan.targetVolume, statErr)
 	}
@@ -1139,21 +1145,85 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	}
 }
 
+// extractKillGrace is how long borgmatic gets to stop cleanly after a
+// forwarded signal before the whole group is killed. borg checkpoints on
+// SIGINT, so a clean stop leaves a resumable repository.
+const extractKillGrace = 10 * time.Second
+
 // runBorgmaticExtract runs the extract as a child rather than exec'ing it, so
 // there is an "after": the caller can check what landed and decide whether to
-// make it live. The child shares this process group, so a Ctrl-C at the
-// terminal reaches borgmatic exactly as it did when this exec'd, and borg
-// checkpoints on SIGINT.
+// make it live.
+//
+// exec'ing used to mean borgmatic *became* this process, so any signal aimed at
+// the manager stopped the restore. A child does not inherit that, and one left
+// running after its parent exits keeps writing into the volume, so signals are
+// forwarded explicitly. The child gets its own process group because borgmatic
+// spawns borg, and only a group signal reaches both.
 func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive, archivePath, destination string) error {
 	// #nosec G204 -- resolved borgmatic binary with computed extract arguments
-	cmd := exec.CommandContext(ctx, borgmaticPath,
+	cmd := exec.Command(borgmaticPath,
 		"--config", configPath, "extract", "--archive", archive,
 		"--path", archivePath, "--strip-components", "2", "--destination", destination)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("borgmatic extract failed: %w", err)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting borgmatic: %w", err)
 	}
-	return nil
+
+	// Its own group no longer receives the terminal's Ctrl-C, so catch the
+	// signals this process would have taken and pass them on.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	for {
+		select {
+		case err := <-exited:
+			if err != nil {
+				return fmt.Errorf("borgmatic extract failed: %w", err)
+			}
+			return nil
+
+		case sig := <-signals:
+			forwarded, ok := sig.(syscall.Signal)
+			if !ok {
+				forwarded = syscall.SIGTERM
+			}
+			signalExtractGroup(cmd, forwarded)
+			return waitOrKill(cmd, exited, "interrupted by "+sig.String())
+
+		case <-ctx.Done():
+			signalExtractGroup(cmd, syscall.SIGTERM)
+			return waitOrKill(cmd, exited, ctx.Err().Error())
+		}
+	}
+}
+
+// waitOrKill gives a signalled extract a bounded chance to stop on its own,
+// then kills its group. Either way the extract did not finish, so the caller
+// must not treat what landed as a complete restore.
+func waitOrKill(cmd *exec.Cmd, exited <-chan error, reason string) error {
+	select {
+	case <-exited:
+	case <-time.After(extractKillGrace):
+		signalExtractGroup(cmd, syscall.SIGKILL)
+		<-exited
+	}
+	return fmt.Errorf("borgmatic extract did not finish: %s", reason)
+}
+
+// signalExtractGroup signals the child's whole process group: borgmatic's own
+// children, borg among them, would otherwise keep writing.
+func signalExtractGroup(cmd *exec.Cmd, sig syscall.Signal) {
+	if cmd.Process == nil {
+		return
+	}
+	// Setpgid makes pgid equal the child's pid; the negative addresses the group.
+	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
 
 // volumeHasRunningContainer reports whether any currently-running container

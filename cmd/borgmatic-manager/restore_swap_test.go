@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // liveVolume builds a volume data dir holding one file, the thing a restore
@@ -116,13 +117,14 @@ func TestRestoreWithSwapPreservesDirectoryMode(t *testing.T) {
 	assert.Equal(t, before.Mode().Perm(), after.Mode().Perm(), "mode carried onto the replacement")
 }
 
-// The two renames are not one atomic step. If the second fails, the volume
-// must not be left without a data directory at all.
+// The rename-pair fallback is not one atomic step. If the second rename fails,
+// the volume must not be left without a data directory at all. Exercised
+// directly, since a kernel with RENAME_EXCHANGE never reaches this path.
 func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	data := liveVolume(t)
 	missingStaging := data + stagingSuffix // deliberately never created
 
-	_, err := swapIntoPlace(missingStaging, data)
+	_, err := swapByRenamePair(missingStaging, data)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "volume is unchanged")
@@ -131,16 +133,57 @@ func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	assert.NoDirExists(t, data+oldSuffix)
 }
 
-// Not an SELinux host: reading a context that is not there is normal, not an
-// error, and must not fail the restore.
-func TestCopySELinuxContextIgnoresAbsentLabels(t *testing.T) {
+// Not an SELinux host: a context that is not there is normal, not an error,
+// and must not fail the restore.
+func TestReadSELinuxContextTreatsAbsentLabelsAsAbsent(t *testing.T) {
 	dir := t.TempDir()
-	from := filepath.Join(dir, "from")
-	to := filepath.Join(dir, "to")
-	require.NoError(t, os.Mkdir(from, 0o755))
-	require.NoError(t, os.Mkdir(to, 0o755))
+	label, present, err := readSELinuxContext(dir)
 
-	assert.NoError(t, copySELinuxContext(from, to))
+	require.NoError(t, err, "no label and no xattr support are both normal")
+	assert.False(t, present)
+	assert.Empty(t, label)
+}
+
+// A label that exists but cannot be applied must stop the restore. Promoting a
+// mislabelled directory hands back a volume the container cannot read, and the
+// original is gone by the time anyone finds out.
+func TestCreateStagingLikeRefusesWhenTheLabelCannotBeApplied(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	if err := unix.Lsetxattr(model, seLinuxAttr, []byte("system_u:object_r:container_file_t:s0"), 0); err != nil {
+		t.Skipf("cannot set an SELinux label here: %v", err)
+	}
+
+	// Applying is only reachable when reading found one; if this host let us
+	// write the label it will let us copy it, so assert the copy instead.
+	staging := filepath.Join(dir, "_data"+stagingSuffix)
+	require.NoError(t, createStagingLike(staging, model))
+	got, present, err := readSELinuxContext(staging)
+	require.NoError(t, err)
+	require.True(t, present, "the label was carried to the replacement")
+	assert.Equal(t, "system_u:object_r:container_file_t:s0", got)
+}
+
+// The special bits carry semantics a volume can depend on: setgid decides
+// group inheritance for everything created after the restore.
+func TestCreateStagingLikePreservesSpecialModeBits(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+	require.NoError(t, os.Chmod(model, 0o775|os.ModeSetgid)) // FileMode, not the 0o2000 octal
+	before, err := os.Stat(model)
+	require.NoError(t, err)
+	require.NotZero(t, before.Mode()&os.ModeSetgid, "precondition: setgid is set")
+
+	staging := filepath.Join(dir, "_data"+stagingSuffix)
+	require.NoError(t, createStagingLike(staging, model))
+
+	after, err := os.Stat(staging)
+	require.NoError(t, err)
+	assert.NotZero(t, after.Mode()&os.ModeSetgid, "setgid carried onto the replacement")
+	assert.Equal(t, before.Mode().Perm(), after.Mode().Perm())
 }
 
 // Once the swap lands, the restore has succeeded. Failing to delete the copy it
@@ -160,9 +203,13 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 	require.NoError(t, os.Chmod(locked, 0o500))
 	// The swap moves it to the displaced path, and it has to be writable again
 	// for TempDir's own cleanup to succeed; chmod wherever it ended up.
+	// The swap moves it, and where depends on whether the filesystem supports an
+	// atomic exchange, so make it writable again wherever it ended up or
+	// TempDir's own cleanup fails.
 	t.Cleanup(func() {
-		_ = os.Chmod(locked, 0o755)
-		_ = os.Chmod(filepath.Join(data+oldSuffix, "locked"), 0o755)
+		for _, p := range []string{locked, filepath.Join(data+oldSuffix, "locked"), filepath.Join(data+stagingSuffix, "locked")} {
+			_ = os.Chmod(p, 0o755)
+		}
 	})
 
 	err := restoreWithSwap(data, quietLogger(), func(dest string) error {
@@ -171,4 +218,34 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 
 	require.NoError(t, err, "a cleanup failure must not fail a restore that landed")
 	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restored data is live")
+}
+
+// The state a crash between the fallback path's two renames leaves behind: no
+// data directory, and the only copy under a suffixed name. Without recovery the
+// next restore stops at "data directory is not present" and the operator has to
+// know to go looking for it.
+func TestRecoverInterruptedSwapPutsTheDataBack(t *testing.T) {
+	data := liveVolume(t)
+	displaced := data + oldSuffix
+	require.NoError(t, os.Rename(data, displaced)) // interrupted between the renames
+	require.NoDirExists(t, data)
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+
+	require.DirExists(t, data, "the volume has its data directory back")
+	assert.Equal(t, []string{"original.txt"}, names(t, data))
+	assert.NoDirExists(t, displaced)
+}
+
+func TestRecoverInterruptedSwapLeavesAHealthyVolumeAlone(t *testing.T) {
+	data := liveVolume(t)
+	// A displaced copy from some earlier run, with the volume perfectly fine.
+	displaced := data + oldSuffix
+	require.NoError(t, os.Mkdir(displaced, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(displaced, "stale.txt"), []byte("stale"), 0o644))
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "live data is never overwritten by a leftover")
+	assert.DirExists(t, displaced, "and the leftover is left for the operator to judge")
 }
