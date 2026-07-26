@@ -1226,7 +1226,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// parent would have borg write the files in plaintext and the swap would
 	// then replace an encrypted volume with a readable one, reporting success.
 	// Writing in place keeps the encrypted directory and its policy.
-	encrypted, encErr := isEncryptedDir(plan.targetData)
+	encrypted, encryptionReason, encErr := encryptionBlocksStaging(plan.targetData)
 	if encErr != nil {
 		return encErr
 	}
@@ -1269,10 +1269,8 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 				"and a failure can leave it partially restored. Take your own copy first if that matters",
 				"path", plan.targetData)
 		case encrypted:
-			logger.Warn("this volume's data directory is encrypted, and an encryption policy cannot be applied to "+
-				"the replacement directory a swap would need, so the restore writes in place instead: the data is "+
-				"replaced as borgmatic extracts, and a failure can leave it partially restored. Restoring through "+
-				"a swap here would have written the files unencrypted",
+			logger.Warn(encryptionReason+", so the restore writes in place instead: the data is replaced as "+
+				"borgmatic extracts, and a failure can leave it partially restored",
 				"path", plan.targetData)
 		default:
 			logger.Warn("a running container has this volume mounted, so the restore writes in place: "+

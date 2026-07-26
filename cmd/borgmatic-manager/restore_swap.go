@@ -32,9 +32,16 @@ import (
 // nobody else can have produced makes the question moot.
 const stagingPrefix = ".borgmatic-manager-restoring-"
 
-// oldSuffix names the displaced original on the fallback swap path. It only
-// exists between two renames, and only where RENAME_EXCHANGE is unavailable.
-const oldSuffix = ".borgmatic-manager-replaced"
+// oldPrefix begins the name of the displaced original on the fallback swap
+// path. It only exists between two renames, and only where RENAME_EXCHANGE is
+// unavailable.
+//
+// A prefix completed by MkdirTemp, for the same reason as stagingPrefix: the
+// fallback used to clear a fixed name before renaming onto it, which
+// recursively deleted whatever happened to be there. A symlink-backed _data
+// resolves into a directory some application owns, and that made an unrelated
+// directory collateral of a restore that had not yet touched the volume.
+const oldPrefix = ".borgmatic-manager-replaced-"
 
 // errStranded marks the one failure that must not clean up after itself: the
 // swap left the old data under one name and the new data under another, with
@@ -188,11 +195,19 @@ func swapIntoPlace(staging, targetData string) (displaced string, err error) {
 // separate so the rollback below can be exercised directly: on a kernel that
 // does support the atomic exchange, nothing else can reach this code.
 func swapByRenamePair(staging, targetData string) (displaced string, err error) {
-	displaced = targetData + oldSuffix
-	if rmErr := os.RemoveAll(displaced); rmErr != nil {
-		return "", fmt.Errorf("clearing %s before the swap: %w", displaced, rmErr)
+	// Created rather than merely named, so the name cannot already belong to
+	// something else. unix.Renameat rather than os.Rename below because Go's
+	// wrapper refuses any existing directory while the syscall replaces an empty
+	// one, which is exactly what this placeholder is.
+	displaced, err = os.MkdirTemp(filepath.Dir(targetData), filepath.Base(targetData)+oldPrefix)
+	if err != nil {
+		return "", fmt.Errorf("reserving a name to move the current data aside (the volume is untouched): %w", err)
 	}
-	if renErr := os.Rename(targetData, displaced); renErr != nil {
+	if renErr := unix.Renameat(unix.AT_FDCWD, targetData, unix.AT_FDCWD, displaced); renErr != nil {
+		if rmErr := os.Remove(displaced); rmErr != nil {
+			return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w",
+				errors.Join(renErr, rmErr))
+		}
 		return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w", renErr)
 	}
 	if renErr := os.Rename(staging, targetData); renErr != nil {
@@ -252,10 +267,22 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 	if _, err := os.Lstat(targetData); err == nil || !os.IsNotExist(err) {
 		return nil // present, or unreadable for some other reason: nothing to do
 	}
-	displaced := targetData + oldSuffix
-	if _, err := os.Lstat(displaced); err != nil {
+	matches, err := filepath.Glob(targetData + oldPrefix + "*")
+	if err != nil {
+		return fmt.Errorf("looking for data displaced by an interrupted restore beside %s: %w", targetData, err)
+	}
+	if len(matches) == 0 {
 		return nil // nothing to recover from
 	}
+	if len(matches) > 1 {
+		// Never expected: the window is two syscalls wide and only one restore
+		// of a volume runs at a time. Guessing which copy is the volume's is not
+		// this program's to do.
+		return fmt.Errorf("%s is missing and more than one displaced copy is beside it (%s); "+
+			"a restore was interrupted more than once, so move the one you want to %s by hand",
+			targetData, strings.Join(matches, ", "), targetData)
+	}
+	displaced := matches[0]
 	if err := os.Rename(displaced, targetData); err != nil {
 		return fmt.Errorf("a previous restore was interrupted mid-swap and %s could not be moved back to %s: %w",
 			displaced, targetData, err)
@@ -456,32 +483,49 @@ func readSELinuxContext(path string) (label string, present bool, err error) {
 // rather than truncating, and SELinux contexts with long MCS category sets do
 // overflow the obvious guesses. Absent, or a filesystem without xattr support,
 // is normal and not an error.
-// isEncryptedDir reports whether path carries an fscrypt encryption policy.
+// statxFn is the seam for the encryption probe, so a test can present a kernel
+// that cannot answer without needing one.
+var statxFn = unix.Statx
+
+// encryptionBlocksStaging reports whether a target must be restored in place
+// rather than staged, because of encryption, and why.
 //
-// A policy is filesystem-internal state applied at creation and inherited from
-// the parent, not an extended attribute that can be copied onto a directory
-// afterwards. A staging sibling created under an unencrypted parent therefore
-// has no policy at all, and borg would write the restored files in plaintext.
+// An fscrypt policy is applied when a directory is created and inherited from
+// its parent; it is filesystem-internal state, not an extended attribute that
+// can be copied onto a sibling afterwards. A staging directory created under an
+// unencrypted parent has no policy, so borg writes the restored files in
+// plaintext and the swap replaces an encrypted volume with a readable one while
+// reporting success.
 //
-// The mask is checked, not just the attribute. stx_attributes bits are only
-// meaningful where the matching stx_attributes_mask bit says the filesystem
-// reported on them, and treating an unreported bit as false-but-known would let
-// an ordinary volume take the destructive path for no reason. Anything
-// uncertain reports false, which is the conservative answer here: the staged
-// path is the safe one, and only a directory known to be encrypted should be
-// pushed off it.
-func isEncryptedDir(path string) (bool, error) {
+// The two failure directions are not symmetric, and this returns yes whenever
+// it cannot prove no. Staging something that turns out to be encrypted is a
+// silent confidentiality loss. Restoring in place unnecessarily only gives up
+// this PR's safety net, which is exactly where such a host already was.
+//
+// A statx that answers is trusted in both directions: fscrypt exists only on
+// filesystems that report STATX_ATTR_ENCRYPTED in the mask, so a mask without
+// that bit means the question does not arise here. A statx that cannot answer
+// at all establishes nothing, and old kernels that predate it (fscrypt landed
+// before statx did) are exactly where an encrypted directory can exist and go
+// unseen.
+func encryptionBlocksStaging(path string) (blocks bool, reason string, err error) {
 	var st unix.Statx_t
-	if err := unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BASIC_STATS, &st); err != nil {
-		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) {
-			return false, nil // no statx here, so nothing can be established
+	if statErr := statxFn(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BASIC_STATS, &st); statErr != nil {
+		if errors.Is(statErr, unix.ENOSYS) || errors.Is(statErr, unix.EOPNOTSUPP) ||
+			errors.Is(statErr, unix.ENOTSUP) || errors.Is(statErr, unix.EPERM) {
+			return true, "whether this volume's data directory is encrypted cannot be determined on this kernel, " +
+				"and staging an encrypted directory would replace it with unencrypted data", nil
 		}
-		return false, fmt.Errorf("inspecting %s: %w", path, err)
+		return false, "", fmt.Errorf("inspecting %s: %w", path, statErr)
 	}
 	if st.Attributes_mask&unix.STATX_ATTR_ENCRYPTED == 0 {
-		return false, nil // the filesystem did not report on encryption
+		return false, "", nil // this filesystem has no encryption to report on
 	}
-	return st.Attributes&unix.STATX_ATTR_ENCRYPTED != 0, nil
+	if st.Attributes&unix.STATX_ATTR_ENCRYPTED != 0 {
+		return true, "this volume's data directory is encrypted, and an encryption policy cannot be applied to " +
+			"the replacement directory a swap would need", nil
+	}
+	return false, "", nil
 }
 
 // btrfsSubvolumeRootInode is the inode number every btrfs subvolume root has.
