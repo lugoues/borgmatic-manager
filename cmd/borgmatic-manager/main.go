@@ -484,6 +484,28 @@ func processAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// runningGroups maps group name to the earliest start time of a live pending
+// run, so a stale-plus-fresh pair surfaces the longer-running one.
+//
+// A record whose owner was SIGKILLed (or lost to OOM or power loss) never gets
+// its deferred ClearPending, and only the daemon reaps those at startup: an
+// ad-hoc run deliberately does not, since a daemon may be legitimately mid-run.
+// Without this filter such a record pins its group at "running" forever, hiding
+// the real due state. Records with no stamped PID (pre-PID binaries) stay
+// visible: they cannot be proven dead, and this is a display filter, not a reap.
+func runningGroups(store *state.ScheduleStore) map[string]time.Time {
+	running := map[string]time.Time{}
+	for _, p := range store.PendingSnapshot() {
+		if p.PID != 0 && !processAlive(p.PID) {
+			continue
+		}
+		if started, ok := running[p.Group]; !ok || p.Started.Before(started) {
+			running[p.Group] = p.Started
+		}
+	}
+	return running
+}
+
 func runDaemon() error {
 	// Structured JSON logging to stdout (journald captures it).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
