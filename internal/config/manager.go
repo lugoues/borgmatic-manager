@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"net/url"
 	"os"
@@ -149,6 +150,27 @@ func parseGroupOverride(raw map[string]interface{}, path string) (GroupOverride,
 	return o, nil
 }
 
+// strictCheckManagerSection strict-decodes the merged manager section into a
+// throwaway ManagerSettings so an unknown key (a typo, or a manager option
+// nested under the wrong place) fails loudly. A missing section is fine: the
+// period validation catches an absent or empty manager block elsewhere.
+func strictCheckManagerSection(section interface{}) error {
+	if section == nil {
+		return nil
+	}
+	raw, err := yaml.Marshal(section)
+	if err != nil {
+		return fmt.Errorf("processing manager section: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	var check ManagerSettings
+	if err := dec.Decode(&check); err != nil {
+		return fmt.Errorf("invalid manager section (check for a misspelled or misplaced key): %w", err)
+	}
+	return nil
+}
+
 // LoadConfig reads the manager config, deep-merges conf.d/*.yaml drop-ins
 // (lexical order, beside managerPath) over it, and loads per-group overlays
 // from groupsDir, keyed by filename sans extension. All files support
@@ -164,7 +186,9 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 		return nil, nil, err
 	}
 
-	// Round-trip the resolved map into the typed struct.
+	// Round-trip the resolved map into the typed struct. This decode is lenient
+	// so the free-form borgmatic section and top-level YAML anchor holders (a
+	// `defaults: &defaults` merged into borgmatic) pass through untouched.
 	resolved, err := yaml.Marshal(managerMap)
 	if err != nil {
 		return nil, nil, fmt.Errorf("processing manager config: %w", err)
@@ -172,6 +196,14 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 	var cfg ManagerConfig
 	if parseErr := yaml.Unmarshal(resolved, &cfg); parseErr != nil {
 		return nil, nil, fmt.Errorf("parsing manager config: %w", parseErr)
+	}
+
+	// The manager section is our own typed config, so strict-decode it: a
+	// misspelled or misplaced key (mtrics, xenabled, a manager option nested
+	// under the wrong section) is a hard error rather than a silently dropped
+	// setting. borgmatic options are validated by borgmatic's own config check.
+	if strictErr := strictCheckManagerSection(managerMap["manager"]); strictErr != nil {
+		return nil, nil, strictErr
 	}
 	if validateErr := cfg.Manager.Metrics.Validate(); validateErr != nil {
 		return nil, nil, fmt.Errorf("invalid manager config: %w", validateErr)

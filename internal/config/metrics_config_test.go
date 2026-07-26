@@ -40,6 +40,38 @@ func TestMetricsSettingsValidate(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsUnknownManagerKeys(t *testing.T) {
+	write := func(t *testing.T, body string) error {
+		t.Helper()
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "manager.yaml"), []byte(body), 0o600))
+		_, _, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+		return err
+	}
+
+	t.Run("misspelled manager key", func(t *testing.T) {
+		err := write(t, "manager:\n  period: \"1h\"\n  mtrics:\n    enabled: true\n")
+		require.Error(t, err, "a dropped setting must fail, not silently disable")
+		assert.Contains(t, err.Error(), "misspelled or misplaced")
+	})
+
+	t.Run("misspelled key nested under metrics", func(t *testing.T) {
+		err := write(t, "manager:\n  period: \"1h\"\n  metrics:\n    xenabled: true\n")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "misspelled or misplaced")
+	})
+
+	t.Run("valid config with metrics loads", func(t *testing.T) {
+		err := write(t, "manager:\n  period: \"1h\"\n  metrics:\n    enabled: true\n    endpoint: \"https://otel.example/v1/metrics\"\n    protocol: \"http\"\n")
+		assert.NoError(t, err)
+	})
+
+	t.Run("arbitrary borgmatic keys still allowed", func(t *testing.T) {
+		err := write(t, "manager:\n  period: \"1h\"\nborgmatic:\n  some_future_borgmatic_option: 42\n")
+		assert.NoError(t, err, "the borgmatic section is free-form; borgmatic validates it")
+	})
+}
+
 func TestLoadConfigRejectsBadMetricsProtocol(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manager.yaml"), []byte(
