@@ -4,8 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,14 +41,31 @@ Need some help? https://torsion.org/borgmatic/#issues
 `
 )
 
-// The probe that gates the destructive wipe: a path that is absent must read as
-// absent even though borgmatic wrote a banner line to stdout.
-func TestCountJSONLinesSeparatesEntriesFromBanner(t *testing.T) {
-	assert.Equal(t, 2, countJSONLines([]byte(listStdoutPathPresent)), "both entries counted, banner ignored")
-	assert.Equal(t, 0, countJSONLines([]byte(listStdoutPathAbsent)), "a banner alone is not a match")
-	assert.Equal(t, 0, countJSONLines(nil), "no output is not a match")
-	assert.Equal(t, 0, countJSONLines([]byte("{not json\n{\"a\":1")), "malformed lines do not count")
-	assert.Equal(t, 1, countJSONLines([]byte("  {\"path\": \"x\"}  ")), "surrounding whitespace is tolerated")
+// The probe that gates the destructive wipe: borgmatic's banner is on stdout
+// ahead of borg's entries, so a non-empty stdout is not by itself a match.
+func TestIsArchiveEntryLineSeparatesEntriesFromBanner(t *testing.T) {
+	lines := strings.Split(strings.TrimRight(listStdoutPathPresent, "\n"), "\n")
+	require.Len(t, lines, 3)
+	assert.False(t, isArchiveEntryLine([]byte(lines[0])), "the banner is not an entry")
+	assert.True(t, isArchiveEntryLine([]byte(lines[1])))
+	assert.True(t, isArchiveEntryLine([]byte(lines[2])))
+
+	assert.False(t, isArchiveEntryLine(nil), "no output is not a match")
+	assert.False(t, isArchiveEntryLine([]byte("{not json")), "a malformed line is not an entry")
+	assert.True(t, isArchiveEntryLine([]byte("  {\"path\": \"x\"}  ")), "surrounding whitespace is tolerated")
+}
+
+// headWriter caps what a chatty failure can cost in memory while keeping the
+// leading bytes, which is where the cause is.
+func TestHeadWriterKeepsHeadAndDropsTail(t *testing.T) {
+	w := &headWriter{maxBytes: 8}
+	n, err := w.Write([]byte("12345"))
+	require.NoError(t, err)
+	assert.Equal(t, 5, n, "reports a full write: it is a capture, not a sink that can fail")
+	n, err = w.Write([]byte("6789abcdef"))
+	require.NoError(t, err)
+	assert.Equal(t, 10, n)
+	assert.Equal(t, "12345678", w.String(), "kept the head, dropped the tail")
 }
 
 // borgmatic re-wraps the real cause per repository, per config, and again under
@@ -83,6 +102,53 @@ func TestArchivePathPopulatedReportsBannerOnlyAsEmpty(t *testing.T) {
 	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
 	require.NoError(t, err, "borgmatic exited 0: this is a real answer, not a probe failure")
 	assert.False(t, found, "an archive predating the volume must not be mirrored over live data")
+}
+
+// borg emits one JSON line per file, so an archive holding millions of them
+// would be gigabytes if buffered. One entry settles the question, so the probe
+// stops there instead of reading the rest.
+func TestArchivePathPopulatedStopsAtFirstEntry(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	// An emitter that never ends. Buffering it would hang forever and grow
+	// without bound, so simply returning is the proof that it streams and stops.
+	script := "#!/bin/sh\n" +
+		"echo '/srv/repo: Listing archive host-1'\n" +
+		"while :; do echo '{\"type\": \"-\", \"path\": \"myvol/_data/f\"}' || exit 0; done\n"
+	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
+
+	type result struct {
+		found bool
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+		done <- result{found, err}
+	}()
+
+	select {
+	case got := <-done:
+		require.NoError(t, got.err)
+		assert.True(t, got.found, "the first entry settles it")
+	case <-time.After(30 * time.Second):
+		t.Fatal("probe did not stop at the first entry; it drained an unbounded listing")
+	}
+}
+
+// A stream that cannot be read through is "cannot tell", never "nothing there":
+// reporting absent would let the caller empty the volume.
+func TestArchivePathPopulatedErrorsOnUnreadableStream(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	// One entry-looking line past the scanner's cap, and no valid entry at all.
+	script := "#!/bin/sh\nprintf '{'\nhead -c " + strconv.Itoa(maxListLineBytes+1024) +
+		" /dev/zero | tr '\\000' 'a'\nprintf '\\n'\n"
+	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
+
+	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	require.Error(t, err, "a truncated listing must not read as an empty one")
+	assert.False(t, found)
 }
 
 // The probe passes the extract's own --archive/--path pair, so a true answer
