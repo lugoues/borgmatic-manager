@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/lugoues/borgmatic-manager/internal/config"
 )
 
 // stagingSuffix names the sibling directory a mirror restore extracts into
@@ -263,9 +266,7 @@ func createStagingLike(staging, model string, logger *slog.Logger) error {
 		return err
 	}
 
-	// Created restrictively and widened afterwards: it briefly exists at its
-	// final path, and umask would mask an intended mode passed to Mkdir anyway.
-	if err := os.Mkdir(staging, 0o700); err != nil {
+	if err := createStagingDir(staging, model, logger); err != nil {
 		return fmt.Errorf("creating the staging directory %s: %w", staging, err)
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
@@ -347,6 +348,79 @@ func readSELinuxContext(path string) (label string, present bool, err error) {
 // rather than truncating, and SELinux contexts with long MCS category sets do
 // overflow the obvious guesses. Absent, or a filesystem without xattr support,
 // is normal and not an error.
+// btrfsSubvolumeRootInode is the inode number every btrfs subvolume root has.
+// It is an unremarkable number on any other filesystem, so it only means this
+// once the filesystem is known to be btrfs.
+const btrfsSubvolumeRootInode = 256
+
+// createStagingDir makes the directory the restore extracts into, matching what
+// the target *is* and not merely what it contains.
+//
+// The exchange swaps two entries in one parent directory, so a plain staging
+// sibling trades places with a btrfs subvolume root perfectly happily: the
+// restore succeeds and nothing warns. What it leaves behind is an ordinary
+// directory where a subvolume used to be, so the operator's snapshots,
+// send/receive, and quota groups silently stop applying to that volume. Created
+// as a subvolume, the exchange preserves it.
+//
+// Created restrictively and widened afterwards: it briefly exists at its final
+// path, and umask would mask an intended mode passed to Mkdir anyway.
+func createStagingDir(staging, model string, logger *slog.Logger) error {
+	subvolume, err := isBtrfsSubvolumeRoot(model)
+	if err != nil {
+		return err
+	}
+	if !subvolume {
+		return os.Mkdir(staging, 0o700)
+	}
+	if subErr := createBtrfsSubvolume(staging); subErr != nil {
+		// Losing the subvolume is worth saying out loud, but it is not worth
+		// refusing a restore over: the data lands correctly either way, and an
+		// operator without btrfs-progs installed still needs their volume back.
+		logger.Warn("this volume's data directory is a btrfs subvolume, but a subvolume could not be created to "+
+			"replace it, so the restored directory will be an ordinary one; snapshots, send/receive, or quotas "+
+			"set up against this subvolume will stop applying to it",
+			"path", staging, "error", subErr)
+		return os.Mkdir(staging, 0o700)
+	}
+	// #nosec G302 -- a directory, and briefly: it takes the model's mode next
+	return os.Chmod(staging, 0o700)
+}
+
+// isBtrfsSubvolumeRoot reports whether path is the root of its own btrfs
+// subvolume. Such a root is not a separate mount, so /proc/self/mountinfo does
+// not show it and isOwnMountPoint says nothing about it.
+func isBtrfsSubvolumeRoot(path string) (bool, error) {
+	onBtrfs, err := config.IsBtrfs(path)
+	if err != nil {
+		return false, fmt.Errorf("checking the filesystem of %s: %w", path, err)
+	}
+	if !onBtrfs {
+		return false, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, nil
+	}
+	return st.Ino == btrfsSubvolumeRootInode, nil
+}
+
+// createBtrfsSubvolume shells out because creating one otherwise means issuing
+// BTRFS_IOC_SUBVOL_CREATE by hand through unsafe pointers, and this package
+// already runs an external binary (cp --reflink) for the snapshot path.
+var createBtrfsSubvolume = func(path string) error {
+	// #nosec G204 -- fixed argv over a path this process derived
+	out, err := exec.Command("btrfs", "subvolume", "create", path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs subvolume create: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // listXattrs names every extended attribute on path. A filesystem without
 // xattr support reports none rather than failing: there is then nothing to
 // preserve.

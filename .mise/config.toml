@@ -18,6 +18,10 @@ CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$VERSION" -o bin/borgmati
 description = "go vet + unit tests"
 run = ["go vet ./...", "go test ./..."]
 
+[tasks.test-btrfs]
+description = "tests needing a real btrfs mount; set BM_BTRFS_DIR to a writable one"
+run = "go test -tags btrfs ./cmd/borgmatic-manager/"
+
 [tasks.race]
 description = "Race-detector test run"
 run = "go test -race -count=1 ./..."
