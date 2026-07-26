@@ -81,3 +81,5 @@ jobs:
           args: release --snapshot --clean --skip=sign
       - name: verify the built deb (install/upgrade/remove on current distros)
         run: bash tests/packaging/verify-deb.sh
+      - name: verify the maintainer scripts against a real systemd
+        run: bash tests/packaging/verify-systemd-lifecycle.sh

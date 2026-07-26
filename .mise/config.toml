@@ -77,6 +77,11 @@ description = "Verify the built deb installs/upgrades/removes cleanly on current
 depends = ["package"]
 run = "bash tests/packaging/verify-deb.sh"
 
+[tasks.package-verify-systemd]
+description = "Verify the maintainer scripts against a real systemd (needs privileged docker)"
+depends = ["package"]
+run = "bash tests/packaging/verify-systemd-lifecycle.sh"
+
 [tasks.clean]
 description = "Remove build artifacts"
 run = "rm -rf bin dist"
