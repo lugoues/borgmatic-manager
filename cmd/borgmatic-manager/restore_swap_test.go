@@ -1076,3 +1076,211 @@ func waitBounded(t *testing.T, child *exec.Cmd) error {
 		return nil
 	}
 }
+
+// A zero-length attribute is present, not absent. user.* attributes are often
+// used as bare boolean markers, and reporting them missing dropped them from
+// the directory that replaces the volume.
+func TestReadXattrReportsAZeroLengthAttributeAsPresent(t *testing.T) {
+	dir := t.TempDir()
+	if err := unix.Lsetxattr(dir, "user.marker", nil, 0); err != nil {
+		t.Skipf("this filesystem cannot hold a user xattr: %v", err)
+	}
+
+	value, present, err := readXattr(dir, "user.marker")
+	require.NoError(t, err)
+	assert.True(t, present, "an attribute with an empty value still exists")
+	assert.Empty(t, value)
+
+	_, present, err = readXattr(dir, "user.never-set")
+	require.NoError(t, err)
+	assert.False(t, present, "and one that was never set is still absent")
+}
+
+func TestCreateStagingLikeCarriesAZeroLengthAttribute(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+	if err := unix.Lsetxattr(model, "user.marker", nil, 0); err != nil {
+		t.Skipf("this filesystem cannot hold a user xattr: %v", err)
+	}
+	staging := model + stagingSuffix
+
+	require.NoError(t, createStagingLike(staging, model, quietLogger()))
+
+	_, present, err := readXattr(staging, "user.marker")
+	require.NoError(t, err)
+	assert.True(t, present, "the marker the volume carried was dropped")
+}
+
+// The retained copy is only useful if the rename that made it survives a crash.
+// Without a flush the namespace can roll back to the staging name while the
+// error still points at the kept one, and the next attempt deletes it.
+func TestRetainOutOfTheWayFlushesTheRename(t *testing.T) {
+	data := liveVolume(t)
+	staging := data + stagingSuffix
+	require.NoError(t, os.Mkdir(staging, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "kept.txt"), []byte("kept"), 0o644))
+
+	synced := make([]string, 0, 1)
+	realSync := syncDirFn
+	syncDirFn = func(path string) error {
+		synced = append(synced, path)
+		return realSync(path)
+	}
+	defer func() { syncDirFn = realSync }()
+
+	kept, err := retainOutOfTheWay(staging, data)
+	require.NoError(t, err)
+	assert.Equal(t, []string{filepath.Dir(data)}, synced, "the parent directory was flushed after the rename")
+	assert.Equal(t, []string{"kept.txt"}, names(t, kept))
+}
+
+// A flush failure must not send the operator to a path with nothing at it: the
+// data really has moved by then, it just is not durable yet.
+func TestRetainOrWarnStillReportsThePathWhenTheFlushFails(t *testing.T) {
+	data := liveVolume(t)
+	staging := data + stagingSuffix
+	require.NoError(t, os.Mkdir(staging, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "kept.txt"), []byte("kept"), 0o644))
+
+	realSync := syncDirFn
+	syncDirFn = func(string) error { return errors.New("disk went away") }
+	defer func() { syncDirFn = realSync }()
+
+	logs, logger := capturedWarnLogger()
+	kept := retainOrWarn(staging, data, logger)
+
+	assert.NotEqual(t, staging, kept, "the copy really did move, so report where it is")
+	assert.Equal(t, []string{"kept.txt"}, names(t, kept), "and it is there")
+	assert.Contains(t, logs.String(), "could not be flushed", "the durability gap is reported")
+}
+
+// Two restores of one volume derive the same staging path, and the second's
+// opening cleanup deletes the first's live extract. The lock is what stops the
+// second from starting at all.
+func TestLockVolumeRestoreExcludesASecondRestoreOfTheSameVolume(t *testing.T) {
+	locks := t.TempDir()
+	data := "/var/lib/docker/volumes/myvol/_data"
+
+	first, err := lockVolumeRestore(locks, data)
+	require.NoError(t, err)
+
+	_, err = lockVolumeRestore(locks, data)
+	require.Error(t, err, "a second restore of the same volume must be refused")
+	assert.Contains(t, err.Error(), "another restore is already running")
+	assert.Contains(t, err.Error(), "nothing was changed")
+
+	// A different volume is unrelated and must not be blocked.
+	other, err := lockVolumeRestore(locks, "/var/lib/docker/volumes/othervol/_data")
+	require.NoError(t, err)
+	other.Release()
+
+	// And the lock is released for the next run.
+	first.Release()
+	again, err := lockVolumeRestore(locks, data)
+	require.NoError(t, err, "the lock must not outlive the restore that held it")
+	again.Release()
+}
+
+// Keyed on the resolved directory, not the name used to reach it: --into and a
+// symlinked _data both let two invocations mean the same directory.
+func TestLockVolumeRestoreKeysOnTheResolvedTarget(t *testing.T) {
+	locks := t.TempDir()
+	held, err := lockVolumeRestore(locks, "/srv/backing/v")
+	require.NoError(t, err)
+	defer held.Release()
+
+	_, err = lockVolumeRestore(locks, "/srv/backing/v")
+	require.Error(t, err, "the same resolved path is the same lock")
+}
+
+// Ctrl-Z has to stop the restore, not just the process the shell watches. With
+// the extract in its own session the terminal cannot reach it, so an
+// unforwarded SIGTSTP suspends the manager while borgmatic keeps writing: the
+// shell reports the command stopped while a merge or forced in-place restore
+// carries on modifying the live volume.
+func TestExtractIsSuspendedAndResumedWithTheManager(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "child.log")
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer func() { _ = logFile.Close() }()
+
+	// #nosec G204 -- re-execs this test binary
+	child := exec.Command(os.Args[0], "-test.run=TestExtractSignalHelper")
+	child.Env = minimalEnv("BM_EXTRACT_SIGNAL_HELPER=1")
+	child.Stdout, child.Stderr = logFile, logFile
+	require.NoError(t, child.Start())
+	t.Cleanup(func() {
+		_ = child.Process.Signal(syscall.SIGCONT)
+		_ = child.Process.Kill()
+		_, _ = child.Process.Wait()
+	})
+
+	grandchild := waitForPID(t, logPath)
+	require.NoError(t, child.Process.Signal(syscall.SIGTSTP))
+
+	// The manager stops, which is what makes the shell notice at all.
+	requireProcState(t, child.Process.Pid, "T", "the manager did not stop")
+	// And the extract stops with it, which is the part that was missing.
+	requireProcState(t, grandchild, "T", "borgmatic kept running while the restore was suspended")
+
+	require.NoError(t, child.Process.Signal(syscall.SIGCONT))
+	requireProcStateNot(t, child.Process.Pid, "T", "the manager did not resume")
+	requireProcStateNot(t, grandchild, "T", "borgmatic was left stopped after the restore resumed")
+}
+
+// procState reads the single-letter run state from /proc/<pid>/stat. The comm
+// field can contain spaces and parentheses, so the scan starts after the last
+// ')' rather than splitting the whole line.
+func procState(pid int) (string, error) {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return "", err
+	}
+	end := strings.LastIndexByte(string(raw), ')')
+	if end < 0 || end+2 >= len(raw) {
+		return "", fmt.Errorf("cannot parse /proc/%d/stat", pid)
+	}
+	fields := strings.Fields(string(raw[end+2:]))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("no state in /proc/%d/stat", pid)
+	}
+	return fields[0], nil
+}
+
+func requireProcState(t *testing.T, pid int, want, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		got, err := procState(pid)
+		return err == nil && got == want
+	}, helperGrace, 20*time.Millisecond, msg)
+}
+
+func requireProcStateNot(t *testing.T, pid int, unwanted, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		got, err := procState(pid)
+		return err == nil && got != unwanted
+	}, helperGrace, 20*time.Millisecond, msg)
+}
+
+// The consequence of a false positive here is that an ordinary volume takes the
+// destructive in-place path for no reason, so the check has to be certain
+// before it says yes. An unencrypted directory, and a filesystem that does not
+// report on encryption at all, must both come back false without an error.
+func TestIsEncryptedDirIsFalseForAnOrdinaryDirectory(t *testing.T) {
+	for name, path := range map[string]string{
+		"temp dir":       t.TempDir(),
+		"its parent":     filepath.Dir(t.TempDir()),
+		"a volume _data": liveVolume(t),
+	} {
+		got, err := isEncryptedDir(path)
+		require.NoError(t, err, "%s: reporting on encryption must not fail", name)
+		assert.False(t, got, "%s: an unencrypted directory must never be treated as encrypted", name)
+	}
+}
+
+func TestIsEncryptedDirReportsAMissingPath(t *testing.T) {
+	_, err := isEncryptedDir(filepath.Join(t.TempDir(), "nope"))
+	require.Error(t, err, "a path that cannot be inspected is not the same as one that is unencrypted")
+}

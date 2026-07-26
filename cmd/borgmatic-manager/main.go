@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -974,6 +976,31 @@ refuses unless the container is stopped or --force.`,
 
 // volumeRestorePlan is the resolved borg geometry for a restore: what to pull
 // from the archive and where to land it.
+// lockVolumeRestore takes an exclusive lock covering one volume's data
+// directory for the whole restore.
+//
+// Keyed on the resolved target rather than the volume name, because --into and
+// a symlinked _data both let different names denote the same directory, and the
+// directory is what the staging path is derived from. Two restores that agree
+// on the target must agree on the lock.
+//
+// Non-blocking on purpose: a restore can run for hours, so a second one waiting
+// silently is worse than being told the first is still going.
+func lockVolumeRestore(locksDir, targetData string) (*lockfile.Lock, error) {
+	sum := sha256.Sum256([]byte(targetData))
+	path := filepath.Join(locksDir, "restore-"+hex.EncodeToString(sum[:8])+".lock")
+	lock, acquired, err := lockfile.TryExclusive(path)
+	if err != nil {
+		return nil, fmt.Errorf("taking the restore lock for %s: %w", targetData, err)
+	}
+	if !acquired {
+		return nil, fmt.Errorf("another restore is already running for %s (nothing was changed); "+
+			"wait for it to finish, because two restores of one volume share a staging directory "+
+			"and the second would delete the first's extract and could promote a mixture of both", targetData)
+	}
+	return lock, nil
+}
+
 // latestArchive is borg's pseudo-archive for "whichever is newest". It is
 // resolved separately by every invocation, so it names a different archive
 // before and after a backup completes.
@@ -1067,6 +1094,16 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 			"link", plan.targetData, "resolved", resolvedData)
 		plan.targetData = resolvedData
 	}
+
+	// Before anything reads or clears the staging path. Two restores of the same
+	// volume derive the same staging name from it, and the second one's opening
+	// cleanup would delete the first one's live extract, after which both write
+	// into the same directory and either can promote the mixture.
+	restoreLock, lockErr := lockVolumeRestore(e.locksDir(), plan.targetData)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer restoreLock.Release()
 
 	// A previous restore killed between the two renames leaves the data under a
 	// suffixed name and nothing at targetData. Put it back before concluding the
@@ -1163,11 +1200,23 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return mountErr
 	}
 
+	// An fscrypt policy is applied when a directory is created and inherited
+	// from its parent; it cannot be copied onto the staging sibling afterwards
+	// the way ownership, mode, and xattrs are. Staging under an unencrypted
+	// parent would have borg write the files in plaintext and the swap would
+	// then replace an encrypted volume with a readable one, reporting success.
+	// Writing in place keeps the encrypted directory and its policy.
+	encrypted, encErr := isEncryptedDir(plan.targetData)
+	if encErr != nil {
+		return encErr
+	}
+
 	// Mirror restores stage and swap, so the live data is never destroyed
-	// before its replacement exists on disk. Three cases cannot: --merge is
+	// before its replacement exists on disk. Four cases cannot: --merge is
 	// additive and has nothing to replace, --force means a container is running
-	// with this directory bind-mounted and pins the inode a swap would move,
-	// and a mount point cannot be renamed at all.
+	// with this directory bind-mounted and pins the inode a swap would move, a
+	// mount point cannot be renamed at all, and an encrypted directory cannot
+	// have its policy reproduced on a sibling.
 	switch {
 	case merge:
 		// Merge writes straight into the live directory, so a container that
@@ -1192,22 +1241,30 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		logger.Info("restore complete", "path", plan.targetData)
 		return nil
 
-	case (force && running) || mounted:
-		if mounted {
+	case (force && running) || mounted || encrypted:
+		switch {
+		case mounted:
 			logger.Warn("this volume's data directory is its own mount point, so it cannot be swapped into place "+
 				"and the restore writes in place instead: the data is replaced as borgmatic extracts, "+
 				"and a failure can leave it partially restored. Take your own copy first if that matters",
 				"path", plan.targetData)
-		} else {
+		case encrypted:
+			logger.Warn("this volume's data directory is encrypted, and an encryption policy cannot be applied to "+
+				"the replacement directory a swap would need, so the restore writes in place instead: the data is "+
+				"replaced as borgmatic extracts, and a failure can leave it partially restored. Restoring through "+
+				"a swap here would have written the files unencrypted",
+				"path", plan.targetData)
+		default:
 			logger.Warn("a running container has this volume mounted, so the restore writes in place: "+
 				"the data is replaced as borgmatic extracts, and a failure can leave it partially restored",
 				"path", plan.targetData)
 		}
 		// The in-place path empties before extracting, so it destroys on the
 		// same race the staged path aborts on. --force is an explicit "do it
-		// anyway" and keeps its meaning; a mount-point volume without --force
-		// has no such consent, so ask again after the probe.
-		if mounted && !force {
+		// anyway" and keeps its meaning; a volume pushed onto this path by its
+		// own nature rather than by the operator has given no such consent, so
+		// ask again after the probe.
+		if (mounted || encrypted) && !force {
 			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
 			if checkErr != nil {
 				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
@@ -1297,23 +1354,20 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	// Armed before the child exists. A signal landing between Start and Notify
-	// would otherwise take the default action, killing the manager and leaving
-	// borgmatic writing into the volume with nothing supervising it.
+	// would otherwise take its default action on this process, killing the
+	// manager and leaving borgmatic writing into the volume unsupervised.
 	//
-	// SIGHUP is on the list for that reason and not because anything here wants
-	// to reload: its default action is also to terminate, and it arrives on its
-	// own whenever a controlling terminal goes away, so leaving it unhandled
-	// means closing the terminal on a merge or forced in-place restore kills the
-	// manager while borgmatic keeps writing into the live volume.
-	// The extract runs in its own session, so the terminal can no longer signal
-	// it directly: every terminal-generated signal arrives here and nowhere
-	// else. Anything whose default action would kill this process therefore has
-	// to be caught and forwarded, or the manager dies and leaves borgmatic
-	// writing into the volume unsupervised. That is the whole list of them a
-	// restore can realistically meet: Ctrl-C, Ctrl-\, a supervisor's terminate,
-	// and a closing terminal.
+	// The extract's own session is what makes this list load-bearing rather than
+	// a convenience: the terminal can no longer reach borgmatic directly, so
+	// every terminal-generated signal arrives here and nowhere else, and
+	// anything not forwarded simply does not happen to the restore. Those are
+	// the terminating ones a restore can realistically meet (Ctrl-C, Ctrl-\, a
+	// supervisor's terminate, a closing terminal) plus the job-control pair,
+	// which for the same reason no longer reaches borgmatic on its own.
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(signals,
+		syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP,
+		syscall.SIGTSTP, syscall.SIGCONT)
 	defer signal.Stop(signals)
 
 	if err := cmd.Start(); err != nil {
@@ -1341,6 +1395,22 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 			if !ok {
 				forwarded = syscall.SIGTERM
 			}
+			// Ctrl-Z has to mean the whole operation stops, not just the process
+			// the shell happens to be watching. Left unhandled it suspends the
+			// manager while borgmatic keeps writing, so the shell reports the
+			// command stopped while a merge or forced in-place restore carries on
+			// modifying the live volume.
+			if forwarded == syscall.SIGTSTP {
+				suspendWithExtract(cmd)
+				continue
+			}
+			// A SIGCONT arriving on its own, from kill rather than after a stop
+			// this process handled, still has to reach the extract: nothing else
+			// will resume it.
+			if forwarded == syscall.SIGCONT {
+				signalExtractGroup(cmd, syscall.SIGCONT)
+				continue
+			}
 			signalExtractGroup(cmd, forwarded)
 			return waitOrKill(cmd, exited, "interrupted by "+sig.String())
 
@@ -1349,6 +1419,26 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 			return waitOrKill(cmd, exited, ctx.Err().Error())
 		}
 	}
+}
+
+// suspendWithExtract stops the extract and then this process, so a Ctrl-Z
+// suspends the whole restore rather than only the half the shell can see.
+//
+// It deliberately does not resume anything. kill() returns once the signal is
+// queued, not once it has taken effect, so a SIGCONT sent to the group on the
+// next line raced ahead of this process actually stopping and cancelled the
+// SIGSTOP that had just been sent: the extract ran on while the manager sat
+// suspended, which is the exact bug this is meant to fix. Resuming belongs to
+// the SIGCONT the shell sends on fg, which the caller forwards.
+//
+// SIGSTOP rather than SIGTSTP for both, because SIGTSTP can be caught or
+// ignored and this is not a request. Stopping this process by re-raising
+// SIGTSTP has the same problem in reverse: dropping the handler to let the
+// default action happen races against putting it back, and the re-raised signal
+// is caught by the re-armed handler instead of stopping anything.
+func suspendWithExtract(cmd *exec.Cmd) {
+	signalExtractGroup(cmd, syscall.SIGSTOP)
+	_ = syscall.Kill(syscall.Getpid(), syscall.SIGSTOP)
 }
 
 // waitOrKill gives a signalled extract a bounded chance to stop on its own,
