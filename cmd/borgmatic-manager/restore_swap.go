@@ -108,10 +108,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 			// about to run clears staging as its first act, which would delete
 			// the very tree this error points them at.
 			keepStaging = true
-			kept := staging
-			if moved, moveErr := retainOutOfTheWay(staging, targetData); moveErr == nil {
-				kept = moved
-			}
+			kept := retainOrWarn(staging, targetData, logger)
 			return fmt.Errorf("%w (the volume is untouched; the completed restore is kept at %s)", safeErr, kept)
 		}
 	}
@@ -127,13 +124,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		// Move it off the staging path before reporting it. The next restore
 		// clears staging as its first act, which would silently delete the very
 		// copy this branch is telling the operator to keep.
-		kept := displaced
-		if moved, moveErr := retainOutOfTheWay(displaced, targetData); moveErr == nil {
-			kept = moved
-		} else {
-			logger.Warn("could not move the retained copy out of the staging path; a later restore may clear it",
-				"path", displaced, "error", moveErr)
-		}
+		kept := retainOrWarn(displaced, targetData, logger)
 		logger.Warn("the restore is in place but the swap could not be flushed to disk, so the copy it replaced is being kept; "+
 			"delete it once the volume looks right",
 			"path", filepath.Dir(targetData), "kept", kept, "error", syncErr)
@@ -565,6 +556,25 @@ func unescapeMountField(field string) string {
 		b.WriteByte(field[i])
 	}
 	return b.String()
+}
+
+// retainOrWarn moves a copy that must outlive this run out of the way and
+// reports where it ended up, falling back to where it already is.
+//
+// Both callers need exactly this, and neither can treat a failure as fatal: the
+// copy still exists, it is just sitting on a path a later restore reuses, and
+// the operator is about to be pointed at it either way. Saying so is the whole
+// obligation. It is one function rather than two call sites because leaving that
+// warning to be remembered independently is how this went wrong before.
+func retainOrWarn(from, targetData string, logger *slog.Logger) string {
+	moved, err := retainOutOfTheWay(from, targetData)
+	if err != nil {
+		logger.Warn("could not move a copy that has to be kept clear of the staging path; "+
+			"a later restore may delete it, so move it yourself if you need it",
+			"path", from, "error", err)
+		return from
+	}
+	return moved
 }
 
 // retainOutOfTheWay moves a copy that must outlive this run to a uniquely named
