@@ -43,12 +43,17 @@ fi
 # A reinstall after a plain "remove" keeps the enablement symlink, since only
 # purge drops it. But preremove stopped the service, and nothing above starts it
 # again, so the package would come back enabled and inactive: the same silently
-# stopped backups that preserving the enablement exists to prevent. Start it only
-# when it is already enabled, which a genuinely fresh install never is, so
-# enabling stays the operator's call.
-if command -v systemctl >/dev/null 2>&1 \
-   && systemctl is-enabled --quiet borgmatic-manager 2>/dev/null \
+# stopped backups that preserving the enablement exists to prevent.
+#
+# The stamp is what makes this safe. It exists only when preremove stopped a
+# service that was actually running, so this restores that exact state and
+# nothing else: a genuinely fresh install has no stamp, and neither does a
+# service the operator had deliberately stopped before removing the package.
+STOPPED_STAMP=/var/lib/borgmatic-manager/.stopped-by-package
+if [ -e "$STOPPED_STAMP" ] \
+   && command -v systemctl >/dev/null 2>&1 \
    && ! systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
+    rm -f "$STOPPED_STAMP"
     # deb-systemd-invoke honors policy-rc.d, so chroot and container builds
     # still get to refuse.
     if command -v deb-systemd-invoke >/dev/null 2>&1; then
@@ -57,7 +62,7 @@ if command -v systemctl >/dev/null 2>&1 \
         systemctl start borgmatic-manager.service || true
     fi
     if systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
-        echo "borgmatic-manager reinstalled; it was still enabled, so the service was started again."
+        echo "borgmatic-manager reinstalled; the removal had stopped a running service, so it was started again."
         exit 0
     fi
 fi
