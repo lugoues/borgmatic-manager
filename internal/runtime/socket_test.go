@@ -79,3 +79,20 @@ func TestResolveSocketPathErrorIsActionable(t *testing.T) {
 		}
 	}
 }
+
+// A paused container's process still exists and resumes holding the inode it
+// had, so a restore that swaps the volume underneath it leaves it writing into
+// an orphaned mount. "restarting" is about to be running again. Neither reports
+// "running", which is why the state string alone is not the question to ask.
+func TestContainerHoldsMounts(t *testing.T) {
+	for _, state := range []string{"running", "paused", "restarting"} {
+		if !containerHoldsMounts(state) {
+			t.Errorf("state %q still holds its mounts and must count as live", state)
+		}
+	}
+	for _, state := range []string{"created", "exited", "dead", "removing", ""} {
+		if containerHoldsMounts(state) {
+			t.Errorf("state %q has let its mounts go and must not block a restore", state)
+		}
+	}
+}
