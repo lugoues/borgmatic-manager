@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,93 @@ import (
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
 )
+
+// Fixtures captured from borgmatic 2.1.6 over borg 1.4.0. borgmatic prints a
+// human banner to stdout before borg's --json-lines entries, so "stdout is
+// non-empty" is not the same question as "the archive holds this path".
+const (
+	listStdoutPathPresent = `/srv/repo: Listing archive host-2026-07-26T06:06:35.597399
+{"type": "d", "mode": "drwxr-xr-x", "user": "root", "group": "root", "uid": 0, "gid": 0, "path": "myvol/_data", "healthy": true, "source": "", "linktarget": "", "flags": 0, "mtime": "2026-07-26T06:05:36.811407", "size": 0}
+{"type": "-", "mode": "-rw-r--r--", "user": "root", "group": "root", "uid": 0, "gid": 0, "path": "myvol/_data/file.txt", "healthy": true, "source": "", "linktarget": "", "flags": 0, "mtime": "2026-07-26T06:05:36.811407", "size": 6}
+`
+	listStdoutPathAbsent = `/srv/repo: Listing archive host-2026-07-26T06:06:35.597399
+`
+	listStderrBadArchive = `Archive definitely-not-there does not exist
+/srv/repo: Error running actions for repository
+/srv/repo: Command 'borg list --log-json --json-lines /srv/repo::definitely-not-there myvol/_data' returned non-zero exit status 31.
+/srv/cfg.yaml: Error running configuration
+/srv/cfg.yaml: An error occurred
+
+summary:
+An error occurred
+Error running actions for repository
+Archive definitely-not-there does not exist
+Error running configuration
+
+Need some help? https://torsion.org/borgmatic/#issues
+`
+)
+
+// The probe that gates the destructive wipe: a path that is absent must read as
+// absent even though borgmatic wrote a banner line to stdout.
+func TestCountJSONLinesSeparatesEntriesFromBanner(t *testing.T) {
+	assert.Equal(t, 2, countJSONLines([]byte(listStdoutPathPresent)), "both entries counted, banner ignored")
+	assert.Equal(t, 0, countJSONLines([]byte(listStdoutPathAbsent)), "a banner alone is not a match")
+	assert.Equal(t, 0, countJSONLines(nil), "no output is not a match")
+	assert.Equal(t, 0, countJSONLines([]byte("{not json\n{\"a\":1")), "malformed lines do not count")
+	assert.Equal(t, 1, countJSONLines([]byte("  {\"path\": \"x\"}  ")), "surrounding whitespace is tolerated")
+}
+
+// borgmatic re-wraps the real cause per repository, per config, and again under
+// "summary:", so the useful message is the first line, not the last.
+func TestFirstNonEmptyLinePicksTheCause(t *testing.T) {
+	assert.Equal(t, "Archive definitely-not-there does not exist", firstNonEmptyLine(listStderrBadArchive))
+	assert.Empty(t, firstNonEmptyLine("\n\n   \n"))
+	assert.Equal(t, strings.Repeat("x", 200)+"...", firstNonEmptyLine(strings.Repeat("x", 500)), "a wall of borg output is truncated")
+}
+
+// The probe must treat a failed borgmatic as "cannot tell", never as "nothing
+// there": returning false with no error would let the caller wipe the target.
+func TestArchivePathPopulatedErrorsWhenBorgmaticFails(t *testing.T) {
+	found, err := archivePathPopulated(context.Background(), "/bin/false", "cfg.yaml", "latest", "myvol/_data")
+	require.Error(t, err, "a non-zero exit is an error, not an empty result")
+	assert.False(t, found)
+}
+
+func TestArchivePathPopulatedReadsEntriesFromStdout(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathPresent+"EOF\n"), 0o700))
+
+	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	require.NoError(t, err)
+	assert.True(t, found, "entries under the path mean the extract has something to write")
+}
+
+func TestArchivePathPopulatedReportsBannerOnlyAsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathAbsent+"EOF\n"), 0o700))
+
+	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	require.NoError(t, err, "borgmatic exited 0: this is a real answer, not a probe failure")
+	assert.False(t, found, "an archive predating the volume must not be mirrored over live data")
+}
+
+// The probe passes the extract's own --archive/--path pair, so a true answer
+// means that exact extract has something to write.
+func TestArchivePathPopulatedPassesExtractArguments(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	argsFile := filepath.Join(dir, "args")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\necho \"$@\" > "+argsFile+"\n"), 0o700))
+
+	_, err := archivePathPopulated(context.Background(), stub, "/tmp/cfg.yaml", "weekly-1", "myvol/_data")
+	require.NoError(t, err)
+	recorded, err := os.ReadFile(argsFile)
+	require.NoError(t, err)
+	assert.Equal(t, "--config /tmp/cfg.yaml list --archive weekly-1 --path myvol/_data --json", strings.TrimSpace(string(recorded)))
+}
 
 func TestEmptyVolumeDataRefusesNonVolumePaths(t *testing.T) {
 	dir := t.TempDir() // no "/volumes/" component

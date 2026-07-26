@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1060,6 +1062,30 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return genErr
 	}
 
+	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(configsDir, group+".yaml")
+
+	// Mirror mode destroys the target before borgmatic has proven it can refill
+	// it, and the extract runs via syscall.Exec, so there is no "after" in which
+	// to notice and undo. Ask first whether this exact --archive/--path pair
+	// resolves to anything: a typo'd archive, an unreachable repository, a wrong
+	// passphrase, or an archive predating the volume all leave an operator with
+	// an empty volume and no restore. Merge mode adds files without removing
+	// any, so it has nothing to lose and skips the probe.
+	if !merge {
+		found, probeErr := archivePathPopulated(ctx, borgmaticPath, configPath, archive, plan.archivePath)
+		if probeErr != nil {
+			return fmt.Errorf("cannot verify archive %q before emptying %s (nothing was changed): %w", archive, plan.targetData, probeErr)
+		}
+		if !found {
+			return fmt.Errorf("archive %q contains nothing under %q, so a mirror restore would empty %s and put nothing back (nothing was changed); "+
+				"check the archive name with: borgmatic-manager borgmatic %s list", archive, plan.archivePath, plan.targetData, group)
+		}
+	}
+
 	// Preserve the current data before overwriting it: a btrfs CoW copy the
 	// operator can roll back from, then removed once the restore is verified.
 	if snapshot {
@@ -1080,11 +1106,6 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		logger.Warn("emptied the target volume for a mirror restore", "path", plan.targetData)
 	}
 
-	borgmaticPath, err := resolveBorgmatic(e.cfg)
-	if err != nil {
-		return err
-	}
-	configPath := filepath.Join(configsDir, group+".yaml")
 	// Strip "<sourceVolume>/_data" so files land directly in the target's data
 	// dir, which lets --into retarget a differently-named volume.
 	argv := []string{borgmaticPath, "--config", configPath, "extract", "--archive", archive,
@@ -1139,6 +1160,68 @@ func snapshotVolume(ctx context.Context, targetData string) (string, error) {
 		return "", fmt.Errorf("btrfs snapshot copy failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return snap, nil
+}
+
+// archivePathPopulated reports whether archive holds at least one entry under
+// archivePath, the question a mirror restore must answer before it empties
+// anything. It deliberately uses the same --archive/--path pair the extract
+// will, so a true answer means that extract has something to write.
+//
+// A non-zero exit (unknown archive, unreachable repository, bad passphrase) is
+// an error, not a false: the caller must refuse to wipe rather than treat "we
+// could not tell" as "nothing there".
+func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archive, archivePath string) (bool, error) {
+	// #nosec G204 -- resolved borgmatic binary, read-only list over computed args
+	cmd := exec.CommandContext(ctx, borgmaticPath,
+		"--config", configPath, "list", "--archive", archive, "--path", archivePath, "--json")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := firstNonEmptyLine(stderr.String()); msg != "" {
+			return false, fmt.Errorf("%w: %s", err, msg)
+		}
+		return false, err
+	}
+	return countJSONLines(stdout.Bytes()) > 0, nil
+}
+
+// countJSONLines counts borg's --json-lines entries in a borgmatic list. Only
+// the JSON lines count: borgmatic prefixes stdout with a human "Listing archive
+// <name>" banner, so a non-empty stdout does not by itself mean a match.
+func countJSONLines(out []byte) int {
+	n := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "{") {
+			continue
+		}
+		if !json.Valid([]byte(trimmed)) {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// firstNonEmptyLine picks the cause out of borgmatic's error output. The first
+// line is the underlying borg or borgmatic failure ("Archive x does not exist",
+// "[Errno 13] Permission denied"); everything after it is that failure being
+// re-wrapped per repository, per config, and then repeated under "summary:", so
+// the tail is the least specific part, not the most.
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		const maxLen = 200 // one line of cause, not a wall of borg output
+		if len(trimmed) > maxLen {
+			return trimmed[:maxLen] + "..."
+		}
+		return trimmed
+	}
+	return ""
 }
 
 // emptyVolumeData removes the contents of a volume's _data directory (keeping
