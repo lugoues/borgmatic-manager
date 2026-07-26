@@ -68,7 +68,23 @@ ck() {
   else echo "  FAIL  $1: expected '$2' got '$3'"; FAIL=$((FAIL+1)); fi
 }
 active()  { systemctl is-active borgmatic-manager 2>/dev/null || true; }
+# Wait for a settled state rather than sleeping a guessed interval: on a loaded
+# CI runner a fixed sleep is the difference between a green suite and a flake.
+# Returns as soon as the state matches, and gives up after ~15s so a genuine
+# failure still reports the wrong state instead of hanging.
+settle() {
+  local want="$1" i
+  for i in $(seq 1 150); do
+    [ "$(systemctl is-active borgmatic-manager 2>/dev/null || true)" = "$want" ] && return 0
+    sleep 0.1
+  done
+  return 0
+}
 enabled() { systemctl is-enabled borgmatic-manager 2>/dev/null || true; }
+# The unit's PID. An upgrade must replace the running process, and "still
+# active" cannot show that: a try-restart that quietly became a no-op leaves the
+# old process up and looks identical.
+mainpid() { systemctl show borgmatic-manager -p MainPID --value 2>/dev/null || true; }
 exists()  { [ -e "$1" ] && echo yes || echo no; }
 # -e follows the link, and the wants symlink dangles once dpkg removes the
 # unit file, which is exactly the state under test. -L asks the real question.
@@ -103,18 +119,18 @@ ck "not active" inactive "$(active)"
 ck "no stopped-service record" no "$(exists $STAMP)"
 
 echo "--- operator enables and starts it"
-systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; sleep 1
+systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; settle active
 ck "enabled" enabled "$(enabled)"
 ck "active" active "$(active)"
 
 echo "--- dpkg -r stops it but keeps the operator's choices"
-dpkg -r borgmatic-manager >/dev/null 2>&1; sleep 1
+dpkg -r borgmatic-manager >/dev/null 2>&1; settle inactive
 ck "stopped" inactive "$(active)"
 ck "enablement preserved" yes "$(linked $WANTS)"
 ck "recorded that it stopped a running service" yes "$(exists $STAMP)"
 
 echo "--- reinstall brings the service back up"
-install_pkg; sleep 2
+install_pkg; settle active
 ck "still enabled" enabled "$(enabled)"
 ck "running again" active "$(active)"
 ck "record consumed" no "$(exists $STAMP)"
@@ -124,20 +140,27 @@ dpkg --purge borgmatic-manager >/dev/null 2>&1; systemctl daemon-reload
 ck "enablement dropped" no "$(linked $WANTS)"
 ck "record dropped" no "$(exists $STAMP)"
 
-echo "--- upgrading a running service keeps it running"
+echo "--- upgrading a running service restarts it onto the new binary"
 reset; install_pkg
-systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; sleep 1
-install_pkg; sleep 2
+systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; settle active
+before_pid=$(mainpid)
+install_pkg; settle active
+after_pid=$(mainpid)
 ck "still active" active "$(active)"
+# The invariant an upgrade owes the operator: never keep executing the binary
+# the package just replaced.
+if [ -n "$before_pid" ] && [ "$before_pid" != 0 ] && [ -n "$after_pid" ] && [ "$after_pid" != 0 ] \
+   && [ "$before_pid" != "$after_pid" ]; then replaced=yes; else replaced="no ($before_pid -> $after_pid)"; fi
+ck "process replaced, not left on the old binary" yes "$replaced"
 ck "no record left behind" no "$(exists $STAMP)"
 
 echo "--- a deliberately stopped service is left stopped"
 reset; install_pkg
-systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; sleep 1
-systemctl stop borgmatic-manager; sleep 1
+systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; settle active
+systemctl stop borgmatic-manager; settle inactive
 dpkg -r borgmatic-manager >/dev/null 2>&1
 ck "nothing was running, so nothing recorded" no "$(exists $STAMP)"
-install_pkg; sleep 2
+install_pkg; sleep 2  # a negative needs a real pause: nothing to settle toward
 ck "operator's choice respected" inactive "$(active)"
 
 echo "--- purge clears a --runtime enablement too"
@@ -150,10 +173,10 @@ ck "runtime enablement dropped" no "$(linked $RUNTIME_WANTS)"
 echo "--- policy-rc.d can still refuse the restart"
 [ -e "$POLICY.off" ] && mv "$POLICY.off" "$POLICY"
 reset; install_pkg
-systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; sleep 1
+systemctl enable --quiet borgmatic-manager; systemctl start borgmatic-manager; settle active
 dpkg -r borgmatic-manager >/dev/null 2>&1
 ck "stop was recorded" yes "$(exists $STAMP)"
-install_pkg; sleep 2
+install_pkg; sleep 2  # a negative needs a real pause: nothing to settle toward
 ck "policy refused the start" inactive "$(active)"
 ck "record still consumed, not left stale" no "$(exists $STAMP)"
 
