@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1162,6 +1163,15 @@ func snapshotVolume(ctx context.Context, targetData string) (string, error) {
 	return snap, nil
 }
 
+const (
+	// maxListLineBytes bounds a single archive-listing line. Entries are one
+	// file's metadata, so this is orders of magnitude above any real path.
+	maxListLineBytes = 1 << 20
+	// maxProbeStderrBytes bounds captured failure output; only its first line
+	// is ever surfaced.
+	maxProbeStderrBytes = 64 << 10
+)
+
 // archivePathPopulated reports whether archive holds at least one entry under
 // archivePath, the question a mirror restore must answer before it empties
 // anything. It deliberately uses the same --archive/--path pair the extract
@@ -1171,38 +1181,89 @@ func snapshotVolume(ctx context.Context, targetData string) (string, error) {
 // an error, not a false: the caller must refuse to wipe rather than treat "we
 // could not tell" as "nothing there".
 func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archive, archivePath string) (bool, error) {
+	// borg's --json-lines emits one object per file, so a volume with millions
+	// of them would be a multi-gigabyte buffer. Stream it: one entry is the
+	// whole answer, and memory stays flat regardless of archive size.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// #nosec G204 -- resolved borgmatic binary, read-only list over computed args
 	cmd := exec.CommandContext(ctx, borgmaticPath,
 		"--config", configPath, "list", "--archive", archive, "--path", archivePath, "--json")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if msg := firstNonEmptyLine(stderr.String()); msg != "" {
-			return false, fmt.Errorf("%w: %s", err, msg)
-		}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
 		return false, err
 	}
-	return countJSONLines(stdout.Bytes()) > 0, nil
+	stderr := &headWriter{maxBytes: maxProbeStderrBytes}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return false, err
+	}
+
+	found := false
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxListLineBytes)
+	for scanner.Scan() {
+		if isArchiveEntryLine(scanner.Bytes()) {
+			found = true
+			break
+		}
+	}
+	scanErr := scanner.Err()
+
+	if found {
+		// The answer is settled. Kill the listing rather than walk an archive
+		// that may hold millions more entries; its exit status is moot now,
+		// because a valid entry is itself the proof.
+		cancel()
+		_ = cmd.Wait()
+		return true, nil
+	}
+
+	waitErr := cmd.Wait()
+	// A truncated or unreadable stream is "cannot tell", never "nothing there":
+	// the caller must refuse to wipe rather than act on a half-read listing.
+	if scanErr != nil {
+		return false, fmt.Errorf("reading the archive listing: %w", scanErr)
+	}
+	if waitErr != nil {
+		if msg := firstNonEmptyLine(stderr.String()); msg != "" {
+			return false, fmt.Errorf("%w: %s", waitErr, msg)
+		}
+		return false, waitErr
+	}
+	return false, nil
 }
 
-// countJSONLines counts borg's --json-lines entries in a borgmatic list. Only
-// the JSON lines count: borgmatic prefixes stdout with a human "Listing archive
-// <name>" banner, so a non-empty stdout does not by itself mean a match.
-func countJSONLines(out []byte) int {
-	n := 0
-	for _, line := range strings.Split(string(out), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "{") {
-			continue
-		}
-		if !json.Valid([]byte(trimmed)) {
-			continue
-		}
-		n++
-	}
-	return n
+// isArchiveEntryLine reports whether a line is one of borg's --json-lines
+// entries rather than borgmatic's human "<repo>: Listing archive <name>" banner,
+// which it writes to stdout ahead of them. Non-empty stdout is therefore not by
+// itself a match.
+func isArchiveEntryLine(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	return len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(trimmed)
 }
+
+// headWriter keeps the first maxBytes written and silently drops the rest, so a
+// chatty failure cannot balloon memory. Writes always report full success: this
+// is a capture for diagnostics, not a sink whose failure should stop a command.
+type headWriter struct {
+	buf      bytes.Buffer
+	maxBytes int
+}
+
+func (w *headWriter) Write(p []byte) (int, error) {
+	if remaining := w.maxBytes - w.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			w.buf.Write(p[:remaining])
+		} else {
+			w.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (w *headWriter) String() string { return w.buf.String() }
 
 // firstNonEmptyLine picks the cause out of borgmatic's error output. The first
 // line is the underlying borg or borgmatic failure ("Archive x does not exist",
