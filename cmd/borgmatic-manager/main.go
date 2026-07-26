@@ -1289,6 +1289,10 @@ func giveTerminalTo(pgid int) func() {
 		signal.Reset(syscall.SIGTTOU)
 		return func() {}
 	}
+	// The child starts before this call, so it can read the terminal, take
+	// SIGTTIN, and stop in the gap. Making its group the foreground one does not
+	// undo that: a stopped process stays stopped until something continues it.
+	_ = syscall.Kill(-pgid, syscall.SIGCONT)
 	return func() {
 		_ = unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, previous)
 		signal.Reset(syscall.SIGTTOU)

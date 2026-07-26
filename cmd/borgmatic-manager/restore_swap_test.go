@@ -478,3 +478,24 @@ func TestUnescapeMountField(t *testing.T) {
 	assert.Equal(t, "/mnt/with space", unescapeMountField(`/mnt/with\040space`), "the kernel octal-escapes spaces")
 	assert.Equal(t, "/mnt/tab\tsep", unescapeMountField(`/mnt/tab\011sep`))
 }
+
+// createStagingLike builds the directory and then configures it. A failure in
+// that second half must not leave the half-built directory behind: the cleanup
+// has to cover it, which means being registered before it exists.
+func TestRestoreWithSwapLeavesNoStagingWhenSetupFailsPartway(t *testing.T) {
+	data := liveVolume(t)
+
+	// A label the host claims to have but refuses to apply: createStagingLike
+	// fails after os.Mkdir has already run.
+	restore := stubXattr(t, map[string][]byte{seLinuxAttr: []byte("system_u:object_r:container_file_t:s0")}, unix.EPERM)
+	defer restore()
+
+	err := restoreWithSwap(data, quietLogger(), false, func(string) error {
+		t.Fatal("extract must not run when the staging directory could not be set up")
+		return nil
+	}, nil)
+
+	require.Error(t, err)
+	assert.NoDirExists(t, data+stagingSuffix, "a half-built staging directory must not be left on disk")
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "and the volume is untouched")
+}
