@@ -78,12 +78,22 @@ type Scheduler struct {
 	// discoverFunc and generateFunc are overridable for testing.
 	discoverFunc func(ctx context.Context) (*models.BackupState, error)
 	generateFunc func(state *models.BackupState) (map[string]config.GroupRunMeta, error)
+
+	// cycleObserver, when set, receives each cycle's merged inventory and offline
+	// state (nil when no cache), so metrics can report offline volume counts.
+	cycleObserver func(*models.BackupState, *state.Offline)
 }
 
 // SetGroupCache attaches a durable group cache so offline groups survive and
 // their schedule records are protected from retention pruning.
 func (s *Scheduler) SetGroupCache(cache *state.GroupCache) {
 	s.cache = cache
+}
+
+// SetCycleObserver registers a callback invoked at the end of each cycle with
+// the merged inventory. Optional; nil (the default) disables it.
+func (s *Scheduler) SetCycleObserver(f func(*models.BackupState, *state.Offline)) {
+	s.cycleObserver = f
 }
 
 // cacheNames returns cached group names for retention protection, or nil.
@@ -344,13 +354,18 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 	// backed up (data at rest, no silent shrink). Offline databases cannot be
 	// dumped without their container, so drop them from this cycle with a
 	// warning; their last dump stays restorable from prior archives.
+	var off *state.Offline
 	if s.cache != nil {
-		merged, off := s.cache.Reconcile(backupState, s.now())
-		off.StripUndumpableDatabases(merged, func(group string, db models.DatabaseConfig) {
+		merged, o := s.cache.Reconcile(backupState, s.now())
+		o.StripUndumpableDatabases(merged, func(group string, db models.DatabaseConfig) {
 			s.logger.Warn("skipping database dump: its container is offline (cannot join a namespace that is gone)",
 				"group", group, "database", db.Type+"/"+db.Name)
 		})
-		backupState = merged
+		backupState, off = merged, o
+	}
+
+	if s.cycleObserver != nil {
+		s.cycleObserver(backupState, off)
 	}
 
 	meta, err := s.generateFunc(backupState)

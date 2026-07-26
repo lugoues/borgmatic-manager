@@ -52,6 +52,21 @@ type ManagerSettings struct {
 	// commands ("docker" or "podman"). Empty means derive it from the
 	// socket the manager is connected to, then PATH.
 	ContainerCLI string `yaml:"container_cli"`
+	// Metrics configures OpenTelemetry metric export (daemon only).
+	Metrics MetricsSettings `yaml:"metrics"`
+}
+
+// MetricsSettings configures native OpenTelemetry metric export over OTLP. The
+// exporter also honors the standard OTEL_EXPORTER_OTLP_* and
+// OTEL_RESOURCE_ATTRIBUTES environment variables; fields here take precedence.
+type MetricsSettings struct {
+	// Enabled turns on metric export. Off by default: no exporter, no metrics.
+	Enabled bool `yaml:"enabled"`
+	// Endpoint is the OTLP collector URL (e.g. "http://localhost:4318"). Empty
+	// falls back to OTEL_EXPORTER_OTLP_ENDPOINT, then the OTLP default.
+	Endpoint string `yaml:"endpoint"`
+	// Protocol selects the OTLP transport: "http" (default) or "grpc".
+	Protocol string `yaml:"protocol"`
 }
 
 // GroupOverride is one groups/{group}.yaml overlay: the same manager+borgmatic
