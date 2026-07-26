@@ -135,7 +135,7 @@ func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	data := liveVolume(t)
 	missingStaging := data + stagingPrefix + "4001" // deliberately never created
 
-	_, err := swapByRenamePair(missingStaging, data)
+	_, err := swapByRenamePair(missingStaging, data, quietLogger())
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "volume is unchanged")
@@ -1567,7 +1567,7 @@ func TestSwapByRenamePairDoesNotDeleteAnUnrelatedSibling(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
 
-	displaced, err := swapByRenamePair(staging, data)
+	displaced, err := swapByRenamePair(staging, data, quietLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the swap still happened")
@@ -1973,7 +1973,7 @@ func TestScratchNamesStayFindableWhenTheTargetContainsAStar(t *testing.T) {
 	staging, err := createStagingLike(data, quietLogger())
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
-	displaced, err := swapByRenamePair(staging, data)
+	displaced, err := swapByRenamePair(staging, data, quietLogger())
 	require.NoError(t, err)
 	assert.Equal(t, []string{displaced}, displacedDirsFor(t, data),
 		"the displaced copy must be findable by the prefix recovery searches for")
@@ -2093,11 +2093,11 @@ func TestStagingIsStillProvablyOursAtTheMomentItIsPromoted(t *testing.T) {
 
 	marked := false
 	realSwap := swapIntoPlaceFn
-	swapIntoPlaceFn = func(staging, target string) (string, error) {
+	swapIntoPlaceFn = func(staging, target string, logger *slog.Logger) (string, error) {
 		var err error
 		marked, _, err = provablyOurs(staging)
 		require.NoError(t, err)
-		return realSwap(staging, target)
+		return realSwap(staging, target, logger)
 	}
 	defer func() { swapIntoPlaceFn = realSwap }()
 
@@ -2125,7 +2125,7 @@ func TestDisplacedDataCarriesProofFromTheInstantItExists(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
 
-	displaced, err := swapByRenamePair(staging, data)
+	displaced, err := swapByRenamePair(staging, data, quietLogger())
 	require.NoError(t, err)
 
 	ours, _, err := provablyOurs(displaced)
@@ -2143,7 +2143,7 @@ func TestDisplacedDataCarriesProofFromTheInstantItExists(t *testing.T) {
 // meaningless and must not stay behind.
 func TestAFailedRenamePairLeavesNoClaimOnTheVolume(t *testing.T) {
 	data := liveVolume(t)
-	_, err := swapByRenamePair(data+stagingPrefix+"9999", data) // staging never created
+	_, err := swapByRenamePair(data+stagingPrefix+"9999", data, quietLogger()) // staging never created
 	require.Error(t, err)
 
 	ours, _, err := provablyOurs(data)
@@ -2224,7 +2224,7 @@ func TestTheDisplacedCopyIsMarkedAtTheInstantOfTheRename(t *testing.T) {
 		t.Skip("this filesystem cannot hold the marker")
 	}
 
-	_, err = swapByRenamePair(staging, data)
+	_, err = swapByRenamePair(staging, data, quietLogger())
 	require.NoError(t, err)
 	assert.True(t, markedAtRename,
 		"the displaced copy was unverifiable in the window between the rename and a later mark")
@@ -2266,4 +2266,90 @@ func TestAnUnstageableParentStillSendsAMirrorRestoreInPlace(t *testing.T) {
 	reason, err := resolveInPlaceReason(false, false, false, false, "", "/var/lib/docker/volumes/v/_data")
 	require.NoError(t, err)
 	assert.Contains(t, reason, "cannot be created")
+}
+
+// The mask is the whole contract of copyInodeFlags, and a constant declared
+// beside it but left out of the expression compiles silently: unused constants
+// are legal in Go. FS_DAX_FL was added to the block and missing from the mask
+// for two rounds because of exactly that.
+func TestEveryDeclaredInodeFlagIsInTheInheritableMask(t *testing.T) {
+	for name, flag := range map[string]int{
+		"FS_NOCOW_FL":    fsNoCoWFlag,
+		"FS_COMPR_FL":    fsCompressFlag,
+		"FS_NOCOMP_FL":   fsNoCompressFlag,
+		"FS_NOATIME_FL":  fsNoAtimeFlag,
+		"FS_NODUMP_FL":   fsNoDumpFlag,
+		"FS_SYNC_FL":     fsSyncFlag,
+		"FS_DIRSYNC_FL":  fsDirSyncFlag,
+		"FS_DAX_FL":      fsDaxFlag,
+		"FS_CASEFOLD_FL": fsCasefoldFlag,
+	} {
+		assert.NotZero(t, inheritableMask&flag, "%s is declared but not carried", name)
+	}
+}
+
+// A staging directory made for a btrfs subvolume target is itself a subvolume,
+// and emptying one is not removing it. Left behind it is not merely litter: the
+// next restore repeats the same removal and stops on it, so the volume becomes
+// unrestorable until someone deletes it by hand.
+func TestRemoveScratchDirFallsBackToSubvolumeDeletion(t *testing.T) {
+	dir := t.TempDir()
+	stubborn := filepath.Join(dir, "staging")
+	require.NoError(t, os.Mkdir(stubborn, 0o755))
+
+	// A filesystem that empties the directory but refuses to remove its root.
+	realRemove, realDelete := removeAllFn, deleteBtrfsSubvolume
+	removeAllFn = func(string) error { return errors.New("rmdir: operation not permitted") }
+	deleted := ""
+	deleteBtrfsSubvolume = func(path string) error { deleted = path; return os.Remove(path) }
+	isSubvolume = func(string) (bool, error) { return true, nil }
+	defer func() {
+		removeAllFn, deleteBtrfsSubvolume = realRemove, realDelete
+		isSubvolume = isBtrfsSubvolumeRoot
+	}()
+
+	require.NoError(t, removeScratchDir(stubborn))
+	assert.Equal(t, stubborn, deleted, "the subvolume path was not handed to btrfs")
+	assert.NoDirExists(t, stubborn)
+}
+
+// And an ordinary directory must not send anyone looking for btrfs.
+func TestRemoveScratchDirDoesNotReachForBtrfsOnAnOrdinaryDirectory(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "staging")
+	require.NoError(t, os.Mkdir(plain, 0o755))
+
+	realDelete := deleteBtrfsSubvolume
+	called := false
+	deleteBtrfsSubvolume = func(string) error { called = true; return nil }
+	defer func() { deleteBtrfsSubvolume = realDelete }()
+
+	require.NoError(t, removeScratchDir(plain))
+	assert.False(t, called, "an ordinary directory removes ordinarily")
+	assert.NoDirExists(t, plain)
+}
+
+// Without a claim on the inode an interruption in the two-rename window leaves
+// a volume recovery cannot put back automatically. That has to be said before
+// the window opens, not discovered afterwards.
+func TestSwapByRenamePairWarnsWhenItCannotClaimTheVolume(t *testing.T) {
+	data := liveVolume(t)
+	staging, err := createStagingLike(data, quietLogger())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
+
+	realSet := setXattr
+	setXattr = func(_, attr string, _ []byte, _ int) error {
+		if attr == scratchMarkerAttr {
+			return unix.EOPNOTSUPP
+		}
+		return realSet("", attr, nil, 0)
+	}
+	defer func() { setXattr = realSet }()
+
+	logs, logger := capturedWarnLogger()
+	_, err = swapByRenamePair(staging, data, logger)
+	require.NoError(t, err, "the restore is still worth doing; the recovery is manual, not impossible")
+	assert.Contains(t, logs.String(), "put back by hand")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data))
 }
