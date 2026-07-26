@@ -353,6 +353,34 @@ func readSELinuxContext(path string) (label string, present bool, err error) {
 // rather than truncating, and SELinux contexts with long MCS category sets do
 // overflow the obvious guesses. Absent, or a filesystem without xattr support,
 // is normal and not an error.
+// isEncryptedDir reports whether path carries an fscrypt encryption policy.
+//
+// A policy is filesystem-internal state applied at creation and inherited from
+// the parent, not an extended attribute that can be copied onto a directory
+// afterwards. A staging sibling created under an unencrypted parent therefore
+// has no policy at all, and borg would write the restored files in plaintext.
+//
+// The mask is checked, not just the attribute. stx_attributes bits are only
+// meaningful where the matching stx_attributes_mask bit says the filesystem
+// reported on them, and treating an unreported bit as false-but-known would let
+// an ordinary volume take the destructive path for no reason. Anything
+// uncertain reports false, which is the conservative answer here: the staged
+// path is the safe one, and only a directory known to be encrypted should be
+// pushed off it.
+func isEncryptedDir(path string) (bool, error) {
+	var st unix.Statx_t
+	if err := unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BASIC_STATS, &st); err != nil {
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) {
+			return false, nil // no statx here, so nothing can be established
+		}
+		return false, fmt.Errorf("inspecting %s: %w", path, err)
+	}
+	if st.Attributes_mask&unix.STATX_ATTR_ENCRYPTED == 0 {
+		return false, nil // the filesystem did not report on encryption
+	}
+	return st.Attributes&unix.STATX_ATTR_ENCRYPTED != 0, nil
+}
+
 // btrfsSubvolumeRootInode is the inode number every btrfs subvolume root has.
 // It is an unremarkable number on any other filesystem, so it only means this
 // once the filesystem is known to be btrfs.
@@ -515,8 +543,12 @@ func readXattr(path, attr string) (value []byte, present bool, err error) {
 		}
 		return nil, false, fmt.Errorf("reading %s on %s: %w", attr, path, err)
 	}
+	// Present with an empty value, not absent. Absence is ENODATA, handled
+	// above. A zero-length user.* attribute is a perfectly ordinary way to mark
+	// a directory with a boolean, and reporting it missing dropped it from the
+	// replacement silently.
 	if size == 0 {
-		return nil, false, nil
+		return nil, true, nil
 	}
 	buf := make([]byte, size)
 	n, err := unix.Lgetxattr(path, attr, buf)
@@ -562,6 +594,10 @@ func syncStagedData(dir string) error {
 	defer func() { _ = f.Close() }()
 	return unix.Syncfs(int(f.Fd()))
 }
+
+// syncDirFn is the seam for the durability barrier, so a test can make a flush
+// fail without needing a filesystem that will.
+var syncDirFn = syncDir
 
 // syncDir flushes a directory entry so renames and creations within it survive
 // a power loss.
@@ -647,11 +683,19 @@ func unescapeMountField(field string) string {
 // warning to be remembered independently is how this went wrong before.
 func retainOrWarn(from, targetData string, logger *slog.Logger) string {
 	moved, err := retainOutOfTheWay(from, targetData)
-	if err != nil {
+	switch {
+	case err != nil && moved == "":
 		logger.Warn("could not move a copy that has to be kept clear of the staging path; "+
 			"a later restore may delete it, so move it yourself if you need it",
 			"path", from, "error", err)
 		return from
+	case err != nil:
+		// Moved, but not durably. The path is right and worth reporting; what is
+		// not guaranteed is that it survives a power loss before anyone acts.
+		logger.Warn("a copy that has to be kept was moved clear of the staging path, but the move "+
+			"could not be flushed to disk; copy it somewhere else if you need it to survive a crash",
+			"path", moved, "error", err)
+		return moved
 	}
 	return moved
 }
@@ -691,6 +735,18 @@ func retainOutOfTheWay(from, targetData string) (string, error) {
 			return "", fmt.Errorf("%w (and the placeholder %s could not be removed: %v)", err, kept, rmErr)
 		}
 		return "", err
+	}
+	// The rename has to outlive a power loss, not merely this process. Without
+	// this the namespace can roll back to the staging name while the error
+	// message still points at the kept one, and the next attempt's opening
+	// RemoveAll deletes the completed extract this whole dance existed to save.
+	//
+	// The path is returned even when the flush fails, because by then the data
+	// really is at the new name; the caller warns rather than sending the
+	// operator to a path with nothing at it.
+	if syncErr := syncDirFn(filepath.Dir(targetData)); syncErr != nil {
+		return kept, fmt.Errorf("keeping %s at %s could not be flushed to disk, so it may not survive a power loss: %w",
+			from, kept, syncErr)
 	}
 	return kept, nil
 }
