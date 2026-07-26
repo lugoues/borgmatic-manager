@@ -22,7 +22,6 @@ import (
 	charmlog "github.com/charmbracelet/log"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/unix"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
@@ -1250,8 +1249,32 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	cmd := exec.Command(borgmaticPath,
 		"--config", configPath, "extract", "--archive", archive,
 		"--path", archivePath, "--strip-components", "2", "--destination", destination)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// No stdin. borg asks for a passphrase with getpass, which opens /dev/tty
+	// directly; the new session below leaves it nothing to open, so it falls
+	// back to stdin, and /dev/null makes that an immediate EOF and a clear
+	// "passphrase required" error. Handing it the real terminal instead would
+	// have it reading the operator's keystrokes out from under their shell.
+	// Passphrases belong in the config or a systemd credential, which is what
+	// the manager is built around.
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, os.Stdout, os.Stderr
+
+	// Its own session, not merely its own process group.
+	//
+	// A separate group still shares the controlling terminal, so borgmatic could
+	// open /dev/tty, and a background group reading the terminal is stopped with
+	// SIGTTIN: a passphrase prompt hung the restore forever. Handing the group
+	// the foreground fixed that and created a worse problem, because Ctrl-Z then
+	// stopped borgmatic's group while this process stayed blocked in Wait. The
+	// shell is waiting on this process rather than on borgmatic, so it never saw
+	// a stop, never took the terminal back, and the session looked hung with no
+	// fg able to reach it.
+	//
+	// A new session has no controlling terminal, so neither can happen: nothing
+	// to open, nothing to be stopped by. Ctrl-Z stops this process, which is what
+	// the shell is watching, and job control behaves normally again. The session
+	// leader is also its process group leader, so the group signalling below is
+	// unchanged.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	// Armed before the child exists. A signal landing between Start and Notify
 	// would otherwise take the default action, killing the manager and leaving
@@ -1269,13 +1292,6 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting borgmatic: %w", err)
 	}
-
-	// Its own process group is a background group as far as the terminal is
-	// concerned, and a background group that reads from the terminal is stopped
-	// with SIGTTIN. borgmatic prompting for a repository passphrase would hang
-	// there forever, so hand it the foreground for the duration.
-	restoreForeground := giveTerminalTo(cmd.Process.Pid)
-	defer restoreForeground()
 
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
@@ -1326,48 +1342,14 @@ func waitOrKill(cmd *exec.Cmd, exited <-chan error, reason string) error {
 	return fmt.Errorf("borgmatic extract did not finish: %s", reason)
 }
 
-// giveTerminalTo makes pgid the terminal's foreground process group and returns
-// a function restoring the previous one. Without a controlling terminal, for
-// instance under systemd or in CI, there is nothing to hand over and both are
-// no-ops.
-func giveTerminalTo(pgid int) func() {
-	fd := int(os.Stdin.Fd())
-	previous, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
-	if err != nil {
-		return func() {} // not a terminal
-	}
-	// Only hand over a foreground this process already holds. Run as a
-	// background job ("restore-volume ... &"), the foreground belongs to the
-	// interactive shell, and taking it would steal the user's terminal and
-	// stop their shell. A background job has no terminal input to offer
-	// borgmatic anyway.
-	if self, err := unix.Getpgid(os.Getpid()); err != nil || self != previous {
-		return func() {}
-	}
-	// Changing the foreground group from a process that is not in it raises
-	// SIGTTOU at the caller, which would stop this process mid-restore.
-	signal.Ignore(syscall.SIGTTOU)
-	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, pgid); err != nil {
-		signal.Reset(syscall.SIGTTOU)
-		return func() {}
-	}
-	// The child starts before this call, so it can read the terminal, take
-	// SIGTTIN, and stop in the gap. Making its group the foreground one does not
-	// undo that: a stopped process stays stopped until something continues it.
-	_ = syscall.Kill(-pgid, syscall.SIGCONT)
-	return func() {
-		_ = unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, previous)
-		signal.Reset(syscall.SIGTTOU)
-	}
-}
-
 // signalExtractGroup signals the child's whole process group: borgmatic's own
 // children, borg among them, would otherwise keep writing.
 func signalExtractGroup(cmd *exec.Cmd, sig syscall.Signal) {
 	if cmd.Process == nil {
 		return
 	}
-	// Setpgid makes pgid equal the child's pid; the negative addresses the group.
+	// Setsid makes the child a session and process group leader, so its pgid
+	// equals its pid; the negative addresses the group.
 	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
 

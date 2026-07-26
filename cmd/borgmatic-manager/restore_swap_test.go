@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -858,4 +859,104 @@ func TestRetainOrWarnReportsAFailureRatherThanHidingIt(t *testing.T) {
 	assert.Equal(t, staging, got, "the caller is pointed at where the copy actually is")
 	assert.Contains(t, logs.String(), "later restore may delete it", "the risk is stated")
 	assert.DirExists(t, staging, "and the copy itself is still there")
+}
+
+// The extract must run with no controlling terminal. That is what stops borg's
+// getpass from opening /dev/tty and hanging on SIGTTIN, and it is what lets
+// Ctrl-Z stop this process (which the shell is watching) rather than a group
+// the shell knows nothing about.
+//
+// Run under a real pty, because a test binary normally has no controlling
+// terminal at all and would pass without proving anything.
+func TestExtractRunsWithNoControllingTerminal(t *testing.T) {
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("no pty available: %v", err)
+	}
+	defer func() { _ = ptmx.Close() }()
+
+	var n uint32
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN,
+		uintptr(unsafe.Pointer(&n))); e != 0 {
+		t.Skipf("cannot get pty number: %v", e)
+	}
+	var unlock int32
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK,
+		uintptr(unsafe.Pointer(&unlock))); e != 0 {
+		t.Skipf("cannot unlock pty: %v", e)
+	}
+	pts, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer func() { _ = pts.Close() }()
+
+	// A session leader with the pty as its controlling terminal: what an
+	// operator's shell gives the manager.
+	// #nosec G204 -- re-execs this test binary
+	child := exec.Command(os.Args[0], "-test.run=TestControllingTerminalHelper")
+	child.Env = append(os.Environ(), "BM_TTY_HELPER=1")
+	child.Stdin, child.Stdout, child.Stderr = pts, pts, pts
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	require.NoError(t, child.Start())
+
+	read := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var seen strings.Builder
+		for {
+			n, readErr := ptmx.Read(buf)
+			if n > 0 {
+				seen.Write(buf[:n])
+				if strings.Contains(seen.String(), "CHILD-DONE") {
+					read <- seen.String()
+					return
+				}
+			}
+			if readErr != nil {
+				read <- seen.String()
+				return
+			}
+		}
+	}()
+
+	_ = child.Wait()
+	var out string
+	select {
+	case out = <-read:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the helper never reported")
+	}
+
+	assert.Contains(t, out, "MANAGER-HAS-TTY=true", "the fixture must give the manager a controlling terminal")
+	assert.Contains(t, out, "EXTRACT-HAS-TTY=false", "the extract must not be able to open /dev/tty")
+}
+
+// TestControllingTerminalHelper is the child half of the test above, not a test.
+func TestControllingTerminalHelper(t *testing.T) {
+	if os.Getenv("BM_TTY_HELPER") != "1" {
+		t.Skip("child half of TestExtractRunsWithNoControllingTerminal")
+	}
+	fmt.Printf("MANAGER-HAS-TTY=%v\r\n", canOpenTTY())
+
+	dir, err := os.MkdirTemp("", "bm-tty-helper-")
+	require.NoError(t, err)
+	fake := filepath.Join(dir, "borgmatic")
+	// Reports whether it can reach a controlling terminal, the way borg's
+	// getpass would.
+	require.NoError(t, os.WriteFile(fake,
+		[]byte("#!/bin/sh\nif (: </dev/tty) 2>/dev/null; then echo EXTRACT-HAS-TTY=true; "+
+			"else echo EXTRACT-HAS-TTY=false; fi\n"), 0o755))
+
+	_ = runBorgmaticExtract(context.Background(), fake, "config.yaml", "archive", "vol/_data",
+		filepath.Join(dir, "dest"))
+	fmt.Print("CHILD-DONE\r\n")
+	os.Exit(0)
+}
+
+func canOpenTTY() bool {
+	f, err := os.OpenFile("/dev/tty", os.O_RDONLY, 0)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
 }
