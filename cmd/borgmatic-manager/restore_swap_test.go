@@ -295,6 +295,7 @@ func TestRecoverInterruptedSwapPutsTheDataBack(t *testing.T) {
 	data := liveVolume(t)
 	displaced := data + oldPrefix + "1001"
 	require.NoError(t, os.Rename(data, displaced)) // interrupted between the renames
+	markAsOurs(displaced)                          // as the fallback swap does
 	require.NoDirExists(t, data)
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
@@ -667,6 +668,7 @@ func TestResolveVolumeDataResolvesThroughADanglingLink(t *testing.T) {
 
 	// The state an interrupted rename-pair swap leaves behind.
 	require.NoError(t, os.Rename(target, target+oldPrefix+"1001"))
+	markAsOurs(target + oldPrefix + "1001") // as the fallback swap does
 	require.NoFileExists(t, target)
 
 	resolved, err = resolveVolumeData(data)
@@ -1509,6 +1511,7 @@ func TestProjectQuotaIDDoesNotInventOneForAnOrdinaryDirectory(t *testing.T) {
 func TestRecoverInterruptedSwapFlushesTheRename(t *testing.T) {
 	data := liveVolume(t)
 	require.NoError(t, os.Rename(data, data+oldPrefix+"1001")) // interrupted between the renames
+	markAsOurs(data + oldPrefix + "1001")                      // as the fallback swap does
 
 	synced := make([]string, 0, 1)
 	realSync := syncDirFn
@@ -1529,6 +1532,7 @@ func TestRecoverInterruptedSwapFlushesTheRename(t *testing.T) {
 func TestRecoverInterruptedSwapReportsAFlushFailure(t *testing.T) {
 	data := liveVolume(t)
 	require.NoError(t, os.Rename(data, data+oldPrefix+"1001"))
+	markAsOurs(data + oldPrefix + "1001") // as the fallback swap does
 
 	realSync := syncDirFn
 	syncDirFn = func(string) error { return errors.New("disk went away") }
@@ -1578,6 +1582,7 @@ func TestRecoverInterruptedSwapFindsAUniquelyNamedDisplacedCopy(t *testing.T) {
 	data := liveVolume(t)
 	displaced := data + oldPrefix + "6001"
 	require.NoError(t, os.Rename(data, displaced))
+	markAsOurs(displaced) // as the fallback swap does
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	require.DirExists(t, data)
@@ -1588,11 +1593,13 @@ func TestRecoverInterruptedSwapFindsAUniquelyNamedDisplacedCopy(t *testing.T) {
 func TestRecoverInterruptedSwapRefusesToGuessBetweenTwo(t *testing.T) {
 	data := liveVolume(t)
 	require.NoError(t, os.Rename(data, data+oldPrefix+"7001"))
+	markAsOurs(data + oldPrefix + "7001") // as the fallback swap does
 	// A second one that also holds data: two real candidates, which is the only
 	// genuinely ambiguous case.
 	second := data + oldPrefix + "7002"
 	require.NoError(t, os.Mkdir(second, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(second, "also-data.txt"), []byte("data"), 0o644))
+	markAsOurs(second) // both are provably this tool's, which is what makes it ambiguous
 
 	err := recoverInterruptedSwap(data, quietLogger())
 	require.Error(t, err, "picking one of two copies of a volume's data is not this program's call")
@@ -1704,6 +1711,7 @@ func TestResolveVolumeDataFollowsAChainOfDanglingLinks(t *testing.T) {
 	// Interrupted mid-swap: the real directory is displaced, both links remain.
 	displaced := real + oldPrefix + "1001"
 	require.NoError(t, os.Rename(real, displaced))
+	markAsOurs(displaced) // as the fallback swap does
 
 	resolved, err = resolveVolumeData(data)
 	require.NoError(t, err, "a dangling end of the chain is the state recovery exists to repair")
@@ -1774,6 +1782,7 @@ func TestRecoverInterruptedSwapReapsAbandonedReservations(t *testing.T) {
 	// The scenario the reaping exists to prevent: a later interruption must
 	// still be recoverable rather than ambiguous.
 	require.NoError(t, os.Rename(data, data+oldPrefix+"8002"))
+	markAsOurs(data + oldPrefix + "8002") // as the fallback swap does
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume came back")
 	assert.Empty(t, displacedDirsFor(t, data))
@@ -1801,6 +1810,7 @@ func TestRecoverInterruptedSwapRestoresAnEmptyVolume(t *testing.T) {
 	data := filepath.Join(root, "volumes", "myvol", "_data")
 	require.NoError(t, os.MkdirAll(data, 0o755))
 	require.NoError(t, os.Rename(data, data+oldPrefix+"1001"))
+	markAsOurs(data + oldPrefix + "1001") // as the fallback swap does
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	require.DirExists(t, data, "an empty volume is still a volume")
@@ -1816,6 +1826,7 @@ func TestRecoverInterruptedSwapIgnoresAReservationAlongsideRealData(t *testing.T
 	require.NoError(t, os.Mkdir(abandoned, 0o755))
 	markAsOurs(abandoned)
 	require.NoError(t, os.Rename(data, data+oldPrefix+"8002"))
+	markAsOurs(data + oldPrefix + "8002") // as the fallback swap does
 
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	assert.Equal(t, []string{"original.txt"}, names(t, data))
@@ -1971,4 +1982,132 @@ func TestScratchNamesStayFindableWhenTheTargetContainsAStar(t *testing.T) {
 	require.NoError(t, os.RemoveAll(data))
 	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume came back")
+}
+
+// A name an application happens to use is not evidence. Recovering from an
+// unverified directory would rename someone else's data into the volume's path
+// and present it as the volume.
+func TestRecoverInterruptedSwapRefusesAnUnmarkedCandidate(t *testing.T) {
+	data := liveVolume(t)
+	impostor := data + oldPrefix + "1234" // right shape, never displaced by us
+	require.NoError(t, os.Mkdir(impostor, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(impostor, "someone-elses.txt"), []byte("keep"), 0o644))
+	require.NoError(t, os.RemoveAll(data)) // the volume is missing for some other reason
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, recoverInterruptedSwap(data, logger))
+
+	assert.NoDirExists(t, data, "unrelated data must not be presented as the volume")
+	assert.FileExists(t, filepath.Join(impostor, "someone-elses.txt"), "and it must be left where it is")
+	assert.Contains(t, logs.String(), "carries no mark")
+}
+
+// The proof has to outlive every step that can still strand staging. Removing
+// it before the swap left a window in which a kill produced a complete,
+// volume-sized tree with no mark, which the next restore would refuse to delete
+// and leave on disk forever.
+func TestStagingStaysProvablyOursUntilItIsPromoted(t *testing.T) {
+	data := liveVolume(t)
+	var stagingPath string
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		stagingPath = dest
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, func() error {
+		// The last thing that runs before the swap: the tree is complete here,
+		// and this is the moment a kill would strand it.
+		ours, err := provablyOurs(stagingPath)
+		require.NoError(t, err)
+		if ours {
+			return nil
+		}
+		marked, markErr := provablyOurs(stagingPath)
+		require.NoError(t, markErr)
+		if !marked {
+			t.Skip("this filesystem cannot hold the marker, so there is nothing to prove")
+		}
+		return nil
+	}))
+	assert.Equal(t, []string{"restored.txt"}, names(t, data))
+}
+
+// The scratch name is the target's own name plus a prefix and a random suffix,
+// so a target with a long but perfectly valid basename can leave no room. That
+// is a reason to restore in place, not a reason to refuse a volume the previous
+// implementation could restore.
+func TestCanCreateSiblingTreatsANameTooLongAsCannotStage(t *testing.T) {
+	root := t.TempDir()
+	// NAME_MAX is 255 on every filesystem this runs on; leave just too little
+	// room for the prefix and MkdirTemp's digits.
+	longName := strings.Repeat("n", 250)
+	data := filepath.Join(root, "volumes", "myvol", longName)
+	require.NoError(t, os.MkdirAll(data, 0o755))
+
+	ok, err := canCreateSibling(data)
+	require.NoError(t, err, "a name with no room for a sibling is an answer, not a failure")
+	assert.False(t, ok, "and it means the restore writes in place")
+}
+
+func TestCanCreateSiblingAcceptsAnOrdinaryName(t *testing.T) {
+	ok, err := canCreateSibling(liveVolume(t))
+	require.NoError(t, err)
+	assert.True(t, ok)
+}
+
+// The decision that determines whether a volume's data is destroyed before its
+// replacement exists. --force must reach it, or the flag keeps its promise only
+// until a container actually starts, which is the case it exists for.
+func TestInPlaceReasonCoversEveryCannotStageCondition(t *testing.T) {
+	const why = "this volume's data directory is encrypted"
+	for name, tc := range map[string]struct {
+		force, mounted, encrypted, unstageable bool
+		wantInPlace                            bool
+		wantContains                           string
+	}{
+		"nothing in the way":       {wantInPlace: false},
+		"forced":                   {force: true, wantInPlace: true, wantContains: "--force was given"},
+		"forced with nothing else": {force: true, wantInPlace: true, wantContains: "in place"},
+		"a mount point":            {mounted: true, wantInPlace: true, wantContains: "its own mount point"},
+		"encrypted":                {encrypted: true, wantInPlace: true, wantContains: why},
+		"nowhere to stage":         {unstageable: true, wantInPlace: true, wantContains: "cannot be created"},
+		"forced and also a mount":  {force: true, mounted: true, wantInPlace: true, wantContains: "--force was given"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := inPlaceReason(tc.force, tc.mounted, tc.encrypted, tc.unstageable, why)
+			if !tc.wantInPlace {
+				assert.Empty(t, got, "a volume with nothing in the way must be staged")
+				return
+			}
+			require.NotEmpty(t, got, "this condition must send the restore in place")
+			assert.Contains(t, got, tc.wantContains)
+		})
+	}
+}
+
+// The proof of ownership has to outlive every step that can still leave a
+// complete staging tree on disk. Removing it earlier left a window in which a
+// kill produced a volume-sized tree with no mark, which the next restore would
+// refuse to delete and leave forever.
+func TestStagingIsStillProvablyOursAtTheMomentItIsPromoted(t *testing.T) {
+	data := liveVolume(t)
+
+	marked := false
+	realSwap := swapIntoPlaceFn
+	swapIntoPlaceFn = func(staging, target string) (string, error) {
+		var err error
+		marked, err = provablyOurs(staging)
+		require.NoError(t, err)
+		return realSwap(staging, target)
+	}
+	defer func() { swapIntoPlaceFn = realSwap }()
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		if ours, err := provablyOurs(dest); err == nil && !ours {
+			t.Skip("this filesystem cannot hold the marker, so there is nothing to prove")
+		}
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	assert.True(t, marked, "staging lost its ownership mark before the swap committed")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data))
 }

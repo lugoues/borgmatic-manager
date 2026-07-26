@@ -121,16 +121,6 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		return fmt.Errorf("flushing the restored data to disk (the volume is untouched): %w", syncErr)
 	}
 
-	// Off before it becomes the volume: the mark says "scratch", and this
-	// directory is about to stop being scratch. Before the read-only step, not
-	// after: that step is the last thing that can write to this directory at
-	// all, and clearing an extended attribute on a read-only subvolume fails
-	// with EROFS.
-	if unmarkErr := removeXattr(staging, scratchMarkerAttr); unmarkErr != nil {
-		return fmt.Errorf("clearing the scratch mark on %s before promoting it (the volume is untouched): %w",
-			staging, unmarkErr)
-	}
-
 	// After the extract, before the swap: borg has to be able to write into
 	// staging, so this is the last moment it can be made read-only and the
 	// first at which doing so is harmless.
@@ -151,11 +141,26 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		}
 	}
 
-	displaced, swapErr := swapIntoPlace(staging, targetData)
+	displaced, swapErr := swapIntoPlaceFn(staging, targetData)
 	if swapErr != nil {
 		return swapErr
 	}
 	committed = true
+	// The mark comes off only now. Removing it before the swap left a window in
+	// which a kill produced a complete, volume-sized staging tree with no proof
+	// of ownership on it, which the next restore would then refuse to delete and
+	// leave on disk indefinitely. Staging stays provably ours right up to the
+	// moment it stops being staging.
+	//
+	// Best effort on the way out: this is the live volume now, its name no
+	// longer matches the scratch pattern, so nothing looks at the mark again. A
+	// read-only subvolume cannot have it removed at all, and failing a completed
+	// restore over a stray attribute would be absurd.
+	if unmarkErr := removeXattr(targetData, scratchMarkerAttr); unmarkErr != nil {
+		logger.Warn("the restored volume kept an internal scratch mark, which is harmless but untidy; "+
+			"remove it with: setfattr -x "+scratchMarkerAttr,
+			"path", targetData, "error", unmarkErr)
+	}
 	// Persist the swap itself before removing the copy it replaced, or a power
 	// loss could replay the deletion without the rename and lose both.
 	if syncErr := syncDir(filepath.Dir(targetData)); syncErr != nil {
@@ -183,6 +188,10 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	logger.Info("restore complete", "path", targetData, "entries", len(entries))
 	return nil
 }
+
+// swapIntoPlaceFn is the seam for the one irreversible step, so a test can
+// inspect what is about to be promoted at the moment it is promoted.
+var swapIntoPlaceFn = swapIntoPlace
 
 // swapIntoPlace makes staging the live data directory and returns the path the
 // displaced original ended up at, for the caller to dispose of.
@@ -221,6 +230,10 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 		return "", fmt.Errorf("reserving a name to move the current data aside (the volume is untouched): %w", err)
 	}
 	markAsOurs(displaced)
+	// The mark on the placeholder does not survive this: the rename replaces
+	// that inode with the volume's own directory. It is applied again below,
+	// once the thing at this path is the displaced data, so recovery can tell
+	// this directory apart from an unrelated one that merely matches the name.
 	if renErr := unix.Renameat(unix.AT_FDCWD, targetData, unix.AT_FDCWD, displaced); renErr != nil {
 		if rmErr := os.Remove(displaced); rmErr != nil {
 			return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w",
@@ -228,6 +241,7 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 		}
 		return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w", renErr)
 	}
+	markAsOurs(displaced)
 	if renErr := os.Rename(staging, targetData); renErr != nil {
 		// Put it back: a volume with no data directory is worse than a failed
 		// restore, and this is the only moment that state can exist.
@@ -357,30 +371,49 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 	// The target is gone, so one of these is the volume. A non-empty one is
 	// certainly it; an empty one alongside can only be an earlier abandoned
 	// reservation, since a swap displaces exactly one directory.
-	var withData []string
+	// Ownership first, and nothing that fails it is a candidate at all. A name
+	// is not evidence: the volume being missing for some unrelated reason,
+	// beside a directory that merely matches the public shape, would otherwise
+	// have this rename someone else's data into the volume's path and present it
+	// as the volume.
+	var ours, oursWithData []string
 	for _, m := range matches {
+		mine, ownErr := provablyOurs(m)
+		if ownErr != nil {
+			return ownErr
+		}
+		if !mine {
+			logger.Warn("a directory beside this volume matches the name an interrupted restore leaves behind "+
+				"but carries no mark showing this tool displaced it, so it is not being treated as the volume's data",
+				"path", m, "volume", targetData)
+			continue
+		}
+		ours = append(ours, m)
 		empty, emptyErr := isEmptyDir(m)
 		if emptyErr != nil {
 			return emptyErr
 		}
 		if !empty {
-			withData = append(withData, m)
+			oursWithData = append(oursWithData, m)
 		}
 	}
-	if len(withData) > 1 {
+	if len(ours) == 0 {
+		return nil // nothing here is this tool's to put back
+	}
+	if len(oursWithData) > 1 {
 		// Never expected: the window is two syscalls wide and one restore of a
 		// volume runs at a time. Choosing between two copies of a volume's data
 		// is not this program's to do.
 		return fmt.Errorf("%s is missing and more than one displaced copy beside it holds data (%s); "+
 			"a restore was interrupted more than once, so move the one you want to %s by hand",
-			targetData, strings.Join(withData, ", "), targetData)
+			targetData, strings.Join(oursWithData, ", "), targetData)
 	}
 
-	// With no non-empty candidate every match is empty, and the volume was
+	// With no non-empty candidate every one of ours is empty, and the volume was
 	// empty too: any of them restores the same directory.
-	displaced := matches[0]
-	if len(withData) == 1 {
-		displaced = withData[0]
+	displaced := ours[0]
+	if len(oursWithData) == 1 {
+		displaced = oursWithData[0]
 	}
 
 	if err := os.Rename(displaced, targetData); err != nil {
@@ -395,6 +428,12 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 		return fmt.Errorf("a previous restore was interrupted mid-swap and %s was moved back to %s, "+
 			"but that could not be flushed to disk, so it may not survive a power loss: %w",
 			displaced, targetData, syncErr)
+	}
+	// It is the volume again, so the scratch mark no longer applies. Harmless if
+	// it cannot be removed: nothing consults it at this path.
+	if unmarkErr := removeXattr(targetData, scratchMarkerAttr); unmarkErr != nil {
+		logger.Warn("the recovered volume kept an internal scratch mark, which is harmless but untidy",
+			"path", targetData, "error", unmarkErr)
 	}
 	logger.Warn("a previous restore was interrupted mid-swap; the volume's data has been put back",
 		"path", targetData, "recovered_from", displaced)
@@ -649,7 +688,12 @@ var projectQuotaID = func(path string) (uint64, bool) {
 func canCreateSibling(targetData string) (bool, error) {
 	probe, err := os.MkdirTemp(filepath.Dir(targetData), scratchPattern(targetData, stagingPrefix))
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS) {
+		// ENAMETOOLONG belongs here rather than with the genuine failures: the
+		// scratch name is the target's own name plus a prefix and a random
+		// suffix, so a target with a long but perfectly valid basename can have
+		// no room left for one. That is a reason to restore in place, not a
+		// reason to refuse a volume the previous implementation could restore.
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS) || errors.Is(err, unix.ENAMETOOLONG) {
 			return false, nil
 		}
 		return false, fmt.Errorf("checking whether a staging directory can be created beside %s: %w", targetData, err)
@@ -1157,7 +1201,10 @@ func copyRemainingXattrs(from, to string, logger *slog.Logger) error {
 // steps' own lists rather than repeating them, so an attribute added to one
 // cannot silently start being written twice.
 var explicitlyHandledXattrs = func() map[string]bool {
-	handled := map[string]bool{seLinuxAttr: true}
+	// The scratch mark is this tool's own bookkeeping, never the volume's, so a
+	// stale one left on a promoted volume must not be copied onward as if it
+	// described the data.
+	handled := map[string]bool{seLinuxAttr: true, scratchMarkerAttr: true}
 	for _, attr := range aclAttrs {
 		handled[attr] = true
 	}

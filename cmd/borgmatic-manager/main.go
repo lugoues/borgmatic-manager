@@ -996,6 +996,37 @@ func checkVolumeDataDir(targetData, volume string) error {
 	return nil
 }
 
+// inPlaceReason says why a restore cannot stage and swap, or returns empty when
+// it can. It is one function rather than a chain of conditions at the call site
+// because the answer decides whether the volume's data is destroyed before its
+// replacement exists, and that deserves to be readable and testable on its own.
+//
+// --force comes first and unconditionally. The flag means "extract into a live
+// volume", so it has to mean that for the whole restore: staging and then
+// aborting at the last-moment recheck would keep the promise only until a
+// container actually started, which is the case the flag exists for, and would
+// throw away a completed extract to do it.
+func inPlaceReason(force, mounted, encrypted, unstageable bool, encryptionReason string) string {
+	switch {
+	case force:
+		return "--force was given, so the restore writes in place rather than staging: the data is replaced " +
+			"as borgmatic extracts, a failure can leave it partially restored, and a container using this " +
+			"volume will see it change underneath"
+	case unstageable:
+		return "a staging directory cannot be created beside this volume's data directory, so the restore " +
+			"writes in place instead: the data is replaced as borgmatic extracts, and a failure can leave it " +
+			"partially restored. Grant write access to the parent directory to get the safer staged restore"
+	case mounted:
+		return "this volume's data directory is its own mount point, so it cannot be swapped into place and " +
+			"the restore writes in place instead: the data is replaced as borgmatic extracts, and a failure " +
+			"can leave it partially restored. Take your own copy first if that matters"
+	case encrypted:
+		return encryptionReason + ", so the restore writes in place instead: the data is replaced as " +
+			"borgmatic extracts, and a failure can leave it partially restored"
+	}
+	return ""
+}
+
 // lockVolumeRestore takes an exclusive lock covering one volume's data
 // directory for the whole restore.
 //
@@ -1280,33 +1311,19 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		logger.Info("restore complete", "path", plan.targetData)
 		return nil
 
-	case (force && running) || mounted || encrypted || !stageable:
-		switch {
-		case !stageable:
-			logger.Warn("a staging directory cannot be created beside this volume's data directory, so the restore "+
-				"writes in place instead: the data is replaced as borgmatic extracts, and a failure can leave it "+
-				"partially restored. Grant write access to the parent directory to get the safer staged restore",
-				"path", plan.targetData, "parent", filepath.Dir(plan.targetData))
-		case mounted:
-			logger.Warn("this volume's data directory is its own mount point, so it cannot be swapped into place "+
-				"and the restore writes in place instead: the data is replaced as borgmatic extracts, "+
-				"and a failure can leave it partially restored. Take your own copy first if that matters",
-				"path", plan.targetData)
-		case encrypted:
-			logger.Warn(encryptionReason+", so the restore writes in place instead: the data is replaced as "+
-				"borgmatic extracts, and a failure can leave it partially restored",
-				"path", plan.targetData)
-		default:
-			logger.Warn("a running container has this volume mounted, so the restore writes in place: "+
-				"the data is replaced as borgmatic extracts, and a failure can leave it partially restored",
-				"path", plan.targetData)
-		}
+	// --force means "do it anyway", so it has to mean that for the whole
+	// restore. Staged and then aborting at the recheck would keep the promise
+	// only until a container actually started, which is the case the flag
+	// exists for, and would throw away a completed extract to do it.
+	case inPlaceReason(force, mounted, encrypted, !stageable, encryptionReason) != "":
+		logger.Warn(inPlaceReason(force, mounted, encrypted, !stageable, encryptionReason),
+			"path", plan.targetData, "parent", filepath.Dir(plan.targetData))
 		// The in-place path empties before extracting, so it destroys on the
 		// same race the staged path aborts on. --force is an explicit "do it
 		// anyway" and keeps its meaning; a volume pushed onto this path by its
 		// own nature rather than by the operator has given no such consent, so
 		// ask again after the probe.
-		if (mounted || encrypted || !stageable) && !force {
+		if !force {
 			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
 			if checkErr != nil {
 				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
