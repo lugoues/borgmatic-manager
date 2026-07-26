@@ -45,15 +45,30 @@ fi
 # again, so the package would come back enabled and inactive: the same silently
 # stopped backups that preserving the enablement exists to prevent.
 #
-# The stamp is what makes this safe. It exists only when preremove stopped a
-# service that was actually running, so this restores that exact state and
-# nothing else: a genuinely fresh install has no stamp, and neither does a
-# service the operator had deliberately stopped before removing the package.
+# Two independent conditions have to agree, and the service is started only in
+# their intersection:
+#
+#   the stamp   preremove stopped a service that was really running, so a fresh
+#               install has none, and neither does one the operator had already
+#               stopped on purpose before removing the package.
+#   is-enabled  the operator's standing intent is "run this at boot". A running
+#               but disabled service was a transient state, and a remove and
+#               reinstall is closer to a reboot than to a no-op, so that state
+#               is not something to recreate.
 STOPPED_STAMP=/var/lib/borgmatic-manager/.stopped-by-package
-if [ -e "$STOPPED_STAMP" ] \
-   && command -v systemctl >/dev/null 2>&1 \
-   && ! systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
+stamped=""
+if [ -e "$STOPPED_STAMP" ]; then
+    stamped=1
+    # Consume it whether or not it leads to a start: it describes the removal
+    # this install just undid, so leaving it behind would let a later reinstall
+    # act on a stale record.
     rm -f "$STOPPED_STAMP"
+fi
+
+if [ -n "$stamped" ] \
+   && command -v systemctl >/dev/null 2>&1 \
+   && systemctl is-enabled --quiet borgmatic-manager.service 2>/dev/null \
+   && ! systemctl is-active --quiet borgmatic-manager 2>/dev/null; then
     # deb-systemd-invoke honors policy-rc.d, so chroot and container builds
     # still get to refuse.
     if command -v deb-systemd-invoke >/dev/null 2>&1; then
