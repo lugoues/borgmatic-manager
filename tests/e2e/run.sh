@@ -243,4 +243,65 @@ kill -0 "$MANAGER_PID" 2>/dev/null && fail "manager did not exit after SIGTERM"
 MANAGER_PID=""
 grep -q '"msg":"borgmatic-manager stopped"' "$LOG_FILE" || fail "missing clean shutdown log line"
 
+# --- phase 5: ad-hoc runs and the volume restore roundtrip ------------------
+#
+# Deliberately after the daemon has exited: ad-hoc runs and the scheduler share
+# repository locks and schedule state, so running these with the daemon up would
+# test lock contention rather than the commands. Everything here is synchronous,
+# so nothing polls.
+
+# newest_archive GROUP: the most recent archive for a group. borg lists oldest
+# first, so the tail is newest.
+newest_archive() {
+  borg list --short "$REPO" 2>/dev/null | grep -- "-$1-" | tail -1
+}
+# archive_has ARCHIVE PATTERN
+archive_has() {
+  borg list --format '{path}{NL}' "$REPO::$1" 2>/dev/null | grep -q "$2"
+}
+
+log "run <group> backs up a named group on demand"
+docker exec e2e-app-a sh -c 'echo adhoc-marker > /data/adhoc.txt'
+manager run files
+ADHOC_ARCHIVE=$(newest_archive files)
+[ -n "$ADHOC_ARCHIVE" ] || fail "run <group> produced no archive"
+archive_has "$ADHOC_ARCHIVE" "adhoc.txt" || fail "ad-hoc archive is missing the file written just before it"
+
+# Removed, not merely stopped: discovery lists containers with All=true, so a
+# stopped container is still found and would prove nothing here. A removed one
+# (what podman quadlets do on stop) exists only in the durable group cache, so
+# its volume survives in the backup set only if run --all merges that cache.
+log "run --all keeps backing up a removed container's volume"
+compose --profile late rm -sf app-b
+docker inspect e2e-app-b >/dev/null 2>&1 && fail "app-b must be gone for this to test the cache merge"
+docker volume inspect e2e-data-b >/dev/null || fail "app-b's volume must outlive its container"
+docker exec e2e-app-a sh -c 'echo second-adhoc > /data/adhoc.txt'
+manager run --all
+ALL_ARCHIVE=$(newest_archive files)
+[ "$ALL_ARCHIVE" != "$ADHOC_ARCHIVE" ] || fail "run --all did not produce a new archive"
+archive_has "$ALL_ARCHIVE" "file-b.txt" \
+  || fail "run --all dropped the stopped container's volume; the group cache was not merged"
+archive_has "$ALL_ARCHIVE" "file-a.txt" || fail "run --all is missing the running container's volume"
+
+# restore-volume mirrors by default: it empties the target first, so the stray
+# file must be gone and the archived file must be back.
+log "restore-volume mirrors a volume back from the archive"
+compose stop app-a
+docker run --rm -v e2e-data-a:/data alpine sh -c 'rm -f /data/file-a.txt && echo stray > /data/stray.txt'
+manager restore-volume files e2e-data-a --archive "$ALL_ARCHIVE"
+RESTORED=$(docker run --rm -v e2e-data-a:/data alpine cat /data/file-a.txt)
+[ "$RESTORED" = "e2e-data-a" ] || fail "restore-volume did not bring the file back: got '$RESTORED'"
+docker run --rm -v e2e-data-a:/data alpine test -e /data/stray.txt \
+  && fail "a mirror restore must empty the target first, but the stray file survived"
+
+# The destructive mode must prove the archive can refill the volume before it
+# empties anything: an unknown archive has to fail with the data untouched.
+log "restore-volume refuses a bad archive without emptying the target"
+if manager restore-volume files e2e-data-a --archive definitely-not-an-archive >/dev/null 2>&1; then
+  fail "restore-volume accepted an archive that does not exist"
+fi
+SURVIVED=$(docker run --rm -v e2e-data-a:/data alpine cat /data/file-a.txt 2>/dev/null || echo MISSING)
+[ "$SURVIVED" = "e2e-data-a" ] \
+  || fail "a refused restore emptied the volume anyway: got '$SURVIVED'"
+
 echo "PASS: end-to-end backup flow succeeded"
