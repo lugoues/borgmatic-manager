@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -67,6 +68,31 @@ type MetricsSettings struct {
 	Endpoint string `yaml:"endpoint"`
 	// Protocol selects the OTLP transport: "http" (default) or "grpc".
 	Protocol string `yaml:"protocol"`
+}
+
+// Validate rejects a misconfigured metrics block at load time, so a typo fails
+// fast with a clear message instead of silently disabling metrics when the
+// daemon starts. It only checks when metrics are enabled; runtime conditions
+// (an unreachable collector) stay best-effort and never block startup.
+func (m MetricsSettings) Validate() error {
+	if !m.Enabled {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(m.Protocol)) {
+	case "", "http", "http/protobuf", "grpc":
+	default:
+		return fmt.Errorf("metrics.protocol %q is invalid (want \"http\" or \"grpc\"); the OTLP URL belongs in metrics.endpoint", m.Protocol)
+	}
+	if m.Endpoint != "" {
+		u, err := url.Parse(m.Endpoint)
+		switch {
+		case err != nil || u.Host == "":
+			return fmt.Errorf("metrics.endpoint %q is not a valid URL (want e.g. \"https://collector.example/v1/metrics\")", m.Endpoint)
+		case u.Scheme != "http" && u.Scheme != "https":
+			return fmt.Errorf("metrics.endpoint %q must use http or https", m.Endpoint)
+		}
+	}
+	return nil
 }
 
 // GroupOverride is one groups/{group}.yaml overlay: the same manager+borgmatic
@@ -146,6 +172,9 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 	var cfg ManagerConfig
 	if parseErr := yaml.Unmarshal(resolved, &cfg); parseErr != nil {
 		return nil, nil, fmt.Errorf("parsing manager config: %w", parseErr)
+	}
+	if validateErr := cfg.Manager.Metrics.Validate(); validateErr != nil {
+		return nil, nil, fmt.Errorf("invalid manager config: %w", validateErr)
 	}
 
 	overrides := make(map[string]GroupOverride)
