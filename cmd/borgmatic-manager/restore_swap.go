@@ -19,11 +19,18 @@ import (
 	"github.com/lugoues/borgmatic-manager/internal/config"
 )
 
-// stagingSuffix names the sibling directory a mirror restore extracts into
-// before it replaces the live one. Sibling, not a subdirectory of the target:
-// it has to be on the same filesystem for the swap to be a rename, and inside
-// the target it would be part of what the restore is meant to replace.
-const stagingSuffix = ".borgmatic-manager-restoring"
+// stagingPrefix begins the name of the sibling directory a mirror restore
+// extracts into. Sibling, not a subdirectory of the target: it has to be on the
+// same filesystem for the swap to be a rename, and inside the target it would
+// be part of what the restore is meant to replace.
+//
+// A prefix rather than a fixed suffix, completed with random characters by
+// MkdirTemp. Clearing leftovers is the first thing a restore does, and against
+// a fixed name that is an unconditional recursive delete of whatever happens to
+// hold it. Nothing marks such a directory as this tool's, and for a
+// symlink-backed volume it can sit in a directory some application owns. A name
+// nobody else can have produced makes the question moot.
+const stagingPrefix = ".borgmatic-manager-restoring-"
 
 // oldSuffix names the displaced original on the fallback swap path. It only
 // exists between two renames, and only where RENAME_EXCHANGE is unavailable.
@@ -53,14 +60,16 @@ var errStranded = errors.New("restore stranded mid-swap")
 // a long time, and a container started meanwhile would have mounted the very
 // inode the swap is about to move out from under it.
 func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, extract func(destination string) error, stillSafe func() error) (err error) {
-	staging := targetData + stagingSuffix
-
-	// A previous run killed between extract and swap leaves this behind. It is
-	// never live data (the swap renames rather than copies), so it is safe to
-	// discard, and reusing it would mix two restores together.
-	if rmErr := os.RemoveAll(staging); rmErr != nil {
-		return fmt.Errorf("clearing a leftover staging directory %s: %w", staging, rmErr)
+	// A previous run killed between extract and swap leaves these behind. They
+	// are never live data (the swap renames rather than copies), so they are
+	// safe to discard, and reusing one would mix two restores together. Only
+	// this tool can have created a path with this prefix, and the per-volume
+	// restore lock means no other run holds one right now.
+	if rmErr := clearStagingLeftovers(targetData, logger); rmErr != nil {
+		return rmErr
 	}
+
+	staging := ""
 
 	// Registered before the directory exists, so a createStagingLike that fails
 	// partway through its owner/mode/label work does not leave a half-built
@@ -71,7 +80,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// aborted recheck, where staging holds the only copy of the restored data.
 	committed, keepStaging := false, false
 	defer func() {
-		if committed || keepStaging || errors.Is(err, errStranded) {
+		if committed || keepStaging || staging == "" || errors.Is(err, errStranded) {
 			return
 		}
 		if rmErr := os.RemoveAll(staging); rmErr != nil {
@@ -80,9 +89,11 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		}
 	}()
 
-	if createErr := createStagingLike(staging, targetData, logger); createErr != nil {
+	staging, createErr := createStagingLike(targetData, logger)
+	if createErr != nil {
 		return createErr
 	}
+	logger.Info("staging the restore", "path", staging)
 
 	if extractErr := extract(staging); extractErr != nil {
 		return fmt.Errorf("extracting into %s (the volume is untouched): %w", staging, extractErr)
@@ -259,40 +270,77 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 // SELinux context. A fresh directory would otherwise get the creating process's
 // defaults, and on an SELinux host a volume relabelled that way stops being
 // readable by the container that owns it.
-func createStagingLike(staging, model string, logger *slog.Logger) error {
+func createStagingLike(model string, logger *slog.Logger) (staging string, err error) {
 	info, err := os.Stat(model)
 	if err != nil {
-		return fmt.Errorf("inspecting %s: %w", model, err)
+		return "", fmt.Errorf("inspecting %s: %w", model, err)
 	}
 	// Read the label before creating anything: an unreadable one is a reason to
 	// stop, not something to discover after the directory exists.
 	label, labelled, err := readSELinuxContext(model)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	if err := createStagingDir(staging, model, logger); err != nil {
-		return fmt.Errorf("creating the staging directory %s: %w", staging, err)
+	staging, err = createStagingDir(model, logger)
+	if err != nil {
+		return "", fmt.Errorf("creating a staging directory beside %s: %w", model, err)
 	}
+	// From here the directory exists, so every failure has to take it with it.
+	// The caller cannot: it only learns the name from a successful return, and a
+	// half-built directory left on disk is one the next restore has to reason
+	// about.
+	//
+	// Held in its own variable because the failure paths below return an empty
+	// name, which would leave this cleanup with nothing to remove.
+	created := staging
+	defer func() {
+		if err != nil {
+			if rmErr := os.RemoveAll(created); rmErr != nil {
+				logger.Warn("could not remove a staging directory that could not be set up; "+
+					"the volume itself is untouched", "path", created, "error", rmErr)
+			}
+		}
+	}()
 	if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
 		if err := os.Chown(staging, int(st.Uid), int(st.Gid)); err != nil {
-			return fmt.Errorf("setting the owner on %s: %w", staging, err)
+			return "", fmt.Errorf("setting the owner on %s: %w", staging, err)
 		}
 	}
 	// After Chown, which clears setuid and setgid.
 	mode := info.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
 	if err := os.Chmod(staging, mode); err != nil {
-		return fmt.Errorf("setting the mode on %s: %w", staging, err)
+		return "", fmt.Errorf("setting the mode on %s: %w", staging, err)
 	}
 	if labelled {
 		if err := applySELinuxContext(staging, label); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if err := copyAccessControlLists(model, staging); err != nil {
-		return err
+		return "", err
 	}
-	return copyRemainingXattrs(model, staging, logger)
+	if err := copyRemainingXattrs(model, staging, logger); err != nil {
+		return "", err
+	}
+	return staging, nil
+}
+
+// clearStagingLeftovers removes staging directories a previous run died before
+// finishing. Every one of them was created by MkdirTemp under this tool's
+// prefix, so nothing else can own one.
+func clearStagingLeftovers(targetData string, logger *slog.Logger) error {
+	matches, err := filepath.Glob(targetData + stagingPrefix + "*")
+	if err != nil {
+		return fmt.Errorf("looking for leftover staging directories beside %s: %w", targetData, err)
+	}
+	for _, stale := range matches {
+		if rmErr := os.RemoveAll(stale); rmErr != nil {
+			return fmt.Errorf("clearing a leftover staging directory %s: %w", stale, rmErr)
+		}
+		logger.Warn("removed a staging directory left by a restore that did not finish", "path", stale)
+	}
+	return nil
 }
 
 // aclAttrs are the extended attributes POSIX ACLs live in. Dropping them on the
@@ -396,15 +444,25 @@ const btrfsSubvolumeRootInode = 256
 // send/receive, and quota groups silently stop applying to that volume. Created
 // as a subvolume, the exchange preserves it.
 //
-// Created restrictively and widened afterwards: it briefly exists at its final
-// path, and umask would mask an intended mode passed to Mkdir anyway.
-func createStagingDir(staging, model string, logger *slog.Logger) error {
+// Created restrictively and widened afterwards: MkdirTemp makes it 0700, and
+// umask would mask an intended mode passed to Mkdir anyway.
+func createStagingDir(model string, logger *slog.Logger) (string, error) {
+	staging, err := os.MkdirTemp(filepath.Dir(model), filepath.Base(model)+stagingPrefix)
+	if err != nil {
+		return "", err
+	}
 	subvolume, err := isBtrfsSubvolumeRoot(model)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !subvolume {
-		return os.Mkdir(staging, 0o700)
+		return staging, nil
+	}
+	// Replace the placeholder with a subvolume of the same name. Safe rather
+	// than racy: MkdirTemp has just proved the name free, and the per-volume
+	// restore lock means nothing else is restoring this volume.
+	if rmErr := os.Remove(staging); rmErr != nil {
+		return "", rmErr
 	}
 	if subErr := createBtrfsSubvolume(staging); subErr != nil {
 		// Losing the subvolume is worth saying out loud, but it is not worth
@@ -414,10 +472,45 @@ func createStagingDir(staging, model string, logger *slog.Logger) error {
 			"replace it, so the restored directory will be an ordinary one; snapshots, send/receive, or quotas "+
 			"set up against this subvolume will stop applying to it",
 			"path", staging, "error", subErr)
-		return os.Mkdir(staging, 0o700)
+		if mkErr := os.Mkdir(staging, 0o700); mkErr != nil {
+			return "", mkErr
+		}
+		return staging, nil
+	}
+	// A new subvolume has a new subvolume id, so it is a new qgroup. Limits and
+	// parent assignments are keyed on that id and stay with the old one, which
+	// this restore is about to delete: the volume silently leaves whatever quota
+	// it was under. Reproducing the whole qgroup arrangement is more than this
+	// can honestly promise, so say what changed and let the operator reapply it.
+	if btrfsQuotaEnabled(model) {
+		logger.Warn("btrfs quotas are enabled and this volume is a subvolume, so the restore gives it a new "+
+			"subvolume id and therefore a new qgroup; any qgroup limit or parent assignment on the old one does "+
+			"not follow it and has to be reapplied (btrfs qgroup show -re <mountpoint>)",
+			"path", model)
 	}
 	// #nosec G302 -- a directory, and briefly: it takes the model's mode next
-	return os.Chmod(staging, 0o700)
+	if err := os.Chmod(staging, 0o700); err != nil {
+		return "", err
+	}
+	return staging, nil
+}
+
+// btrfsQuotaEnabled reports whether qgroup accounting may apply to the
+// filesystem holding path.
+//
+// Only a listing that says quotas are off counts as a no. Exit status alone
+// does not: listing qgroups needs privilege, so an unprivileged restore gets
+// "Operation not permitted" and a plain success check would read that as
+// "quotas are disabled" and stay silent exactly where it cannot tell. A warning
+// nobody needed is a much smaller harm than a volume that has quietly left its
+// quota, so anything undetermined counts as a yes.
+var btrfsQuotaEnabled = func(path string) bool {
+	// #nosec G204 -- fixed argv over a path this process derived
+	out, err := exec.Command("btrfs", "qgroup", "show", "-f", path).CombinedOutput()
+	if err == nil {
+		return true
+	}
+	return !strings.Contains(string(out), "quotas not enabled")
 }
 
 // isBtrfsSubvolumeRoot reports whether path is the root of its own btrfs
@@ -750,7 +843,3 @@ func retainOutOfTheWay(from, targetData string) (string, error) {
 	}
 	return kept, nil
 }
-
-// stagingPathFor is the staging sibling for a target, exposed so callers can
-// name it in messages without repeating the suffix.
-func stagingPathFor(targetData string) string { return targetData + stagingSuffix }

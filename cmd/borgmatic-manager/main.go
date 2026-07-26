@@ -976,6 +976,25 @@ refuses unless the container is stopped or --force.`,
 
 // volumeRestorePlan is the resolved borg geometry for a restore: what to pull
 // from the archive and where to land it.
+// checkVolumeDataDir rejects a target that cannot be restored into.
+//
+// Existing is not the same as usable. Both swap paths replace whatever node is
+// at this name with a directory, so a _data that resolves to a regular file
+// would be deleted by a restore that then reported success. Discovery does not
+// catch it either: its readability probe only opens the path, which a file
+// satisfies.
+func checkVolumeDataDir(targetData, volume string) error {
+	info, err := os.Stat(targetData)
+	if err != nil {
+		return fmt.Errorf("target volume data directory %s is not present; create the volume first (docker/podman volume create %s): %w", targetData, volume, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("target volume data path %s is not a directory (nothing was changed); "+
+			"a volume's _data must be a directory, so check what %s actually points at", targetData, volume)
+	}
+	return nil
+}
+
 // lockVolumeRestore takes an exclusive lock covering one volume's data
 // directory for the whole restore.
 //
@@ -1111,8 +1130,8 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if recErr := recoverInterruptedSwap(plan.targetData, logger); recErr != nil {
 		return recErr
 	}
-	if _, statErr := os.Stat(plan.targetData); statErr != nil {
-		return fmt.Errorf("target volume data directory %s is not present; create the volume first (docker/podman volume create %s): %w", plan.targetData, plan.targetVolume, statErr)
+	if dirErr := checkVolumeDataDir(plan.targetData, plan.targetVolume); dirErr != nil {
+		return dirErr
 	}
 
 	// Extracting into a volume a running container writes races those writes.
@@ -1286,8 +1305,11 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return nil
 
 	default:
-		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (mirror, staged at %s)\n",
-			group, volume, archive, plan.targetData, stagingPathFor(plan.targetData))
+		// The staging path is not named here: it is chosen when the directory is
+		// created, so that nothing can already hold it, and restoreWithSwap logs
+		// the one it actually got.
+		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (mirror, staged alongside it)\n",
+			group, volume, archive, plan.targetData)
 		// The extract can run for a long time. A container started in the
 		// meantime has mounted the very inode the swap is about to move, so ask
 		// again at the last moment rather than trusting the earlier answer.

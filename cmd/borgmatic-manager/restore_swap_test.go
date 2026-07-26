@@ -58,7 +58,7 @@ func TestRestoreWithSwapReplacesTheLiveData(t *testing.T) {
 	assert.Equal(t, "restored", string(body))
 
 	// Neither scratch directory outlives the operation.
-	assert.NoDirExists(t, data+stagingSuffix)
+	assert.Empty(t, stagingDirsFor(t, data))
 	assert.NoDirExists(t, data+oldSuffix)
 }
 
@@ -79,7 +79,7 @@ func TestRestoreWithSwapLeavesLiveDataIntactWhenExtractFails(t *testing.T) {
 	require.ErrorIs(t, err, boom, "the cause reaches the operator")
 	assert.Contains(t, err.Error(), "volume is untouched")
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "the original data survived untouched")
-	assert.NoDirExists(t, data+stagingSuffix, "the partial extract is cleaned up")
+	assert.Empty(t, stagingDirsFor(t, data), "the partial extract is cleaned up")
 }
 
 // borgmatic can exit 0 having matched nothing, for instance when the archive
@@ -92,14 +92,14 @@ func TestRestoreWithSwapRefusesAnEmptyExtract(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "extracted nothing")
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "an empty result never becomes the volume")
-	assert.NoDirExists(t, data+stagingSuffix)
+	assert.Empty(t, stagingDirsFor(t, data))
 }
 
 // A run killed between extract and swap leaves staging behind. The next
 // restore must start clean rather than promote a mixture of two restores.
 func TestRestoreWithSwapDiscardsLeftoverStaging(t *testing.T) {
 	data := liveVolume(t)
-	stale := data + stagingSuffix
+	stale := data + stagingPrefix + "fromacrash"
 	require.NoError(t, os.MkdirAll(stale, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(stale, "from-a-previous-run.txt"), []byte("stale"), 0o644))
 
@@ -133,7 +133,7 @@ func TestRestoreWithSwapPreservesDirectoryMode(t *testing.T) {
 // directly, since a kernel with RENAME_EXCHANGE never reaches this path.
 func TestSwapIntoPlaceRestoresTheOriginalIfTheSecondRenameFails(t *testing.T) {
 	data := liveVolume(t)
-	missingStaging := data + stagingSuffix // deliberately never created
+	missingStaging := data + stagingPrefix + "gone" // deliberately never created
 
 	_, err := swapByRenamePair(missingStaging, data)
 
@@ -175,8 +175,8 @@ func TestCreateStagingLikeCarriesARealSELinuxLabel(t *testing.T) {
 		t.Skip("no SELinux label to carry on this host")
 	}
 
-	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	require.NoError(t, createStagingLike(staging, model, quietLogger()))
+	staging, err := createStagingLike(model, quietLogger())
+	require.NoError(t, err)
 
 	got, present, err := readSELinuxContext(staging)
 	require.NoError(t, err)
@@ -200,8 +200,7 @@ func TestCreateStagingLikeRefusesWhenTheLabelCannotBeApplied(t *testing.T) {
 	restore := stubXattr(t, map[string][]byte{seLinuxAttr: []byte(label)}, unix.EPERM)
 	defer restore()
 
-	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	err := createStagingLike(staging, model, quietLogger())
+	_, err := createStagingLike(model, quietLogger())
 
 	require.Error(t, err, "an unappliable label must stop the restore, not be ignored")
 	require.ErrorIs(t, err, unix.EPERM)
@@ -221,7 +220,8 @@ func TestCreateStagingLikeProceedsWithoutALabel(t *testing.T) {
 	restore := stubXattr(t, nil, unix.EPERM)
 	defer restore()
 
-	assert.NoError(t, createStagingLike(filepath.Join(dir, "_data"+stagingSuffix), model, quietLogger()))
+	_, err := createStagingLike(model, quietLogger())
+	assert.NoError(t, err)
 }
 
 // The special bits carry semantics a volume can depend on: setgid decides
@@ -235,8 +235,8 @@ func TestCreateStagingLikePreservesSpecialModeBits(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, before.Mode()&os.ModeSetgid, "precondition: setgid is set")
 
-	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	require.NoError(t, createStagingLike(staging, model, quietLogger()))
+	staging, err := createStagingLike(model, quietLogger())
+	require.NoError(t, err)
 
 	after, err := os.Stat(staging)
 	require.NoError(t, err)
@@ -264,7 +264,10 @@ func TestRestoreWithSwapSucceedsEvenIfTheReplacedCopyCannotBeRemoved(t *testing.
 	// it clear of the staging path. Make it writable again wherever it ended up,
 	// or TempDir's own cleanup fails.
 	t.Cleanup(func() {
-		paths := []string{locked, filepath.Join(data+oldSuffix, "locked"), filepath.Join(data+stagingSuffix, "locked")}
+		paths := []string{locked, filepath.Join(data+oldSuffix, "locked")}
+		for _, sd := range stagingDirsFor(t, data) {
+			paths = append(paths, filepath.Join(sd, "locked"))
+		}
 		for _, kept := range keptDirsFor(t, data) {
 			paths = append(paths, filepath.Join(kept, "locked"))
 		}
@@ -321,7 +324,7 @@ func TestRestoreWithSwapAcceptsAnArchivedEmptyDirectory(t *testing.T) {
 
 	require.NoError(t, err, "the archive holds this directory with no children")
 	assert.Empty(t, names(t, data), "the volume is restored to the empty state it was archived in")
-	assert.NoDirExists(t, data+stagingSuffix)
+	assert.Empty(t, stagingDirsFor(t, data))
 }
 
 // posixACL builds a minimal POSIX access ACL granting a named user rwx, in the
@@ -369,8 +372,8 @@ func TestCreateStagingLikeCopiesPOSIXACLs(t *testing.T) {
 	}
 	require.NoError(t, unix.Lsetxattr(model, "system.posix_acl_default", dflt, 0))
 
-	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	require.NoError(t, createStagingLike(staging, model, quietLogger()))
+	staging, err := createStagingLike(model, quietLogger())
+	require.NoError(t, err)
 
 	for attr, want := range map[string][]byte{
 		"system.posix_acl_access":  access,
@@ -485,13 +488,13 @@ func TestCreateStagingLikeCopiesOtherExtendedAttributes(t *testing.T) {
 	dir := t.TempDir()
 	model := filepath.Join(dir, "_data")
 	require.NoError(t, os.Mkdir(model, 0o755))
-	staging := model + stagingSuffix
 
 	if err := unix.Lsetxattr(model, "user.app.role", []byte("primary"), 0); err != nil {
 		t.Skipf("this filesystem cannot hold a user xattr: %v", err)
 	}
 
-	require.NoError(t, createStagingLike(staging, model, quietLogger()))
+	staging, err := createStagingLike(model, quietLogger())
+	require.NoError(t, err)
 
 	value, present, err := readXattr(staging, "user.app.role")
 	require.NoError(t, err)
@@ -506,7 +509,6 @@ func TestCreateStagingLikeWarnsRatherThanFailsOnAnUnwritableAttribute(t *testing
 	dir := t.TempDir()
 	model := filepath.Join(dir, "_data")
 	require.NoError(t, os.Mkdir(model, 0o755))
-	staging := model + stagingSuffix
 
 	restore := swapXattrSeams(t,
 		func(string) ([]string, error) { return []string{"trusted.pinned"}, nil },
@@ -520,7 +522,8 @@ func TestCreateStagingLikeWarnsRatherThanFailsOnAnUnwritableAttribute(t *testing
 	defer restore()
 
 	logs, logger := capturedWarnLogger()
-	require.NoError(t, createStagingLike(staging, model, logger))
+	_, err := createStagingLike(model, logger)
+	require.NoError(t, err)
 	assert.Contains(t, logs.String(), "trusted.pinned")
 }
 
@@ -537,7 +540,7 @@ func TestRestoreWithSwapKeepsTheExtractWhenTheRecheckAborts(t *testing.T) {
 	}, func() error { return appeared })
 
 	require.Error(t, err)
-	assert.NoDirExists(t, data+stagingSuffix, "not left on the path a retry clears first")
+	assert.Empty(t, stagingDirsFor(t, data), "not left where a retry clears first")
 
 	kept := keptDirsFor(t, data)
 	require.Len(t, kept, 1, "the completed extract is kept under a name later runs do not reuse")
@@ -634,7 +637,7 @@ func TestRestoreWithSwapLeavesNoStagingWhenSetupFailsPartway(t *testing.T) {
 	}, nil)
 
 	require.Error(t, err)
-	assert.NoDirExists(t, data+stagingSuffix, "a half-built staging directory must not be left on disk")
+	assert.Empty(t, stagingDirsFor(t, data), "a half-built staging directory must not be left on disk")
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "and the volume is untouched")
 }
 
@@ -701,13 +704,13 @@ func TestEmptyVolumeDataJudgesTheVolumeNotItsBackingDirectory(t *testing.T) {
 func TestRetainOutOfTheWayDoesNotCollideWithinASecond(t *testing.T) {
 	data := liveVolume(t)
 
-	first := data + stagingSuffix
+	first := data + stagingPrefix + "one"
 	require.NoError(t, os.Mkdir(first, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(first, "first.txt"), []byte("first"), 0o644))
 	keptFirst, err := retainOutOfTheWay(first, data)
 	require.NoError(t, err)
 
-	second := data + stagingSuffix
+	second := data + stagingPrefix + "two"
 	require.NoError(t, os.Mkdir(second, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(second, "second.txt"), []byte("second"), 0o644))
 	keptSecond, err := retainOutOfTheWay(second, data)
@@ -717,7 +720,7 @@ func TestRetainOutOfTheWayDoesNotCollideWithinASecond(t *testing.T) {
 	assert.Equal(t, []string{"first.txt"}, names(t, keptFirst), "the first copy was not overwritten")
 	assert.Equal(t, []string{"second.txt"}, names(t, keptSecond))
 	assert.Len(t, keptDirsFor(t, data), 2, "both copies are kept")
-	assert.NoDirExists(t, data+stagingSuffix, "neither is left where a retry clears first")
+	assert.Empty(t, stagingDirsFor(t, data), "neither is left where a retry clears first")
 }
 
 // A retention that cannot complete must not leave its placeholder behind: the
@@ -726,7 +729,7 @@ func TestRetainOutOfTheWayDoesNotCollideWithinASecond(t *testing.T) {
 func TestRetainOutOfTheWayRemovesItsPlaceholderOnFailure(t *testing.T) {
 	data := liveVolume(t)
 
-	_, err := retainOutOfTheWay(data+stagingSuffix, data) // never created
+	_, err := retainOutOfTheWay(data+stagingPrefix+"gone", data) // never created
 	require.Error(t, err)
 	assert.Empty(t, keptDirsFor(t, data), "no empty placeholder was left behind")
 }
@@ -849,7 +852,7 @@ func TestRetainOrWarnReportsAFailureRatherThanHidingIt(t *testing.T) {
 		t.Skip("root writes into an unwritable directory anyway")
 	}
 	data := liveVolume(t)
-	staging := data + stagingSuffix
+	staging := data + stagingPrefix + "one"
 	require.NoError(t, os.Mkdir(staging, 0o755))
 
 	// Retention creates its destination beside the target, so a parent that
@@ -1002,7 +1005,7 @@ func TestRestoreWithSwapDoesNotBlockTheNextRestoreWhenCleanupFails(t *testing.T)
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
 	}, nil))
 	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restore itself succeeded")
-	assert.NoDirExists(t, data+stagingSuffix, "the undeletable copy was moved off the staging path")
+	assert.Empty(t, stagingDirsFor(t, data), "the undeletable copy was moved off the staging path")
 	assert.Len(t, keptDirsFor(t, data), 1, "and kept where the operator can find it")
 
 	// The real assertion: another restore can still run.
@@ -1103,9 +1106,8 @@ func TestCreateStagingLikeCarriesAZeroLengthAttribute(t *testing.T) {
 	if err := unix.Lsetxattr(model, "user.marker", nil, 0); err != nil {
 		t.Skipf("this filesystem cannot hold a user xattr: %v", err)
 	}
-	staging := model + stagingSuffix
-
-	require.NoError(t, createStagingLike(staging, model, quietLogger()))
+	staging, err := createStagingLike(model, quietLogger())
+	require.NoError(t, err)
 
 	_, present, err := readXattr(staging, "user.marker")
 	require.NoError(t, err)
@@ -1117,7 +1119,7 @@ func TestCreateStagingLikeCarriesAZeroLengthAttribute(t *testing.T) {
 // error still points at the kept one, and the next attempt deletes it.
 func TestRetainOutOfTheWayFlushesTheRename(t *testing.T) {
 	data := liveVolume(t)
-	staging := data + stagingSuffix
+	staging := data + stagingPrefix + "one"
 	require.NoError(t, os.Mkdir(staging, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "kept.txt"), []byte("kept"), 0o644))
 
@@ -1139,7 +1141,7 @@ func TestRetainOutOfTheWayFlushesTheRename(t *testing.T) {
 // data really has moved by then, it just is not durable yet.
 func TestRetainOrWarnStillReportsThePathWhenTheFlushFails(t *testing.T) {
 	data := liveVolume(t)
-	staging := data + stagingSuffix
+	staging := data + stagingPrefix + "one"
 	require.NoError(t, os.Mkdir(staging, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "kept.txt"), []byte("kept"), 0o644))
 
@@ -1283,4 +1285,103 @@ func TestIsEncryptedDirIsFalseForAnOrdinaryDirectory(t *testing.T) {
 func TestIsEncryptedDirReportsAMissingPath(t *testing.T) {
 	_, err := isEncryptedDir(filepath.Join(t.TempDir(), "nope"))
 	require.Error(t, err, "a path that cannot be inspected is not the same as one that is unencrypted")
+}
+
+// stagingDirsFor lists the staging directories beside a volume's data path.
+// Their names are unique per run, so tests look them up rather than compute
+// them.
+func stagingDirsFor(t *testing.T, data string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(data + stagingPrefix + "*")
+	require.NoError(t, err)
+	return matches
+}
+
+// Clearing leftovers is the first thing a restore does, and against a fixed
+// name that was an unconditional recursive delete of whatever happened to hold
+// it. Nothing marked such a directory as this tool's, and for a symlink-backed
+// volume it can sit in a directory an application owns.
+func TestRestoreWithSwapDoesNotDeleteAnUnrelatedSibling(t *testing.T) {
+	data := liveVolume(t)
+	// The name the old fixed-suffix scheme would have claimed, plus a couple of
+	// near misses that share the prefix's opening.
+	bystanders := []string{
+		data + ".borgmatic-manager-restoring",
+		data + ".backup",
+		filepath.Join(filepath.Dir(data), "_data-old"),
+	}
+	for _, b := range bystanders {
+		require.NoError(t, os.Mkdir(b, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(b, "someone-elses.txt"), []byte("keep"), 0o644))
+	}
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "the restore still happened")
+	for _, b := range bystanders {
+		assert.FileExists(t, filepath.Join(b, "someone-elses.txt"), "%s was deleted by a restore that did not create it", b)
+	}
+}
+
+// Staging directories from a run that died are this tool's own, and the
+// per-volume lock means no live run holds one, so they are cleared.
+func TestRestoreWithSwapClearsItsOwnLeftovers(t *testing.T) {
+	data := liveVolume(t)
+	stale := data + stagingPrefix + "fromadeadrun"
+	require.NoError(t, os.Mkdir(stale, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(stale, "partial.txt"), []byte("partial"), 0o644))
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	assert.NoDirExists(t, stale, "a leftover from a dead run is this tool's to clear")
+	assert.Empty(t, stagingDirsFor(t, data), "and nothing new is left behind")
+}
+
+// Each run gets its own staging name, so two runs can never reason about the
+// same directory.
+func TestStagingNamesAreUniquePerRun(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	first, err := createStagingDir(model, quietLogger())
+	require.NoError(t, err)
+	second, err := createStagingDir(model, quietLogger())
+	require.NoError(t, err)
+
+	assert.NotEqual(t, first, second)
+	for _, p := range []string{first, second} {
+		assert.True(t, strings.HasPrefix(filepath.Base(p), filepath.Base(model)+stagingPrefix),
+			"%s must be recognisable as this tool's staging directory", p)
+	}
+}
+
+// A _data that resolves to something other than a directory is a malformed
+// volume, and both swap paths would replace that node with the staged
+// directory: the file would be deleted by a restore reporting success.
+func TestCheckVolumeDataDirRejectsANonDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	good := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(good, 0o755))
+	require.NoError(t, checkVolumeDataDir(good, "myvol"))
+
+	file := filepath.Join(dir, "afile")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o644))
+	err := checkVolumeDataDir(file, "myvol")
+	require.Error(t, err, "a regular file must be refused")
+	assert.Contains(t, err.Error(), "not a directory")
+	assert.Contains(t, err.Error(), "nothing was changed")
+
+	// The realistic shape: _data is a symlink to a file, which resolution
+	// follows and the old existence-only check accepted.
+	link := filepath.Join(dir, "linked")
+	require.NoError(t, os.Symlink(file, link))
+	require.Error(t, checkVolumeDataDir(link, "myvol"), "a symlink to a file must be refused too")
+
+	require.Error(t, checkVolumeDataDir(filepath.Join(dir, "missing"), "myvol"), "and a missing one still is")
 }
