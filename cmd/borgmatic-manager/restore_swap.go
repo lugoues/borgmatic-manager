@@ -260,6 +260,15 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 		return fmt.Errorf("a previous restore was interrupted mid-swap and %s could not be moved back to %s: %w",
 			displaced, targetData, err)
 	}
+	// Durable before it is reported. This restore can still fail for a dozen
+	// reasons before it reaches a swap of its own, and an unflushed recovery can
+	// be rolled back by a power loss after the operator has been told the volume
+	// was put back, leaving _data missing again with nothing left saying why.
+	if syncErr := syncDirFn(filepath.Dir(targetData)); syncErr != nil {
+		return fmt.Errorf("a previous restore was interrupted mid-swap and %s was moved back to %s, "+
+			"but that could not be flushed to disk, so it may not survive a power loss: %w",
+			displaced, targetData, syncErr)
+	}
 	logger.Warn("a previous restore was interrupted mid-swap; the volume's data has been put back",
 		"path", targetData, "recovered_from", displaced)
 	return nil
@@ -323,7 +332,53 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 	if err := copyRemainingXattrs(model, staging, logger); err != nil {
 		return "", err
 	}
+	warnAboutProjectQuota(model, logger)
 	return staging, nil
+}
+
+// warnAboutProjectQuota reports a project quota that the replacement directory
+// will not inherit.
+//
+// A project id and its inherit flag live in the inode's fsxattr, reached by
+// ioctl rather than as an extended attribute, so none of the copying above
+// carries them: a new directory starts at project 0. The volume and everything
+// later written under it then sit outside the quota they were meant to be in,
+// and nothing else says so.
+//
+// A warning rather than a copy. Reproducing the id means issuing
+// FS_IOC_FSGETXATTR and FS_IOC_FSSETXATTR by hand through unsafe pointers, and
+// no filesystem supporting project quotas can be mounted in the environment
+// this was written in, so that code could not have been tested. Untested
+// pointer work in a restore path is a worse trade than an accurate warning.
+func warnAboutProjectQuota(model string, logger *slog.Logger) {
+	id, known := projectQuotaID(model)
+	if !known || id == 0 {
+		return
+	}
+	logger.Warn("this volume's data directory has a filesystem project quota id, which lives in the inode "+
+		"rather than in an extended attribute and so does not carry to the directory replacing it; "+
+		"the restored volume will be outside that quota until the id is set again (chattr -p)",
+		"path", model, "project_id", id)
+}
+
+// projectQuotaID reports the project quota id on path, and whether it could be
+// established at all. Shelling out for the same reason the btrfs checks do, and
+// an unreadable or unsupported answer is "unknown" rather than "zero".
+var projectQuotaID = func(path string) (uint64, bool) {
+	// #nosec G204 -- fixed argv over a path this process derived
+	out, err := exec.Command("lsattr", "-pd", path).Output()
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0, false
+	}
+	id, convErr := strconv.ParseUint(fields[0], 10, 64)
+	if convErr != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 // clearStagingLeftovers removes staging directories a previous run died before

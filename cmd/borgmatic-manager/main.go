@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1344,6 +1345,12 @@ const extractKillGrace = 10 * time.Second
 // forwarded explicitly. The child gets its own process group because borgmatic
 // spawns borg, and only a group signal reaches both.
 func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive, archivePath, destination string) error {
+	// Pdeathsig below is delivered when the *thread* that started the child
+	// exits, not the process, so the goroutine has to keep one for the duration
+	// or the signal can arrive early on a perfectly healthy restore.
+	goruntime.LockOSThread()
+	defer goruntime.UnlockOSThread()
+
 	// #nosec G204 -- resolved borgmatic binary with computed extract arguments
 	cmd := exec.Command(borgmaticPath,
 		"--config", configPath, "extract", "--archive", archive,
@@ -1373,7 +1380,15 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	// the shell is watching, and job control behaves normally again. The session
 	// leader is also its process group leader, so the group signalling below is
 	// unchanged.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	//
+	// Pdeathsig ties the extract's lifetime to this process. Without it a
+	// manager that is SIGKILLed or OOM-killed leaves borgmatic and borg running
+	// with nothing supervising them, and the per-volume lock dies with the
+	// manager, so the next attempt is free to start while the orphan is still
+	// writing. That matters most for merge and forced in-place restores, which
+	// write straight into the live volume. SIGTERM rather than SIGKILL so
+	// borgmatic gets to stop borg rather than being torn away from it.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGTERM}
 
 	// Armed before the child exists. A signal landing between Start and Notify
 	// would otherwise take its default action on this process, killing the
