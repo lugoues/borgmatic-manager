@@ -1940,7 +1940,7 @@ func TestRestoreWithSwapLeavesAnUnmarkedStagingLookalikeAlone(t *testing.T) {
 func TestRestoreWithSwapDoesNotPromoteTheScratchMark(t *testing.T) {
 	data := liveVolume(t)
 	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
-		ours, err := provablyOurs(dest)
+		ours, _, err := provablyOurs(dest)
 		require.NoError(t, err)
 		if !ours {
 			t.Skip("this filesystem cannot hold the marker, so there is nothing to clear")
@@ -1948,7 +1948,7 @@ func TestRestoreWithSwapDoesNotPromoteTheScratchMark(t *testing.T) {
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
 	}, nil))
 
-	marked, err := provablyOurs(data)
+	marked, _, err := provablyOurs(data)
 	require.NoError(t, err)
 	assert.False(t, marked, "the promoted volume still carries the scratch mark")
 }
@@ -2016,12 +2016,12 @@ func TestStagingStaysProvablyOursUntilItIsPromoted(t *testing.T) {
 	}, func() error {
 		// The last thing that runs before the swap: the tree is complete here,
 		// and this is the moment a kill would strand it.
-		ours, err := provablyOurs(stagingPath)
+		ours, _, err := provablyOurs(stagingPath)
 		require.NoError(t, err)
 		if ours {
 			return nil
 		}
-		marked, markErr := provablyOurs(stagingPath)
+		marked, _, markErr := provablyOurs(stagingPath)
 		require.NoError(t, markErr)
 		if !marked {
 			t.Skip("this filesystem cannot hold the marker, so there is nothing to prove")
@@ -2095,14 +2095,14 @@ func TestStagingIsStillProvablyOursAtTheMomentItIsPromoted(t *testing.T) {
 	realSwap := swapIntoPlaceFn
 	swapIntoPlaceFn = func(staging, target string) (string, error) {
 		var err error
-		marked, err = provablyOurs(staging)
+		marked, _, err = provablyOurs(staging)
 		require.NoError(t, err)
 		return realSwap(staging, target)
 	}
 	defer func() { swapIntoPlaceFn = realSwap }()
 
 	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
-		if ours, err := provablyOurs(dest); err == nil && !ours {
+		if ours, _, err := provablyOurs(dest); err == nil && !ours {
 			t.Skip("this filesystem cannot hold the marker, so there is nothing to prove")
 		}
 		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
@@ -2110,4 +2110,160 @@ func TestStagingIsStillProvablyOursAtTheMomentItIsPromoted(t *testing.T) {
 
 	assert.True(t, marked, "staging lost its ownership mark before the swap committed")
 	assert.Equal(t, []string{"restored.txt"}, names(t, data))
+}
+
+// The mark has to be on the inode before it moves. A kill between the rename
+// and a later mark left the volume missing beside a directory recovery could
+// not verify, which is worse than the problem the mark was added to solve.
+func TestDisplacedDataCarriesProofFromTheInstantItExists(t *testing.T) {
+	data := liveVolume(t)
+	if ours, _, err := provablyOurs(data); err == nil && ours {
+		t.Fatal("precondition: a live volume is not marked")
+	}
+
+	staging, err := createStagingLike(data, quietLogger())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
+
+	displaced, err := swapByRenamePair(staging, data)
+	require.NoError(t, err)
+
+	ours, _, err := provablyOurs(displaced)
+	require.NoError(t, err)
+	if !ours {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+	// Which is exactly what makes the interrupted state recoverable.
+	require.NoError(t, os.RemoveAll(data))
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	assert.Equal(t, []string{"original.txt"}, names(t, data))
+}
+
+// A failed rename leaves the volume where it was, so the claim on it is
+// meaningless and must not stay behind.
+func TestAFailedRenamePairLeavesNoClaimOnTheVolume(t *testing.T) {
+	data := liveVolume(t)
+	_, err := swapByRenamePair(data+stagingPrefix+"9999", data) // staging never created
+	require.Error(t, err)
+
+	ours, _, err := provablyOurs(data)
+	require.NoError(t, err)
+	assert.False(t, ours, "the volume kept a scratch mark after a swap that never happened")
+}
+
+// Recovery cleans up after itself, but only its own leavings.
+func TestRecoverInterruptedSwapLeavesUnverifiedSiblingsAlone(t *testing.T) {
+	data := liveVolume(t)
+	bystander := data + oldPrefix + "4242" // right shape, empty, not ours
+	require.NoError(t, os.Mkdir(bystander, 0o755))
+	real := data + oldPrefix + "1001"
+	require.NoError(t, os.Rename(data, real))
+	markAsOurs(real)
+	if ours, _, err := provablyOurs(real); err != nil || !ours {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+
+	require.NoError(t, recoverInterruptedSwap(data, quietLogger()))
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume came back")
+	assert.DirExists(t, bystander, "an unverified sibling is not this function's to delete")
+}
+
+// Putting a directory back needs permission on the parent, not on the directory
+// itself. Enumerating a sole verified candidate asked for permission the
+// recovery does not need and made an owner-mode-0300 volume unrecoverable.
+func TestRecoverInterruptedSwapReportsACandidateItCannotVerify(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads regardless of the directory mode")
+	}
+	data := liveVolume(t)
+	displaced := data + oldPrefix + "1001"
+	require.NoError(t, os.Rename(data, displaced))
+	markAsOurs(displaced)
+	if ours, _, err := provablyOurs(displaced); err != nil || !ours {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+	require.NoError(t, os.Chmod(displaced, 0o300)) // search and write, no read
+	t.Cleanup(func() { _ = os.Chmod(displaced, 0o755) })
+
+	// Reading the mark needs the same permission listing does, so ownership
+	// cannot be established here at all. That is a real limit of marking rather
+	// than a bug to work around: recovering an unverifiable directory would put
+	// back the risk the mark exists to remove. What it must not do is fail with
+	// a bare permission error that says nothing about what to do next.
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, recoverInterruptedSwap(data, logger),
+		"an unreadable candidate is reported, not a hard failure")
+	assert.NoDirExists(t, data, "and nothing unverifiable is renamed into the volume's path")
+	assert.Contains(t, logs.String(), "cannot be read")
+	assert.Contains(t, logs.String(), "rename it into place yourself")
+}
+
+// The mark has to be on the inode before the rename, not applied to the name
+// afterwards. What matters is the instant between: a kill there used to leave a
+// missing volume beside a directory recovery could not verify.
+func TestTheDisplacedCopyIsMarkedAtTheInstantOfTheRename(t *testing.T) {
+	data := liveVolume(t)
+
+	markedAtRename := false
+	realMove := moveAsideFn
+	moveAsideFn = func(target, displaced string) error {
+		if err := realMove(target, displaced); err != nil {
+			return err
+		}
+		var err error
+		markedAtRename, _, err = provablyOurs(displaced)
+		require.NoError(t, err)
+		return nil
+	}
+	defer func() { moveAsideFn = realMove }()
+
+	staging, err := createStagingLike(data, quietLogger())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
+	if ours, _, oErr := provablyOurs(staging); oErr == nil && !ours {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+
+	_, err = swapByRenamePair(staging, data)
+	require.NoError(t, err)
+	assert.True(t, markedAtRename,
+		"the displaced copy was unverifiable in the window between the rename and a later mark")
+}
+
+// The probe creates a directory in the parent, and a restore that will never
+// stage does not need one. Running it anyway let a full or read-only parent
+// abort a merge or forced restore that would not have touched it.
+func TestTheStagingProbeIsSkippedWhenNothingWillBeStaged(t *testing.T) {
+	const why = "this volume's data directory is encrypted"
+	for name, tc := range map[string]struct {
+		merge, force, mounted, encrypted bool
+		wantProbe                        bool
+	}{
+		"an ordinary mirror restore": {wantProbe: true},
+		"a merge":                    {merge: true},
+		"forced":                     {force: true},
+		"a mount point":              {mounted: true},
+		"encrypted":                  {encrypted: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			probed := false
+			real := canCreateSiblingFn
+			canCreateSiblingFn = func(string) (bool, error) { probed = true; return true, nil }
+			defer func() { canCreateSiblingFn = real }()
+
+			_, err := resolveInPlaceReason(tc.merge, tc.force, tc.mounted, tc.encrypted, why, "/var/lib/docker/volumes/v/_data")
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantProbe, probed, "whether the parent was touched")
+		})
+	}
+}
+
+func TestAnUnstageableParentStillSendsAMirrorRestoreInPlace(t *testing.T) {
+	real := canCreateSiblingFn
+	canCreateSiblingFn = func(string) (bool, error) { return false, nil }
+	defer func() { canCreateSiblingFn = real }()
+
+	reason, err := resolveInPlaceReason(false, false, false, false, "", "/var/lib/docker/volumes/v/_data")
+	require.NoError(t, err)
+	assert.Contains(t, reason, "cannot be created")
 }

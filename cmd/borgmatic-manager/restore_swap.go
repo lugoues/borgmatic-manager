@@ -189,6 +189,13 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	return nil
 }
 
+// moveAsideFn is the seam for the fallback's first rename, so a test can look at
+// the displaced directory at the instant it exists rather than after the fact.
+// The whole point of marking before the rename is what is true in that instant.
+var moveAsideFn = func(targetData, displaced string) error {
+	return unix.Renameat(unix.AT_FDCWD, targetData, unix.AT_FDCWD, displaced)
+}
+
 // swapIntoPlaceFn is the seam for the one irreversible step, so a test can
 // inspect what is about to be promoted at the moment it is promoted.
 var swapIntoPlaceFn = swapIntoPlace
@@ -230,18 +237,25 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 		return "", fmt.Errorf("reserving a name to move the current data aside (the volume is untouched): %w", err)
 	}
 	markAsOurs(displaced)
-	// The mark on the placeholder does not survive this: the rename replaces
-	// that inode with the volume's own directory. It is applied again below,
-	// once the thing at this path is the displaced data, so recovery can tell
-	// this directory apart from an unrelated one that merely matches the name.
-	if renErr := unix.Renameat(unix.AT_FDCWD, targetData, unix.AT_FDCWD, displaced); renErr != nil {
+	// Marked before it moves, not after it lands. Extended attributes belong to
+	// the inode and travel with it through a rename, so claiming the volume's
+	// own directory here means the displaced copy carries proof from the instant
+	// it exists. Marking the placeholder instead was useless (the rename
+	// discards that inode) and marking afterwards left a window: a kill between
+	// the rename and the mark produced a missing volume beside an unverifiable
+	// directory, which recovery then refused and left for the operator to sort
+	// out by hand.
+	markAsOurs(targetData)
+	if renErr := moveAsideFn(targetData, displaced); renErr != nil {
+		// It never moved, so the claim on it is meaningless and would otherwise
+		// stay on the live volume.
+		_ = removeXattr(targetData, scratchMarkerAttr)
 		if rmErr := os.Remove(displaced); rmErr != nil {
 			return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w",
 				errors.Join(renErr, rmErr))
 		}
 		return "", fmt.Errorf("moving the current data aside (the volume is untouched): %w", renErr)
 	}
-	markAsOurs(displaced)
 	if renErr := os.Rename(staging, targetData); renErr != nil {
 		// Put it back: a volume with no data directory is worse than a failed
 		// restore, and this is the only moment that state can exist.
@@ -250,6 +264,10 @@ func swapByRenamePair(staging, targetData string) (displaced string, err error) 
 				"and the restored copy is at %s; move whichever you want to %s by hand: %w",
 				errStranded, displaced, staging, targetData, errors.Join(renErr, back))
 		}
+		// It is the volume again, and the claim travelled back with the inode.
+		// Left on, the next run would treat the live volume as scratch of its
+		// own if it ever appeared under one of these names.
+		_ = removeXattr(targetData, scratchMarkerAttr)
 		return "", fmt.Errorf("moving the restored data into place (the volume is unchanged): %w", renErr)
 	}
 	return displaced, nil
@@ -348,11 +366,11 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 					"path", m, "volume", targetData)
 				continue
 			}
-			ours, ownErr := provablyOurs(m)
+			ours, known, ownErr := provablyOurs(m)
 			if ownErr != nil {
 				return ownErr
 			}
-			if !ours {
+			if !ours || !known {
 				logger.Warn("an empty directory beside this volume is named like a reservation this tool makes "+
 					"but carries no mark showing it created it, so it is being left alone", "path", m)
 				continue
@@ -376,44 +394,60 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 	// beside a directory that merely matches the public shape, would otherwise
 	// have this rename someone else's data into the volume's path and present it
 	// as the volume.
-	var ours, oursWithData []string
+	var ours []string
 	for _, m := range matches {
-		mine, ownErr := provablyOurs(m)
+		mine, known, ownErr := provablyOurs(m)
 		if ownErr != nil {
 			return ownErr
 		}
-		if !mine {
+		switch {
+		case !known:
+			logger.Warn("a directory beside this volume may hold data displaced by an interrupted restore, but "+
+				"it cannot be read, so it cannot be verified as this tool's and is being left alone; if this "+
+				"volume is missing, check that directory and rename it into place yourself",
+				"path", m, "volume", targetData)
+			continue
+		case !mine:
 			logger.Warn("a directory beside this volume matches the name an interrupted restore leaves behind "+
-				"but carries no mark showing this tool displaced it, so it is not being treated as the volume's data",
+				"but carries no mark showing this tool displaced it, so it is being left alone",
 				"path", m, "volume", targetData)
 			continue
 		}
 		ours = append(ours, m)
-		empty, emptyErr := isEmptyDir(m)
-		if emptyErr != nil {
-			return emptyErr
-		}
-		if !empty {
-			oursWithData = append(oursWithData, m)
-		}
 	}
 	if len(ours) == 0 {
 		return nil // nothing here is this tool's to put back
 	}
-	if len(oursWithData) > 1 {
-		// Never expected: the window is two syscalls wide and one restore of a
-		// volume runs at a time. Choosing between two copies of a volume's data
-		// is not this program's to do.
-		return fmt.Errorf("%s is missing and more than one displaced copy beside it holds data (%s); "+
-			"a restore was interrupted more than once, so move the one you want to %s by hand",
-			targetData, strings.Join(oursWithData, ", "), targetData)
-	}
 
-	// With no non-empty candidate every one of ours is empty, and the volume was
-	// empty too: any of them restores the same directory.
+	// Emptiness only matters when there is a choice to make. Reading a
+	// directory needs permission that putting it back does not, so a volume the
+	// owner can search and write but not list (mode 0300) would otherwise be
+	// unrecoverable for a question nobody asked.
 	displaced := ours[0]
-	if len(oursWithData) == 1 {
-		displaced = oursWithData[0]
+	if len(ours) > 1 {
+		var withData []string
+		for _, m := range ours {
+			empty, emptyErr := isEmptyDir(m)
+			if emptyErr != nil {
+				return emptyErr
+			}
+			if !empty {
+				withData = append(withData, m)
+			}
+		}
+		if len(withData) > 1 {
+			// Never expected: the window is two syscalls wide and one restore of
+			// a volume runs at a time. Choosing between two copies of a volume's
+			// data is not this program's to do.
+			return fmt.Errorf("%s is missing and more than one displaced copy beside it holds data (%s); "+
+				"a restore was interrupted more than once, so move the one you want to %s by hand",
+				targetData, strings.Join(withData, ", "), targetData)
+		}
+		// With no non-empty candidate every one of ours is empty, and the volume
+		// was empty too: any of them restores the same directory.
+		if len(withData) == 1 {
+			displaced = withData[0]
+		}
 	}
 
 	if err := os.Rename(displaced, targetData); err != nil {
@@ -439,7 +473,9 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 		"path", targetData, "recovered_from", displaced)
 
 	// Anything still beside it was an abandoned reservation, now provably so.
-	for _, m := range matches {
+	// Only ours: the unverified ones were excluded above and are not this
+	// function's to delete.
+	for _, m := range ours {
 		if m == displaced {
 			continue
 		}
@@ -757,13 +793,24 @@ func markAsOurs(path string) {
 	_ = setXattr(path, scratchMarkerAttr, []byte("1"), 0)
 }
 
-// provablyOurs reports whether this tool created path.
-func provablyOurs(path string) (bool, error) {
+// provablyOurs reports whether this tool created path, and whether the question
+// could be answered at all.
+//
+// Reading a user extended attribute needs read permission on the directory,
+// exactly as listing it does, so a volume its owner can search and write but
+// not read (mode 0300) cannot be verified. That is a real limit of marking
+// rather than something to work around: dropping verification for such a
+// directory would put back the risk the mark exists to remove, which is renaming
+// an unrelated directory into the volume's path and presenting it as the volume.
+func provablyOurs(path string) (ours, known bool, err error) {
 	_, present, err := readXattrFn(path, scratchMarkerAttr)
 	if err != nil {
-		return false, err
+		if errors.Is(err, os.ErrPermission) {
+			return false, false, nil
+		}
+		return false, false, err
 	}
-	return present, nil
+	return present, true, nil
 }
 
 // scratchPattern builds the MkdirTemp pattern for a scratch directory beside
@@ -813,11 +860,11 @@ func clearStagingLeftovers(targetData string, logger *slog.Logger) error {
 		return nil
 	}
 	for _, stale := range matches {
-		ours, ownErr := provablyOurs(stale)
+		ours, known, ownErr := provablyOurs(stale)
 		if ownErr != nil {
 			return ownErr
 		}
-		if !ours {
+		if !ours || !known {
 			logger.Warn("a directory beside this volume is named like a staging directory but carries no mark "+
 				"showing this tool created it, so it is being left alone; remove it yourself if it is not wanted",
 				"path", stale)
