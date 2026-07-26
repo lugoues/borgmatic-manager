@@ -766,3 +766,220 @@ func TestRunHoldsAndReleasesLivenessLock(t *testing.T) {
 	// O_CREATE, so assert absence directly instead.)
 	assert.NoFileExists(t, lockPath, "the lock must be released and its file unlinked after the run")
 }
+
+func mkResult(location, label string, files int64) createResult {
+	var r createResult
+	r.Repository.Location = location
+	r.Repository.Label = label
+	r.Archive.Name = "arch"
+	r.Archive.Duration = 3
+	r.Archive.Stats.NFiles = files
+	r.Archive.Stats.OriginalSize = files * 100
+	return r
+}
+
+func TestPerRepoSuccess(t *testing.T) {
+	configured := []config.RepoRef{
+		{Path: "/mnt/local", Label: "local"},
+		{Path: "ssh://borg@a/./r", Label: "offsite-a"},
+	}
+
+	t.Run("every repo ok, results carry stats", func(t *testing.T) {
+		results := []createResult{
+			mkResult("/mnt/local", "local", 10),
+			mkResult("ssh://borg@a/./r", "offsite-a", 20),
+		}
+		out := perRepoSuccess(configured, results)
+		byID := map[string]state.RepoOutcome{}
+		for _, o := range out {
+			byID[o.ID] = o
+		}
+		assert.Equal(t, state.ResultOK, byID["local"].Result)
+		assert.EqualValues(t, 20, byID["offsite-a"].Files)
+		assert.EqualValues(t, 3, byID["offsite-a"].DurationSeconds)
+	})
+
+	t.Run("label match when the reported location differs", func(t *testing.T) {
+		results := []createResult{mkResult("/resolved/elsewhere", "local", 5)}
+		out := perRepoSuccess([]config.RepoRef{{Path: "/mnt/local", Label: "local"}}, results)
+		require.Len(t, out, 1)
+		assert.Equal(t, state.ResultOK, out[0].Result, "matched by label despite the path mismatch")
+		assert.EqualValues(t, 5, out[0].Files)
+	})
+
+	t.Run("prune-only cycle: ok without a create entry", func(t *testing.T) {
+		out := perRepoSuccess(configured, nil)
+		require.Len(t, out, 2)
+		for _, o := range out {
+			assert.Equal(t, state.ResultOK, o.Result)
+			assert.Zero(t, o.Files)
+		}
+	})
+
+	t.Run("no configured repos yields nil", func(t *testing.T) {
+		assert.Nil(t, perRepoSuccess(nil, []createResult{mkResult("/x", "", 1)}))
+	})
+}
+
+// probeFake is an execCommand seam for the confirmation probe: a `list` call
+// emits the JSON mapped to its --repository (empty/missing means exit 1, an
+// unreachable/errored probe).
+type probeFake struct {
+	mu        sync.Mutex
+	listCalls []string
+	out       map[string]string
+}
+
+func (p *probeFake) exec(_ context.Context, _ string, args ...string) *exec.Cmd {
+	repo, isList := "", false
+	for i, a := range args {
+		switch {
+		case a == "list":
+			isList = true
+		case a == "--repository" && i+1 < len(args):
+			repo = args[i+1]
+		}
+	}
+	if !isList {
+		return exec.Command("/bin/sh", "-c", "exit 0")
+	}
+	p.mu.Lock()
+	p.listCalls = append(p.listCalls, repo)
+	p.mu.Unlock()
+	if j := p.out[repo]; j != "" {
+		return exec.Command("/bin/sh", "-c", "cat <<'JSONEOF'\n"+j+"\nJSONEOF")
+	}
+	return exec.Command("/bin/sh", "-c", "exit 1")
+}
+
+func (p *probeFake) probed() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, len(p.listCalls))
+	copy(out, p.listCalls)
+	return out
+}
+
+func listJSON(archiveStart time.Time) string {
+	return fmt.Sprintf(`[{"archives":[{"start":%q}]}]`, archiveStart.Format("2006-01-02T15:04:05.000000"))
+}
+
+func TestPerRepoFailure(t *testing.T) {
+	runStart := time.Now()
+	fresh := runStart.Add(2 * time.Second) // archive from this cycle
+	stale := runStart.Add(-2 * time.Hour)  // an older archive, this cycle produced none
+	local := config.RepoRef{Path: "/mnt/local", Label: "local"}
+	offA := config.RepoRef{Path: "ssh://borg@a/./r", Label: "offsite-a"}
+	offB := config.RepoRef{Path: "ssh://borg@b/./r", Label: "offsite-b"}
+
+	newRunner := func(pf *probeFake) *Runner {
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		r := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake", nil, 0)
+		r.execCommand = pf.exec
+		return r
+	}
+
+	t.Run("repo named in an error is failed without a probe", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{"/mnt/local": listJSON(fresh)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+		run.recordErrorText("Repository /mnt/local does not exist.")
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local}, run, runStart)
+		require.Len(t, out, 1)
+		assert.Equal(t, state.ResultFailed, out[0].Result)
+		assert.Empty(t, pf.probed(), "the implicated repo must not be probed")
+	})
+
+	t.Run("unimplicated repo with a fresh archive is confirmed ok", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{offA.Path: listJSON(fresh)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+		run.recordErrorText("Repository /mnt/local does not exist.")
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		require.Len(t, out, 1)
+		assert.Equal(t, state.ResultOK, out[0].Result)
+		assert.Equal(t, []string{offA.Path}, pf.probed())
+	})
+
+	t.Run("unimplicated repo with only a stale archive is left untouched", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{offA.Path: listJSON(stale)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		assert.Nil(t, out, "no fresh archive and not implicated: neither advanced nor failed")
+	})
+
+	t.Run("unreachable repo probe error is left untouched", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{}} // probe exits 1
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		assert.Nil(t, out)
+	})
+
+	t.Run("mixed fan-out: one failed, one confirmed ok, one omitted", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{
+			offA.Path: listJSON(fresh), // healthy, confirmed
+			offB.Path: listJSON(stale), // no fresh archive -> omitted
+		}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+		run.recordErrorText("Repository /mnt/local does not exist.") // local failed
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local, offA, offB}, run, runStart)
+		byID := map[string]state.RepoOutcome{}
+		for _, o := range out {
+			byID[o.ID] = o
+		}
+		assert.Equal(t, state.ResultFailed, byID["local"].Result)
+		assert.Equal(t, state.ResultOK, byID["offsite-a"].Result)
+		_, hasB := byID["offsite-b"]
+		assert.False(t, hasB, "offsite-b is neither implicated nor confirmed: omitted")
+		assert.NotContains(t, pf.probed(), local.Path, "implicated repo not probed")
+	})
+
+	t.Run("shutdown in progress skips probing entirely", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{offA.Path: listJSON(fresh)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		out := r.perRepoFailure(ctx, "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		assert.Nil(t, out)
+		assert.Empty(t, pf.probed(), "no borgmatic work is started during shutdown")
+	})
+
+	t.Run("no configured repos yields nil", func(t *testing.T) {
+		pf := &probeFake{}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+		assert.Nil(t, r.perRepoFailure(context.Background(), "/cfg.yaml", nil, run, runStart))
+	})
+}
+
+func TestContainsPathToken(t *testing.T) {
+	assert.True(t, containsPathToken("Repository /mnt/local does not exist.", "/mnt/local"))
+	assert.True(t, containsPathToken("lock /mnt/local/lock.exclusive failed", "/mnt/local"), "a child path (the repo's lock file) still references the repo")
+	assert.True(t, containsPathToken("borg create /mnt/local::archive-1 ...", "/mnt/local"), "an archive ref (repo::name) still references the repo")
+	assert.True(t, containsPathToken("borg create ssh://borg@a/./r ...", "ssh://borg@a/./r"))
+	assert.False(t, containsPathToken("Repository /mnt/local2 does not exist.", "/mnt/local"), "must not match a longer sibling name")
+	assert.False(t, containsPathToken("Repository /mnt/localish does not exist.", "/mnt/local"), "must not match a name-continuation")
+	assert.False(t, containsPathToken("Repository /srv/mnt/local does not exist.", "/mnt/local"), "an absolute path preceded by a name byte is a different path")
+	assert.False(t, containsPathToken("nothing here", "/mnt/local"))
+}
+
+func TestNewestArchiveAtOrAfter(t *testing.T) {
+	runStart := time.Now()
+	assert.True(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(time.Second))), runStart))
+	assert.True(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-2*time.Second))), runStart), "within the skew window still counts")
+	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-time.Hour))), runStart))
+	assert.False(t, newestArchiveAtOrAfter([]byte(`[{"archives":[]}]`), runStart), "no archives")
+	assert.False(t, newestArchiveAtOrAfter([]byte("not json"), runStart))
+	assert.True(t, newestArchiveAtOrAfter([]byte(fmt.Sprintf(`[{"archives":[{"time":%q}]}]`,
+		runStart.Add(time.Second).Format("2006-01-02T15:04:05"))), runStart), "falls back to time field and the no-microseconds layout")
+}

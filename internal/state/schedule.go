@@ -37,11 +37,36 @@ type RunOutcome struct {
 	// Archive is the archive name borg reported creating, when observed.
 	Archive string `json:"archive,omitempty"`
 	// Create stats from borgmatic's create --json result (zero when the
-	// run had no create action or no result was parsed).
+	// run had no create action or no result was parsed). Group-level fields
+	// are the first repository's, representative of the dataset size.
 	Files             int64 `json:"files,omitempty"`
 	OriginalBytes     int64 `json:"original_bytes,omitempty"`
 	CompressedBytes   int64 `json:"compressed_bytes,omitempty"`
 	DeduplicatedBytes int64 `json:"deduplicated_bytes,omitempty"`
+	// Repositories carries the per-repository breakdown of this run: a
+	// fan-out to several repos can have one fail while the others succeed.
+	Repositories []RepoOutcome `json:"repositories,omitempty"`
+}
+
+// RepoOutcome is one repository's result within a run. ID is borgmatic's
+// repository label when set, else the configured path.
+type RepoOutcome struct {
+	ID                string `json:"id"`
+	Path              string `json:"path,omitempty"`
+	Result            string `json:"result"` // ok | failed | terminated
+	Files             int64  `json:"files,omitempty"`
+	OriginalBytes     int64  `json:"original_bytes,omitempty"`
+	CompressedBytes   int64  `json:"compressed_bytes,omitempty"`
+	DeduplicatedBytes int64  `json:"deduplicated_bytes,omitempty"`
+	DurationSeconds   int64  `json:"duration_seconds,omitempty"`
+}
+
+// RepoRecord persists a repository's last outcome and last success across runs,
+// so per-repository staleness survives a run where that repo failed but others
+// did not (the group-level LastSuccess would not advance in that case).
+type RepoRecord struct {
+	LastSuccess time.Time    `json:"last_success"`
+	LastRun     *RepoOutcome `json:"last_run,omitempty"`
 }
 
 // GroupRecord is one group's persisted schedule state.
@@ -58,6 +83,9 @@ type GroupRecord struct {
 	// History is a bounded, oldest-first ring of past outcomes (log tails
 	// stripped) for inspect. Capped at maxHistory.
 	History []RunOutcome `json:"history,omitempty"`
+	// Repositories holds per-repository last outcome and last success, keyed
+	// by repository ID (label or path), for fan-out monitoring.
+	Repositories map[string]RepoRecord `json:"repositories,omitempty"`
 	// MissingCycles counts consecutive absent cycles; a record survives two
 	// before pruning so a redeploy blip doesn't wipe schedules.
 	MissingCycles int `json:"missing_cycles,omitempty"`
@@ -282,8 +310,25 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 		rec := f.Groups[name]
 		rec.LastRun = &outcome
 
+		// Per-repository: advance each repo's last outcome, and its last
+		// success independently, so a repo that succeeds keeps its freshness
+		// even when a sibling repo fails and the group's LastSuccess stalls.
+		for _, ro := range outcome.Repositories {
+			if rec.Repositories == nil {
+				rec.Repositories = map[string]RepoRecord{}
+			}
+			rr := rec.Repositories[ro.ID]
+			roCopy := ro
+			rr.LastRun = &roCopy
+			if ro.Result == ResultOK {
+				rr.LastSuccess = outcome.Finished
+			}
+			rec.Repositories[ro.ID] = rr
+		}
+
 		slim := outcome
-		slim.LogTail = nil // history keeps stats, not logs, only LastRun carries the tail
+		slim.LogTail = nil      // history keeps stats, not logs, only LastRun carries the tail
+		slim.Repositories = nil // per-repo history lives in rec.Repositories, not per-outcome
 		rec.History = append(rec.History, slim)
 		if len(rec.History) > maxHistory {
 			rec.History = rec.History[len(rec.History)-maxHistory:]

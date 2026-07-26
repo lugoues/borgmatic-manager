@@ -223,12 +223,13 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 	}
 	defer releaseLocks()
 
-	return true, r.runGroup(ctx, groupName, meta.RunID)
+	return true, r.runGroup(ctx, groupName, meta)
 }
 
 // runGroup validates the group's generated config, then executes borgmatic.
-func (r *Runner) runGroup(ctx context.Context, groupName, runID string) error {
+func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) error {
 	configPath := filepath.Join(r.configDir, groupName+".yaml")
+	runID := meta.RunID
 
 	if err := r.validateConfig(ctx, groupName, configPath); err != nil {
 		return err
@@ -320,7 +321,7 @@ func (r *Runner) runGroup(ctx context.Context, groupName, runID string) error {
 	waitErr := cmd.Wait()
 	close(done)
 
-	return r.interpretResult(groupName, configPath, waitErr, run, time.Since(start), timedOut.Load())
+	return r.interpretResult(ctx, groupName, configPath, meta.Repositories, waitErr, run, start, time.Since(start), timedOut.Load())
 }
 
 // validateTimeout bounds 'borgmatic config validate', which runs while holding
@@ -404,7 +405,7 @@ func (r *Runner) recordValidationFailure(groupName string) {
 
 // interpretResult turns exit state into logs and an error. borgmatic exits 0
 // even with warnings (output-only), 1 on error, 143 on SIGTERM.
-func (r *Runner) interpretResult(groupName, configPath string, waitErr error, run *runState, duration time.Duration, timedOut bool) error {
+func (r *Runner) interpretResult(ctx context.Context, groupName, configPath string, repos []config.RepoRef, waitErr error, run *runState, start time.Time, duration time.Duration, timedOut bool) error {
 	warnings := run.warnings.Load()
 	exitCode := 0
 	if waitErr != nil {
@@ -420,7 +421,8 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 		}
 	}
 
-	record := func(result string) {
+	results := run.parseCreateResults()
+	record := func(result string, repoOutcomes []state.RepoOutcome) {
 		if r.recorder == nil {
 			return
 		}
@@ -436,33 +438,36 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 			outcome.LastError = run.firstError()
 		}
 		outcome.LogTail = run.logSnapshot()
-		if res := run.parseCreateResult(); res != nil {
-			outcome.Archive = res.Archive.Name
-			outcome.Files = res.Archive.Stats.NFiles
-			outcome.OriginalBytes = res.Archive.Stats.OriginalSize
-			outcome.CompressedBytes = res.Archive.Stats.CompressedSize
-			outcome.DeduplicatedBytes = res.Archive.Stats.DeduplicatedSize
+		if len(results) > 0 {
+			rep := results[0] // representative for group-level dataset size
+			outcome.Archive = rep.Archive.Name
+			outcome.Files = rep.Archive.Stats.NFiles
+			outcome.OriginalBytes = rep.Archive.Stats.OriginalSize
+			outcome.CompressedBytes = rep.Archive.Stats.CompressedSize
+			outcome.DeduplicatedBytes = rep.Archive.Stats.DeduplicatedSize
 		}
+		outcome.Repositories = repoOutcomes
 		r.recorder.RecordRun(groupName, outcome)
 	}
 
 	switch {
 	case exitCode == 0:
-		record(state.ResultOK)
+		record(state.ResultOK, perRepoSuccess(repos, results))
 		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode,
 			"warnings", warnings, "duration", duration.Round(time.Second).String())
 		return nil
 
 	// Our own run-timeout escalation: a deliberate stop, recorded as terminated.
+	// Per-repo state is left untouched: an interrupted run confirms nothing.
 	case timedOut && (exitCode == sigtermExit || exitCode == sigkillExit):
-		record(state.ResultTerminated)
+		record(state.ResultTerminated, nil)
 		r.logger.Warn("borgmatic timed out and was terminated", "group", groupName, "exit_code", exitCode,
 			"timeout", r.runTimeout, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s timed out after %s and was terminated", groupName, r.runTimeout)
 
 	// SIGINT/SIGTERM without a timeout: clean shutdown, expected, not a failure.
 	case exitCode == sigintExit || exitCode == sigtermExit:
-		record(state.ResultTerminated)
+		record(state.ResultTerminated, nil)
 		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
 			"duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)
@@ -470,13 +475,13 @@ func (r *Runner) interpretResult(groupName, configPath string, waitErr error, ru
 	// External SIGKILL (OOM killer, kill -9) counts as failed: "terminated"
 	// would hide the group from status's failed-groups alert.
 	case exitCode == sigkillExit:
-		record(state.ResultFailed)
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, run, start))
 		r.logger.Error("borgmatic killed (SIGKILL), likely the OOM killer or an external kill -9", "group", groupName,
 			"exit_code", exitCode, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s was killed (exit %d); not a manager timeout, check for OOM", groupName, exitCode)
 
 	default:
-		record(state.ResultFailed)
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, run, start))
 		if run.repoMissing.Load() {
 			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
 				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
@@ -501,6 +506,12 @@ type runState struct {
 	errMu    sync.Mutex
 	firstErr string
 
+	// errText accumulates full CRITICAL/ERROR message bodies (untruncated, bounded
+	// count) so per-repository failure attribution can find which destination a
+	// failure names. Guarded.
+	errTextMu sync.Mutex
+	errText   []string
+
 	// logTail is a bounded, oldest-first tail of log lines for inspect; guarded.
 	logMu   sync.Mutex
 	logTail []string
@@ -524,23 +535,278 @@ func (rs *runState) bufferResult(line string) {
 	}
 }
 
-// createResult mirrors one repository entry of create --json output; the first
-// entry is representative across repositories.
+// refID is a repository's stable identity: its label when set, else its path.
+func refID(ref config.RepoRef) string {
+	if ref.Label != "" {
+		return ref.Label
+	}
+	return ref.Path
+}
+
+// indexResults keys create results by reported location and label, so a repo is
+// matched even when the configured path differs from borg's resolved location.
+func indexResults(results []createResult) map[string]createResult {
+	byKey := make(map[string]createResult, 2*len(results))
+	for _, res := range results {
+		if res.Repository.Location != "" {
+			byKey["path:"+res.Repository.Location] = res
+		}
+		if res.Repository.Label != "" {
+			byKey["label:"+res.Repository.Label] = res
+		}
+	}
+	return byKey
+}
+
+// applyStats copies a create result's archive stats onto a repo outcome.
+func applyStats(ro *state.RepoOutcome, res createResult) {
+	ro.Files = res.Archive.Stats.NFiles
+	ro.OriginalBytes = res.Archive.Stats.OriginalSize
+	ro.CompressedBytes = res.Archive.Stats.CompressedSize
+	ro.DeduplicatedBytes = res.Archive.Stats.DeduplicatedSize
+	ro.DurationSeconds = int64(res.Archive.Duration)
+}
+
+// perRepoSuccess builds per-repository outcomes for a fully-successful group
+// run: every configured repository backed up. Those with a create result carry
+// its stats; a repo without one (a prune/check-only cycle) is still ok, sans stats.
+func perRepoSuccess(configured []config.RepoRef, results []createResult) []state.RepoOutcome {
+	if len(configured) == 0 {
+		return nil
+	}
+	byKey := indexResults(results)
+	out := make([]state.RepoOutcome, 0, len(configured))
+	for _, ref := range configured {
+		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultOK}
+		res, ok := byKey["path:"+ref.Path]
+		if !ok && ref.Label != "" {
+			res, ok = byKey["label:"+ref.Label]
+		}
+		if ok {
+			applyStats(&ro, res)
+		}
+		out = append(out, ro)
+	}
+	return out
+}
+
+// perRepoFailure builds per-repository outcomes for a failed group run.
+// borgmatic suppresses create --json entirely when any repository fails, so
+// there is no positive per-repo signal in its output. It does, however, name
+// the failing repository in an error record, and it soft-fails past a broken
+// repo to run the rest to completion. So: a repo named in an error failed
+// outright; an unimplicated repo is ambiguous (it may have succeeded, or the run
+// may have aborted before any repo ran, e.g. a failing pre-backup hook) and is
+// confirmed by probing for a fresh archive. A repo that can be neither implicated
+// nor confirmed is left out (nil), so its persisted last-success is untouched
+// rather than falsely advanced or failed.
+func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configured []config.RepoRef, run *runState, runStart time.Time) []state.RepoOutcome {
+	if len(configured) == 0 {
+		return nil
+	}
+	errText := run.errorMessages()
+	out := make([]state.RepoOutcome, 0, len(configured))
+	for _, ref := range configured {
+		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultFailed}
+		switch {
+		case ref.Path != "" && mentionedInErrors(ref.Path, errText):
+			// This destination is named in an error: it failed. No probe, and
+			// crucially no probe against a likely-unreachable repo.
+		case r.confirmRepoSucceeded(ctx, configPath, ref.Path, runStart):
+			ro.Result = state.ResultOK
+		default:
+			// Neither implicated nor confirmed (probe skipped on shutdown, or
+			// no fresh archive): leave this repo's stored state untouched.
+			continue
+		}
+		out = append(out, ro)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// mentionedInErrors reports whether repoPath appears as a path token in any
+// error message, boundary-checked so "/data" does not match "/data2" or
+// "/srv/data".
+func mentionedInErrors(repoPath string, errText []string) bool {
+	for _, msg := range errText {
+		if containsPathToken(msg, repoPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsPathToken reports whether path occurs in msg as a whole path, not as a
+// fragment of a longer name. A name-continuation byte (alphanumeric, '.', '-',
+// '_') on either side means the match is a fragment ("/data" inside "/data2")
+// and is rejected. A path separator ('/', ':') after the match is a valid
+// boundary, so a repo path is still matched when the message names a child of it
+// (a lock file "<repo>/lock.exclusive" or an archive "<repo>::name").
+func containsPathToken(msg, path string) bool {
+	for idx := 0; ; {
+		i := strings.Index(msg[idx:], path)
+		if i < 0 {
+			return false
+		}
+		start := idx + i
+		end := start + len(path)
+		beforeOK := start == 0 || !isNameByte(msg[start-1])
+		afterOK := end >= len(msg) || !isNameByte(msg[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		idx = start + 1
+	}
+}
+
+// isNameByte reports whether b can continue a single path-name component. '/'
+// and ':' are excluded: they separate components, so they end a path token.
+func isNameByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '.' || b == '-' || b == '_':
+		return true
+	default:
+		return false
+	}
+}
+
+// probeTimeout bounds a single per-repository confirmation list: an unreachable
+// destination must not stall the failure path.
+const probeTimeout = 60 * time.Second
+
+// probeSkew tolerates clock resolution between the manager's run-start stamp and
+// borg's recorded archive time.
+const probeSkew = 5 * time.Second
+
+// confirmRepoSucceeded reports whether repoPath holds an archive created at or
+// after runStart, the definitive per-repository success signal when create
+// --json is suppressed by a group failure. Any uncertainty (shutdown in
+// progress, unreachable repo, probe error, no fresh archive) returns false: the
+// caller then leaves the repo's stored state untouched rather than crediting it.
+func (r *Runner) confirmRepoSucceeded(ctx context.Context, configPath, repoPath string, runStart time.Time) bool {
+	if repoPath == "" || ctx.Err() != nil {
+		return false
+	}
+	out, ok := r.runProbe(ctx, configPath, repoPath)
+	if !ok {
+		return false
+	}
+	return newestArchiveAtOrAfter(out, runStart)
+}
+
+// runProbe runs 'borgmatic list --repository <path> --last 1 --json', enforcing
+// probeTimeout itself (the exec seam does not bind ctx), and returns the raw
+// stdout. ok is false on any start/timeout/exit error.
+func (r *Runner) runProbe(ctx context.Context, configPath, repoPath string) ([]byte, bool) {
+	cmd := r.execCommand(ctx, r.borgmaticPath,
+		"--config", configPath, "list", "--repository", repoPath, "--json", "--last", "1")
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = io.Discard
+
+	if err := cmd.Start(); err != nil {
+		r.logger.Warn("cannot start per-repository confirmation probe; treating repo as failed",
+			"repo", repoPath, "error", err)
+		return nil, false
+	}
+	exited := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = cmd.Wait(); close(exited) }()
+
+	timer := time.NewTimer(probeTimeout)
+	defer timer.Stop()
+	select {
+	case <-exited:
+	case <-ctx.Done():
+		r.terminateGroup(cmd, exited, "probe:"+repoPath)
+		<-exited
+		return nil, false
+	case <-timer.C:
+		r.logger.Warn("per-repository confirmation probe timed out; treating repo as failed",
+			"repo", repoPath, "timeout", probeTimeout)
+		r.terminateGroup(cmd, exited, "probe:"+repoPath)
+		<-exited
+		return nil, false
+	}
+	if waitErr != nil {
+		return nil, false
+	}
+	return out.Bytes(), true
+}
+
+// listResult mirrors one repository entry of borgmatic list --json.
+type listResult struct {
+	Archives []struct {
+		Start string `json:"start"`
+		Time  string `json:"time"`
+	} `json:"archives"`
+}
+
+// borgTimeLayouts are the local-time formats borg emits in list --json
+// (microseconds optional).
+var borgTimeLayouts = []string{"2006-01-02T15:04:05.000000", "2006-01-02T15:04:05"}
+
+// newestArchiveAtOrAfter reports whether any archive in the list result started
+// at or after runStart (minus a small skew), meaning this cycle produced it.
+func newestArchiveAtOrAfter(raw []byte, runStart time.Time) bool {
+	var results []listResult
+	if err := json.Unmarshal(raw, &results); err != nil {
+		return false
+	}
+	cutoff := runStart.Add(-probeSkew)
+	for _, res := range results {
+		for _, a := range res.Archives {
+			ts := a.Start
+			if ts == "" {
+				ts = a.Time
+			}
+			for _, layout := range borgTimeLayouts {
+				t, err := time.ParseInLocation(layout, ts, time.Local)
+				if err != nil {
+					continue
+				}
+				if !t.Before(cutoff) {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
+
+// createResult mirrors one repository entry of create --json output. The first
+// entry is representative for group-level dataset size; the full list drives
+// per-repository outcomes.
 type createResult struct {
 	Archive struct {
-		Name  string `json:"name"`
-		Stats struct {
+		Name     string  `json:"name"`
+		Duration float64 `json:"duration"`
+		Stats    struct {
 			NFiles           int64 `json:"nfiles"`
 			OriginalSize     int64 `json:"original_size"`
 			CompressedSize   int64 `json:"compressed_size"`
 			DeduplicatedSize int64 `json:"deduplicated_size"`
 		} `json:"stats"`
 	} `json:"archive"`
+	Repository struct {
+		Location string `json:"location"`
+		Label    string `json:"label"`
+	} `json:"repository"`
 }
 
-// parseCreateResult stream-decodes buffered stdout (the result can arrive
-// concatenated with log records) and returns the first create result.
-func (rs *runState) parseCreateResult() *createResult {
+// parseCreateResults stream-decodes buffered stdout (the result can arrive
+// concatenated with log records) and returns every repository's create result.
+func (rs *runState) parseCreateResults() []createResult {
 	rs.archiveMu.Lock()
 	raw := rs.resultBuf.String()
 	rs.archiveMu.Unlock()
@@ -553,7 +819,7 @@ func (rs *runState) parseCreateResult() *createResult {
 		}
 		var results []createResult
 		if err := json.Unmarshal(doc, &results); err == nil && len(results) > 0 && results[0].Archive.Name != "" {
-			return &results[0]
+			return results
 		}
 	}
 }
@@ -590,6 +856,33 @@ func (rs *runState) firstError() string {
 	rs.errMu.Lock()
 	defer rs.errMu.Unlock()
 	return rs.firstErr
+}
+
+// maxErrText bounds how many error bodies are kept for repo attribution; a
+// failing run names its repo early, so a modest cap suffices under log spam.
+const maxErrText = 500
+
+// recordErrorText keeps the full (untruncated) error body: a repo path can sit
+// past the reason-truncation point, so path matching needs the whole message.
+func (rs *runState) recordErrorText(msg string) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	rs.errTextMu.Lock()
+	defer rs.errTextMu.Unlock()
+	if len(rs.errText) >= maxErrText {
+		return
+	}
+	rs.errText = append(rs.errText, msg)
+}
+
+func (rs *runState) errorMessages() []string {
+	rs.errTextMu.Lock()
+	defer rs.errTextMu.Unlock()
+	out := make([]string, len(rs.errText))
+	copy(out, rs.errText)
+	return out
 }
 
 // maxLogTail bounds lines kept for inspect; the full log lives in the journal.
@@ -666,6 +959,7 @@ func (rs *runState) emit(line, stream string) {
 		switch rec.Levelname {
 		case "CRITICAL", "ERROR":
 			rs.recordError(rec.Message)
+			rs.recordErrorText(rec.Message)
 			rs.recordLine(rec.Levelname, rec.Message)
 			rs.logger.Error(rec.Message, "group", rs.group, "source", rec.Name)
 		case "WARNING":
