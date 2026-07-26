@@ -1182,14 +1182,25 @@ const (
 // could not tell" as "nothing there".
 func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archive, archivePath string) (bool, error) {
 	// borg's --json-lines emits one object per file, so a volume with millions
-	// of them would be a multi-gigabyte buffer. Stream it: one entry is the
-	// whole answer, and memory stays flat regardless of archive size.
+	// of them would be a multi-gigabyte buffer. Stream it instead: memory stays
+	// flat regardless of archive size.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// #nosec G204 -- resolved borgmatic binary, read-only list over computed args
 	cmd := exec.CommandContext(ctx, borgmaticPath,
 		"--config", configPath, "list", "--archive", archive, "--path", archivePath, "--json")
+	// Own process group, and cancel kills the group rather than just the leader:
+	// borgmatic spawns borg, which inherits these pipes. Wait does not return
+	// until every writer has closed them, so killing only borgmatic would hang
+	// on a borg still holding them open. Same reason the runner's probes do this.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return false, err
@@ -1200,27 +1211,29 @@ func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archiv
 		return false, err
 	}
 
+	// Read to the end even once an entry is found. The scanner discards each
+	// line as it goes, so memory stays flat either way, and draining is what
+	// makes borgmatic's exit status meaningful: a listing that dies partway
+	// through (archive corruption, a dropped connection, a later repository
+	// failing) must not be read as a clean confirmation, or the caller empties
+	// the volume and then hits the same failure during the extract.
 	found := false
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxListLineBytes)
 	for scanner.Scan() {
-		if isArchiveEntryLine(scanner.Bytes()) {
+		if !found && isArchiveEntryLine(scanner.Bytes()) {
 			found = true
-			break
 		}
 	}
 	scanErr := scanner.Err()
 
-	if found {
-		// The answer is settled. Kill the listing rather than walk an archive
-		// that may hold millions more entries; its exit status is moot now,
-		// because a valid entry is itself the proof.
+	if scanErr != nil {
+		// Nothing is reading stdout now. borgmatic would block forever on a
+		// full pipe, and Wait with it, so stop the process before waiting.
 		cancel()
-		_ = cmd.Wait()
-		return true, nil
 	}
-
 	waitErr := cmd.Wait()
+
 	// A truncated or unreadable stream is "cannot tell", never "nothing there":
 	// the caller must refuse to wipe rather than act on a half-read listing.
 	if scanErr != nil {
@@ -1232,7 +1245,7 @@ func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archiv
 		}
 		return false, waitErr
 	}
-	return false, nil
+	return found, nil
 }
 
 // isArchiveEntryLine reports whether a line is one of borg's --json-lines

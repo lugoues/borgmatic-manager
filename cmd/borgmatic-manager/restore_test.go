@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -105,16 +106,65 @@ func TestArchivePathPopulatedReportsBannerOnlyAsEmpty(t *testing.T) {
 }
 
 // borg emits one JSON line per file, so an archive holding millions of them
-// would be gigabytes if buffered. One entry settles the question, so the probe
-// stops there instead of reading the rest.
-func TestArchivePathPopulatedStopsAtFirstEntry(t *testing.T) {
+// would be gigabytes if buffered. Streaming keeps memory flat: this listing is
+// far larger than any buffer the probe is allowed to hold.
+func TestArchivePathPopulatedStreamsALargeListing(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
-	// An emitter that never ends. Buffering it would hang forever and grow
-	// without bound, so simply returning is the proof that it streams and stops.
+	// ~200k entries, several tens of MB, emitted without ever being retained.
 	script := "#!/bin/sh\n" +
 		"echo '/srv/repo: Listing archive host-1'\n" +
-		"while :; do echo '{\"type\": \"-\", \"path\": \"myvol/_data/f\"}' || exit 0; done\n"
+		"i=0\n" +
+		"while [ $i -lt 200000 ]; do\n" +
+		"  echo '{\"type\": \"-\", \"path\": \"myvol/_data/some/reasonably/long/file/name\"}'\n" +
+		"  i=$((i+1))\n" +
+		"done\n"
+	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	runtime.ReadMemStats(&after)
+
+	require.NoError(t, err)
+	assert.True(t, found)
+	growth := after.TotalAlloc - before.TotalAlloc
+	assert.Less(t, growth, uint64(32<<20),
+		"the listing must be streamed, not accumulated (allocated %d bytes)", growth)
+}
+
+// An entry proves the path is there, but a listing that dies partway through
+// proves nothing about the extract that follows. Draining to the end is what
+// makes the exit status meaningful, so a late failure still refuses the wipe.
+func TestArchivePathPopulatedFailsWhenListingDiesAfterAnEntry(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	script := "#!/bin/sh\n" +
+		"echo '/srv/repo: Listing archive host-1'\n" +
+		"echo '{\"type\": \"-\", \"path\": \"myvol/_data/file.txt\"}'\n" +
+		"echo 'Data integrity error: chunk id mismatch' >&2\n" +
+		"exit 2\n"
+	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
+
+	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	require.Error(t, err, "an entry seen before a failure is not a confirmation")
+	assert.False(t, found)
+	assert.Contains(t, err.Error(), "chunk id mismatch", "the cause reaches the operator")
+}
+
+// A stream that cannot be read through is "cannot tell", never "nothing there":
+// reporting absent would let the caller empty the volume. It must also not hang:
+// once the scanner stops reading, a still-writing borgmatic would block on a
+// full pipe and take Wait down with it.
+func TestArchivePathPopulatedErrorsOnUnreadableStreamWithoutHanging(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	// An over-long line the scanner must reject, followed by far more output
+	// than a pipe buffer holds, so a missing cancel deadlocks instead of failing.
+	script := "#!/bin/sh\nprintf '{'\nhead -c " + strconv.Itoa(maxListLineBytes+1024) +
+		" /dev/zero | tr '\\000' 'a'\nprintf '\\n'\n" +
+		"head -c " + strconv.Itoa(8<<20) + " /dev/zero | tr '\\000' 'b'\n"
 	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
 
 	type result struct {
@@ -129,26 +179,11 @@ func TestArchivePathPopulatedStopsAtFirstEntry(t *testing.T) {
 
 	select {
 	case got := <-done:
-		require.NoError(t, got.err)
-		assert.True(t, got.found, "the first entry settles it")
+		require.Error(t, got.err, "a truncated listing must not read as an empty one")
+		assert.False(t, got.found)
 	case <-time.After(30 * time.Second):
-		t.Fatal("probe did not stop at the first entry; it drained an unbounded listing")
+		t.Fatal("probe hung: it stopped reading stdout but waited on a process still writing to it")
 	}
-}
-
-// A stream that cannot be read through is "cannot tell", never "nothing there":
-// reporting absent would let the caller empty the volume.
-func TestArchivePathPopulatedErrorsOnUnreadableStream(t *testing.T) {
-	dir := t.TempDir()
-	stub := filepath.Join(dir, "borgmatic")
-	// One entry-looking line past the scanner's cap, and no valid entry at all.
-	script := "#!/bin/sh\nprintf '{'\nhead -c " + strconv.Itoa(maxListLineBytes+1024) +
-		" /dev/zero | tr '\\000' 'a'\nprintf '\\n'\n"
-	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
-
-	found, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
-	require.Error(t, err, "a truncated listing must not read as an empty one")
-	assert.False(t, found)
 }
 
 // The probe passes the extract's own --archive/--path pair, so a true answer
