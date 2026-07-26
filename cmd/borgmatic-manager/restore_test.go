@@ -221,7 +221,7 @@ func TestEmptyVolumeDataRefusesNonVolumePaths(t *testing.T) {
 	dir := t.TempDir() // no "/volumes/" component
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "keep"), []byte("x"), 0o600))
 
-	err := emptyVolumeData(dir)
+	err := emptyVolumeData(dir, dir)
 	require.Error(t, err, "a path that is not a container volume must be refused")
 	assert.Contains(t, err.Error(), "not a recognizable container volume")
 	_, statErr := os.Stat(filepath.Join(dir, "keep"))
@@ -235,7 +235,7 @@ func TestEmptyVolumeDataClearsContentsKeepsDir(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(data, "a.txt"), []byte("a"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(data, "sub", "b.txt"), []byte("b"), 0o600))
 
-	require.NoError(t, emptyVolumeData(data))
+	require.NoError(t, emptyVolumeData(data, data))
 
 	entries, err := os.ReadDir(data)
 	require.NoError(t, err)

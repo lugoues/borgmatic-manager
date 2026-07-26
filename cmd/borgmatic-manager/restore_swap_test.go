@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,7 +170,7 @@ func TestCreateStagingLikeCarriesARealSELinuxLabel(t *testing.T) {
 	}
 
 	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	require.NoError(t, createStagingLike(staging, model))
+	require.NoError(t, createStagingLike(staging, model, quietLogger()))
 
 	got, present, err := readSELinuxContext(staging)
 	require.NoError(t, err)
@@ -193,7 +195,7 @@ func TestCreateStagingLikeRefusesWhenTheLabelCannotBeApplied(t *testing.T) {
 	defer restore()
 
 	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	err := createStagingLike(staging, model)
+	err := createStagingLike(staging, model, quietLogger())
 
 	require.Error(t, err, "an unappliable label must stop the restore, not be ignored")
 	require.ErrorIs(t, err, unix.EPERM)
@@ -213,7 +215,7 @@ func TestCreateStagingLikeProceedsWithoutALabel(t *testing.T) {
 	restore := stubXattr(t, nil, unix.EPERM)
 	defer restore()
 
-	assert.NoError(t, createStagingLike(filepath.Join(dir, "_data"+stagingSuffix), model))
+	assert.NoError(t, createStagingLike(filepath.Join(dir, "_data"+stagingSuffix), model, quietLogger()))
 }
 
 // The special bits carry semantics a volume can depend on: setgid decides
@@ -228,7 +230,7 @@ func TestCreateStagingLikePreservesSpecialModeBits(t *testing.T) {
 	require.NotZero(t, before.Mode()&os.ModeSetgid, "precondition: setgid is set")
 
 	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	require.NoError(t, createStagingLike(staging, model))
+	require.NoError(t, createStagingLike(staging, model, quietLogger()))
 
 	after, err := os.Stat(staging)
 	require.NoError(t, err)
@@ -359,7 +361,7 @@ func TestCreateStagingLikeCopiesPOSIXACLs(t *testing.T) {
 	require.NoError(t, unix.Lsetxattr(model, "system.posix_acl_default", dflt, 0))
 
 	staging := filepath.Join(dir, "_data"+stagingSuffix)
-	require.NoError(t, createStagingLike(staging, model))
+	require.NoError(t, createStagingLike(staging, model, quietLogger()))
 
 	for attr, want := range map[string][]byte{
 		"system.posix_acl_access":  access,
@@ -374,15 +376,38 @@ func TestCreateStagingLikeCopiesPOSIXACLs(t *testing.T) {
 
 // stubXattr makes the model directory appear to carry present, and makes every
 // attempt to write an attribute fail with writeErr. Returns a restore func.
+//
+// Enumeration reports nothing, so these tests stay about the security metadata
+// they are checking: on a real SELinux host the model would otherwise come back
+// carrying a label this stub never accounted for.
 func stubXattr(t *testing.T, present map[string][]byte, writeErr error) func() {
 	t.Helper()
-	realRead, realWrite := readXattrFn, setXattr
-	readXattrFn = func(path, attr string) ([]byte, bool, error) {
-		v, ok := present[attr]
-		return v, ok, nil
-	}
-	setXattr = func(string, string, []byte, int) error { return writeErr }
-	return func() { readXattrFn, setXattr = realRead, realWrite }
+	return swapXattrSeams(t,
+		func(string) ([]string, error) { return nil, nil },
+		func(_, attr string) ([]byte, bool, error) {
+			v, ok := present[attr]
+			return v, ok, nil
+		},
+		func(string, string, []byte, int) error { return writeErr })
+}
+
+// swapXattrSeams replaces all three extended-attribute seams for one test.
+func swapXattrSeams(t *testing.T,
+	list func(string) ([]string, error),
+	read func(string, string) ([]byte, bool, error),
+	set func(string, string, []byte, int) error,
+) func() {
+	t.Helper()
+	realList, realRead, realWrite := listXattrsFn, readXattrFn, setXattr
+	listXattrsFn, readXattrFn, setXattr = list, read, set
+	return func() { listXattrsFn, readXattrFn, setXattr = realList, realRead, realWrite }
+}
+
+// capturedWarnLogger returns a logger writing into the returned buffer, for
+// asserting on a warning that is the whole point of a code path.
+func capturedWarnLogger() (*bytes.Buffer, *slog.Logger) {
+	buf := &bytes.Buffer{}
+	return buf, slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }
 
 // The extract can run for a long time, and a container started meanwhile has
@@ -402,26 +427,92 @@ func TestRestoreWithSwapAbortsIfTheVolumeBecameLiveDuringTheExtract(t *testing.T
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "the live data was not swapped")
 }
 
-// A named pipe in the archive would block a read-only open forever, and
-// borgmatic has already exited by then, so the restore would hang just before
-// the swap. Only regular files and directories are opened.
-func TestSyncTreeSkipsFIFOs(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "regular.txt"), []byte("x"), 0o644))
-	require.NoError(t, os.Mkdir(filepath.Join(dir, "sub"), 0o755))
-	if err := unix.Mkfifo(filepath.Join(dir, "pipe"), 0o644); err != nil {
-		t.Skipf("cannot create a FIFO here: %v", err)
+// The flush must not depend on being able to open what was extracted. A
+// mode-000 file is readable by root but not by the unprivileged user a rootless
+// Podman restore runs as, and a named pipe blocks a read-only open until a
+// writer appears, which never happens once borgmatic has exited. Both used to
+// be reachable from an ordinary archive.
+func TestRestoreWithSwapFlushesAnUnopenableTree(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the permission check this test is about")
 	}
+	data := liveVolume(t)
+
+	err := restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		if writeErr := os.WriteFile(filepath.Join(dest, "unreadable"), []byte("x"), 0o000); writeErr != nil {
+			return writeErr
+		}
+		return unix.Mkfifo(filepath.Join(dest, "pipe"), 0o644)
+	}, nil)
+
+	require.NoError(t, err, "an archive this process cannot open must still restore")
+	assert.FileExists(t, filepath.Join(data, "unreadable"))
+}
+
+// A FIFO would hang the restore rather than fail it, so the timeout is the
+// assertion.
+func TestRestoreWithSwapDoesNotBlockOnAFIFO(t *testing.T) {
+	data := liveVolume(t)
 
 	done := make(chan error, 1)
-	go func() { done <- syncTree(dir) }()
+	go func() {
+		done <- restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+			return unix.Mkfifo(filepath.Join(dest, "pipe"), 0o644)
+		}, nil)
+	}()
 
 	select {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(20 * time.Second):
-		t.Fatal("syncTree blocked, almost certainly opening the FIFO and waiting for a writer")
+		t.Fatal("the restore blocked, almost certainly opening the FIFO and waiting for a writer")
 	}
+}
+
+// The staged swap builds a new directory, so anything the live one carried that
+// is not copied across is lost. The security metadata has its own handling; this
+// covers everything else.
+func TestCreateStagingLikeCopiesOtherExtendedAttributes(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+	staging := model + stagingSuffix
+
+	if err := unix.Lsetxattr(model, "user.app.role", []byte("primary"), 0); err != nil {
+		t.Skipf("this filesystem cannot hold a user xattr: %v", err)
+	}
+
+	require.NoError(t, createStagingLike(staging, model, quietLogger()))
+
+	value, present, err := readXattr(staging, "user.app.role")
+	require.NoError(t, err)
+	require.True(t, present, "the attribute the volume carried was dropped")
+	assert.Equal(t, "primary", string(value))
+}
+
+// An attribute this process is not allowed to write is worth a warning, not a
+// refusal to restore: the operator may not know it is there, and failing leaves
+// them with no way to restore the volume at all.
+func TestCreateStagingLikeWarnsRatherThanFailsOnAnUnwritableAttribute(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+	staging := model + stagingSuffix
+
+	restore := swapXattrSeams(t,
+		func(string) ([]string, error) { return []string{"trusted.pinned"}, nil },
+		func(_, attr string) ([]byte, bool, error) { return []byte("v"), attr == "trusted.pinned", nil },
+		func(_, attr string, _ []byte, _ int) error {
+			if attr == "trusted.pinned" {
+				return unix.EPERM
+			}
+			return nil
+		})
+	defer restore()
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, createStagingLike(staging, model, logger))
+	assert.Contains(t, logs.String(), "trusted.pinned")
 }
 
 // A completed extract can represent hours of work. When the safety recheck
@@ -536,4 +627,60 @@ func TestRestoreWithSwapLeavesNoStagingWhenSetupFailsPartway(t *testing.T) {
 	require.Error(t, err)
 	assert.NoDirExists(t, data+stagingSuffix, "a half-built staging directory must not be left on disk")
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "and the volume is untouched")
+}
+
+// A volume whose _data is a symlink is resolved so the swap replaces the real
+// directory rather than the link. When the backing directory is renamed and the
+// process dies before the second rename, the link is left dangling, and
+// EvalSymlinks cannot resolve it at all: recovery has to find the displaced
+// copy beside the directory the link names, not beside the link.
+func TestResolveVolumeDataResolvesThroughADanglingLink(t *testing.T) {
+	root := t.TempDir()
+	backing := filepath.Join(root, "backing")
+	require.NoError(t, os.Mkdir(backing, 0o755))
+	volume := filepath.Join(root, "volumes", "myvol")
+	require.NoError(t, os.MkdirAll(volume, 0o755))
+
+	data := filepath.Join(volume, "_data")
+	target := filepath.Join(backing, "v")
+	require.NoError(t, os.Mkdir(target, 0o755))
+	require.NoError(t, os.Symlink(target, data))
+
+	resolved, err := resolveVolumeData(data)
+	require.NoError(t, err)
+	assert.Equal(t, target, resolved, "an intact link resolves to what it names")
+
+	// The state an interrupted rename-pair swap leaves behind.
+	require.NoError(t, os.Rename(target, target+oldSuffix))
+	require.NoFileExists(t, target)
+
+	resolved, err = resolveVolumeData(data)
+	require.NoError(t, err, "a dangling final component is the state recovery exists to repair")
+	assert.Equal(t, target, resolved)
+
+	require.NoError(t, recoverInterruptedSwap(resolved, quietLogger()))
+	assert.DirExists(t, target, "the displaced backing directory was put back")
+	assert.NoDirExists(t, target+oldSuffix)
+}
+
+// The wipe guard asks whether this is a container volume. Resolving the
+// volume's own symlink must not answer no: the backing directory is legitimately
+// outside the volumes root, and refusing it makes such a volume impossible to
+// mirror-restore.
+func TestEmptyVolumeDataJudgesTheVolumeNotItsBackingDirectory(t *testing.T) {
+	root := t.TempDir()
+	backing := filepath.Join(root, "mnt", "v") // no "/volumes/" component
+	require.NoError(t, os.MkdirAll(backing, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(backing, "a.txt"), []byte("a"), 0o600))
+	identity := filepath.Join(root, "volumes", "myvol", "_data")
+
+	require.NoError(t, emptyVolumeData(backing, identity))
+
+	entries, err := os.ReadDir(backing)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "the backing directory was emptied")
+
+	err = emptyVolumeData(backing, filepath.Join(root, "elsewhere", "_data"))
+	require.Error(t, err, "a target that is not a container volume is still refused")
+	assert.Contains(t, err.Error(), "not a recognizable container volume")
 }
