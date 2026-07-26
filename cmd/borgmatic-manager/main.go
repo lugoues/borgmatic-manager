@@ -1097,26 +1097,61 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		logger.Warn("snapshotted the volume before restore; remove it once you have verified the restore", "snapshot", snap)
 	}
 
-	mode := "mirror"
-	if merge {
-		mode = "merge"
-	} else {
+	// extract runs borgmatic against a chosen destination. Strip
+	// "<sourceVolume>/_data" so files land directly in it, which is also what
+	// lets --into retarget a differently-named volume.
+	extract := func(destination string) error {
+		return runBorgmaticExtract(ctx, borgmaticPath, configPath, archive, plan.archivePath, destination)
+	}
+
+	// Mirror restores stage and swap, so the live data is never destroyed
+	// before its replacement exists on disk. Two cases cannot: --merge is
+	// additive and has nothing to replace, and --force means a container is
+	// running with this directory bind-mounted, which pins the inode a swap
+	// would move out from under it.
+	switch {
+	case merge:
+		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (merge)\n", group, volume, archive, plan.targetData)
+		if err := extract(plan.targetData); err != nil {
+			return err
+		}
+		logger.Info("restore complete", "path", plan.targetData)
+		return nil
+
+	case force && running:
+		logger.Warn("a running container has this volume mounted, so the restore writes in place: "+
+			"the data is replaced as borgmatic extracts, and a failure can leave it partially restored",
+			"path", plan.targetData)
+		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (in place, --force)\n", group, volume, archive, plan.targetData)
 		if wipeErr := emptyVolumeData(plan.targetData); wipeErr != nil {
 			return fmt.Errorf("emptying the target before a mirror restore: %w", wipeErr)
 		}
-		logger.Warn("emptied the target volume for a mirror restore", "path", plan.targetData)
+		if err := extract(plan.targetData); err != nil {
+			return err
+		}
+		logger.Info("restore complete", "path", plan.targetData)
+		return nil
+
+	default:
+		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (mirror, staged at %s)\n",
+			group, volume, archive, plan.targetData, stagingPathFor(plan.targetData))
+		return restoreWithSwap(plan.targetData, logger, extract)
 	}
+}
 
-	// Strip "<sourceVolume>/_data" so files land directly in the target's data
-	// dir, which lets --into retarget a differently-named volume.
-	argv := []string{borgmaticPath, "--config", configPath, "extract", "--archive", archive,
-		"--path", plan.archivePath, "--strip-components", "2", "--destination", plan.targetData}
-
-	fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (%s)\n", group, volume, archive, plan.targetData, mode)
-
-	// #nosec G204 -- deliberately exec'ing the resolved borgmatic binary with computed extract arguments
-	if err := syscall.Exec(borgmaticPath, argv, os.Environ()); err != nil {
-		return fmt.Errorf("executing borgmatic: %w", err)
+// runBorgmaticExtract runs the extract as a child rather than exec'ing it, so
+// there is an "after": the caller can check what landed and decide whether to
+// make it live. The child shares this process group, so a Ctrl-C at the
+// terminal reaches borgmatic exactly as it did when this exec'd, and borg
+// checkpoints on SIGINT.
+func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive, archivePath, destination string) error {
+	// #nosec G204 -- resolved borgmatic binary with computed extract arguments
+	cmd := exec.CommandContext(ctx, borgmaticPath,
+		"--config", configPath, "extract", "--archive", archive,
+		"--path", archivePath, "--strip-components", "2", "--destination", destination)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("borgmatic extract failed: %w", err)
 	}
 	return nil
 }

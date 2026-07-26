@@ -304,4 +304,14 @@ SURVIVED=$(docker run --rm -v e2e-data-a:/data alpine cat /data/file-a.txt 2>/de
 [ "$SURVIVED" = "e2e-data-a" ] \
   || fail "a refused restore emptied the volume anyway: got '$SURVIVED'"
 
+# A mirror restore stages into a sibling and swaps, so the live data is never
+# destroyed before its replacement exists. Neither scratch directory may outlive
+# the operation: a leftover one is a half-finished restore sitting on disk.
+log "restore-volume leaves no staging directories behind"
+VOLDIR=$(docker volume inspect e2e-data-a --format '{{.Mountpoint}}')
+VOLDIR=$(dirname "$VOLDIR")
+for leftover in "$VOLDIR"/_data.borgmatic-manager-restoring "$VOLDIR"/_data.borgmatic-manager-replaced; do
+  [ -e "$leftover" ] && fail "restore left $leftover behind"
+done
+
 echo "PASS: end-to-end backup flow succeeded"
