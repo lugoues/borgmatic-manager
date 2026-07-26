@@ -621,10 +621,15 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		return err
 	}
 
-	backupState, err := discovery.Discover(ctx, e.rt, logger)
+	// Merge the durable cache, exactly as the daemon does: an ad-hoc run must
+	// back up the same set the scheduler would, or a stopped container's volumes
+	// silently drop out of the archive and the recorded fingerprint disagrees
+	// with the daemon's, forcing a redundant cycle on its next wake.
+	backupState, offline, err := e.discoverMerged(ctx, logger)
 	if err != nil {
 		return err
 	}
+	stripOfflineDatabases(backupState, offline, logger)
 
 	// Generate into a private tmpfs directory, never the daemon's live configs
 	// dir: sharing it races the daemon (deleted configs, mismatched RunIDs that
@@ -790,6 +795,18 @@ func (e *env) discoverMerged(ctx context.Context, logger *slog.Logger) (*models.
 	return merged, offline, nil
 }
 
+// stripOfflineDatabases drops databases whose container is gone from a set about
+// to be backed up, mirroring what the scheduler does each cycle: a dump helper
+// cannot join a namespace that no longer exists. Volumes stay, so a partly
+// stopped group still backs up its files, and the last dump remains restorable
+// from prior archives.
+func stripOfflineDatabases(backupState *models.BackupState, offline *state.Offline, logger *slog.Logger) {
+	offline.StripUndumpableDatabases(backupState, func(group string, db models.DatabaseConfig) {
+		logger.Warn("skipping database dump: its container is offline (cannot join a namespace that is gone)",
+			"group", group, "database", db.Type+"/"+db.Name)
+	})
+}
+
 func runGenerate(output string) error {
 	logger := interactiveLogger()
 	ctx := context.Background()
@@ -804,13 +821,17 @@ func runGenerate(output string) error {
 		outDir = e.configsDir
 	}
 
-	state, err := discovery.Discover(ctx, e.rt, logger)
+	// Merged, not live-only: the default output dir is the daemon's live configs
+	// dir, so generating from a live-only set would overwrite them with configs
+	// missing every stopped container's volumes.
+	backupState, offline, err := e.discoverMerged(ctx, logger)
 	if err != nil {
 		return err
 	}
+	stripOfflineDatabases(backupState, offline, logger)
 
 	gen := e.newGenerator(outDir, logger)
-	meta, err := gen.Generate(state)
+	meta, err := gen.Generate(backupState)
 	if err != nil {
 		return err
 	}
