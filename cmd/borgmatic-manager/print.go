@@ -223,14 +223,14 @@ func plural(n int, noun string) string {
 // printStatus renders per-group schedule state. Refused groups are marked as
 // such instead of showing "due now" forever; in-flight runs show "running" with
 // elapsed time, flagged when past runTimeout.
-func printStatus(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline) {
+func printStatus(bs *models.BackupState, store *state.ScheduleStore, lockDir string, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline) {
 	// Trailing blank line keeps the table off the shell prompt.
 	defer fmt.Println()
 	now := time.Now()
 	fmt.Println()
 
 	// A group with a live pending record is mid-run.
-	running := runningGroups(store)
+	running := runningGroups(store, lockDir)
 
 	type row struct {
 		name, last, result, files, size, next string

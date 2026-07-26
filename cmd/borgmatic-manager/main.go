@@ -157,9 +157,9 @@ func runStatus(ctx context.Context, jsonOut bool) error {
 	}
 
 	if jsonOut {
-		return printStatusJSON(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
+		return printStatusJSON(backupState, stateStore(e, logger), e.locksDir(), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
 	}
-	printStatus(backupState, stateStore(e, logger), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
+	printStatus(backupState, stateStore(e, logger), e.locksDir(), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
 	return nil
 }
 
@@ -293,6 +293,10 @@ type env struct {
 	groupOverrides map[string]config.GroupOverride
 	rt             *runtime.DockerRuntime
 }
+
+// locksDir holds the per-run liveness locks the runner takes and the daemon
+// reaps against.
+func (e *env) locksDir() string { return filepath.Join(e.stateDir, "locks") }
 
 func loadEnv() (*env, error) {
 	e := &env{
@@ -491,12 +495,17 @@ func processAlive(pid int) bool {
 // its deferred ClearPending, and only the daemon reaps those at startup: an
 // ad-hoc run deliberately does not, since a daemon may be legitimately mid-run.
 // Without this filter such a record pins its group at "running" forever, hiding
-// the real due state. Records with no stamped PID (pre-PID binaries) stay
-// visible: they cannot be proven dead, and this is a display filter, not a reap.
-func runningGroups(store *state.ScheduleStore) map[string]time.Time {
+// the real due state.
+//
+// Liveness follows reapStalePendingRuns: the per-run advisory lock first (the
+// kernel drops it on crash, so it survives PID reuse across a reboot), and the
+// stamped PID only when no lock file exists. Every uncertainty keeps the record
+// visible, since this is a display filter and over-hiding would claim a live run
+// is not happening.
+func runningGroups(store *state.ScheduleStore, lockDir string) map[string]time.Time {
 	running := map[string]time.Time{}
-	for _, p := range store.PendingSnapshot() {
-		if p.PID != 0 && !processAlive(p.PID) {
+	for runID, p := range store.PendingSnapshot() {
+		if !pendingOwnerLive(lockDir, runID, p.PID) {
 			continue
 		}
 		if started, ok := running[p.Group]; !ok || p.Started.Before(started) {
@@ -504,6 +513,41 @@ func runningGroups(store *state.ScheduleStore) map[string]time.Time {
 		}
 	}
 	return running
+}
+
+// pendingOwnerLive reports whether a pending run's owner still exists, biased to
+// "live when unsure". A held lock proves the owner is alive; a lock we can take
+// proves it is gone regardless of what now holds its PID.
+func pendingOwnerLive(lockDir, runID string, pid int) bool {
+	if lockDir == "" {
+		// No lock dir to consult (tests, or an unset state dir): the stamped PID
+		// is all there is, and it cannot distinguish a recycled PID from the
+		// original owner.
+		return pid == 0 || processAlive(pid)
+	}
+
+	lockPath := runner.PendingLockPath(lockDir, runID)
+	if _, err := os.Stat(lockPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return true // cannot tell: keep showing the run
+		}
+		// No lock file (pre-lock binary, or the run died before acquiring one).
+		// No TryExclusive here: it would create a file the daemon's next sweep
+		// reads as present-unheld.
+		return pid == 0 || processAlive(pid)
+	}
+
+	lock, acquired, err := lockfile.TryExclusive(lockPath)
+	if err != nil {
+		return true // cannot probe (permissions, for one): keep showing the run
+	}
+	if !acquired {
+		return true // someone holds it: the owner is alive
+	}
+	// We took it, so the owner is gone. Release without removing the file:
+	// reaping the record and its lock is the daemon's job, not a status read.
+	lock.Release()
+	return false
 }
 
 func runDaemon() error {
@@ -529,7 +573,7 @@ func runDaemon() error {
 	gen := e.newGenerator(e.configsDir, slog.Default())
 	store := state.LoadSchedule(e.stateDir, slog.Default())
 	r := e.newRunner(slog.Default(), e.configsDir, pf.borgmaticPath, pf.runTimeout, store)
-	locksDir := filepath.Join(e.stateDir, "locks")
+	locksDir := e.locksDir()
 	reapStalePendingRuns(ctx, store, locksDir, e.reapRunHelpers)
 	sweepOrphanedPendingLocks(locksDir, store)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)

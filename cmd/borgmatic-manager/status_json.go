@@ -45,8 +45,8 @@ type statusRunning struct {
 	Stale bool `json:"stale"`
 }
 
-func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline, now time.Time) statusDoc {
-	running := runningGroups(store)
+func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, lockDir string, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline, now time.Time) statusDoc {
+	running := runningGroups(store, lockDir)
 
 	names := make([]string, 0, len(bs.Groups))
 	for name := range bs.Groups {
@@ -113,8 +113,8 @@ func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, period, 
 	return doc
 }
 
-func printStatusJSON(bs *models.BackupState, store *state.ScheduleStore, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline) error {
-	doc := buildStatusDoc(bs, store, period, runTimeout, filePeriods, refused, off, time.Now())
+func printStatusJSON(bs *models.BackupState, store *state.ScheduleStore, lockDir string, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline) error {
+	doc := buildStatusDoc(bs, store, lockDir, period, runTimeout, filePeriods, refused, off, time.Now())
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding status: %w", err)
