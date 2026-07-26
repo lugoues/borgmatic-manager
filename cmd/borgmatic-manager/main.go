@@ -1027,6 +1027,38 @@ func inPlaceReason(force, mounted, encrypted, unstageable bool, encryptionReason
 	return ""
 }
 
+// resolveInPlaceReason answers whether a restore has to write in place, probing
+// for a staging sibling only when nothing else has already decided.
+//
+// The probe creates a directory in the parent, and a merge, a forced restore, a
+// mount-backed volume or an encrypted one never needs one. Running it anyway let
+// a full or quota-exhausted parent abort a restore that would not have touched
+// that directory at all.
+func resolveInPlaceReason(merge, force, mounted, encrypted bool, encryptionReason, targetData string) (string, error) {
+	if reason := inPlaceReason(force, mounted, encrypted, false, encryptionReason); reason != "" {
+		return reason, nil
+	}
+	if merge {
+		return "", nil // additive, and never stages
+	}
+	// Staging is a sibling, so it needs to create an entry in the parent
+	// directory. The previous in-place restore only ever wrote inside _data, so a
+	// volume whose parent is not writable by this process was restorable before
+	// and would not be now. Noticed here rather than as an EACCES partway through.
+	stageable, err := canCreateSiblingFn(targetData)
+	if err != nil {
+		return "", err
+	}
+	if !stageable {
+		return inPlaceReason(false, false, false, true, ""), nil
+	}
+	return "", nil
+}
+
+// canCreateSiblingFn is the seam for the staging probe, so a test can tell
+// whether it was consulted at all.
+var canCreateSiblingFn = canCreateSibling
+
 // lockVolumeRestore takes an exclusive lock covering one volume's data
 // directory for the whole restore.
 //
@@ -1270,14 +1302,15 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return encErr
 	}
 
-	// Staging is a sibling, so it needs to create an entry in the parent
-	// directory. The previous in-place restore only ever wrote inside _data, so
-	// a volume whose parent is not writable by this process was restorable
-	// before and would not be now. Noticed here rather than as an EACCES partway
-	// through, and it is a "cannot stage" condition like the others.
-	stageable, stageErr := canCreateSibling(plan.targetData)
-	if stageErr != nil {
-		return stageErr
+	// What sends this restore in place, if anything does. Answered before the
+	// staging probe so the probe can be skipped entirely when the answer is
+	// already yes: it creates a directory in the parent, and a merge or a
+	// forced, mount-backed or encrypted restore never needs one. Probing anyway
+	// let a full or quota-exhausted parent abort a restore that would not have
+	// touched it.
+	inPlace, inPlaceErr := resolveInPlaceReason(merge, force, mounted, encrypted, encryptionReason, plan.targetData)
+	if inPlaceErr != nil {
+		return inPlaceErr
 	}
 
 	// Mirror restores stage and swap, so the live data is never destroyed
@@ -1315,9 +1348,8 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// restore. Staged and then aborting at the recheck would keep the promise
 	// only until a container actually started, which is the case the flag
 	// exists for, and would throw away a completed extract to do it.
-	case inPlaceReason(force, mounted, encrypted, !stageable, encryptionReason) != "":
-		logger.Warn(inPlaceReason(force, mounted, encrypted, !stageable, encryptionReason),
-			"path", plan.targetData, "parent", filepath.Dir(plan.targetData))
+	case inPlace != "":
+		logger.Warn(inPlace, "path", plan.targetData, "parent", filepath.Dir(plan.targetData))
 		// The in-place path empties before extracting, so it destroys on the
 		// same race the staged path aborts on. --force is an explicit "do it
 		// anyway" and keeps its meaning; a volume pushed onto this path by its
