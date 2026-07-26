@@ -13,7 +13,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 	"github.com/lugoues/borgmatic-manager/internal/models"
+	"github.com/lugoues/borgmatic-manager/internal/runner"
 	"github.com/lugoues/borgmatic-manager/internal/scheduler"
 	"github.com/lugoues/borgmatic-manager/internal/state"
 )
@@ -50,7 +52,7 @@ func TestDisplayBlocksArePaddedTopAndBottom(t *testing.T) {
 
 	for name, render := range map[string]func(){
 		"discover": func() { printGroups(bs, store, nil) },
-		"status":   func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) },
+		"status":   func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := captureStdout(t, render)
@@ -81,7 +83,7 @@ func TestStatusFailurePointsToInspect(t *testing.T) {
 		LastError: "Repository /mnt/repo does not exist.",
 	})
 
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) })
 
 	assert.Contains(t, out, "1 group failed")
 	assert.Contains(t, out, "demo", "the failing group must be named")
@@ -111,7 +113,7 @@ func TestStatusShowsRunningGroup(t *testing.T) {
 	// A pending record with no matching finished outcome: a run in flight.
 	store.RecordPending("run-1", "demo", time.Now().Add(-3*time.Minute))
 
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) })
 
 	assert.Contains(t, out, "running", "an in-flight group shows as running")
 	assert.Contains(t, out, "1 group running", "the header reflects the running count")
@@ -132,21 +134,29 @@ func deadPID(t *testing.T) int {
 	return pid
 }
 
-// recordDeadPending writes a pending record whose owner is gone, the state a
-// SIGKILLed run leaves behind: the deferred ClearPending never runs. It writes
-// schedule.json directly because RecordPending stamps the live test process.
-func recordDeadPending(t *testing.T, stateDir, runID, group string, started time.Time) {
+// recordPendingWithPID writes a pending record stamped with pid, bypassing
+// RecordPending, which always stamps the live test process.
+func recordPendingWithPID(t *testing.T, stateDir, runID, group string, started time.Time, pid int) {
 	t.Helper()
+	rec := map[string]any{"group": group, "started": started}
+	if pid != 0 {
+		rec["pid"] = pid
+	}
 	doc := map[string]any{
-		"version": 1,
-		"groups":  map[string]any{},
-		"pending_runs": map[string]any{
-			runID: map[string]any{"group": group, "started": started, "pid": deadPID(t)},
-		},
+		"version":      1,
+		"groups":       map[string]any{},
+		"pending_runs": map[string]any{runID: rec},
 	}
 	data, err := json.Marshal(doc)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(stateDir, "schedule.json"), data, 0o600))
+}
+
+// recordDeadPending writes a pending record whose owner is gone, the state a
+// SIGKILLed run leaves behind: the deferred ClearPending never runs.
+func recordDeadPending(t *testing.T, stateDir, runID, group string, started time.Time) {
+	t.Helper()
+	recordPendingWithPID(t, stateDir, runID, group, started, deadPID(t))
 }
 
 // A run killed outright (SIGKILL, OOM, power loss) never clears its pending
@@ -159,12 +169,12 @@ func TestStatusIgnoresPendingRunWhoseProcessIsGone(t *testing.T) {
 	recordDeadPending(t, dir, "run-1", "demo", time.Now().Add(-3*time.Minute))
 	store := state.LoadSchedule(dir, nil)
 
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) })
 
 	assert.NotContains(t, out, "running", "a dead owner's record is not an in-flight run")
 	assert.Contains(t, out, "due now", "and the group's real due state is visible again")
 
-	doc := buildStatusDoc(bs, store, time.Hour, 0, nil, nil, nil, time.Now())
+	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, nil, time.Now())
 	require.Len(t, doc.Groups, 1)
 	assert.Nil(t, doc.Groups[0].Running, "status --json agrees with the table")
 	require.NotNil(t, doc.Groups[0].Due)
@@ -181,9 +191,76 @@ func TestStatusKeepsPendingRunWithNoStampedPID(t *testing.T) {
 		time.Now().Add(-3*time.Minute).Format(time.RFC3339) + `"}}}`
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "schedule.json"), []byte(doc), 0o600))
 
-	out := captureStdout(t, func() { printStatus(bs, state.LoadSchedule(dir, nil), time.Hour, 0, nil, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, state.LoadSchedule(dir, nil), "", time.Hour, 0, nil, nil, nil) })
 
 	assert.Contains(t, out, "running", "unprovable liveness keeps the record visible")
+}
+
+// The PID alone cannot survive PID reuse: after a reboot the kernel hands low
+// PIDs straight back out, so a crashed run's stamped PID can name an unrelated
+// live process and pin the group at "running" again. The per-run advisory lock
+// is the authority, exactly as reapStalePendingRuns treats it: the kernel drops
+// it when the owner dies, so a lock we can take proves the owner is gone no
+// matter who holds its PID now.
+func TestStatusUsesLivenessLockNotPIDWhenPIDIsRecycled(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	dir := t.TempDir()
+	lockDir := filepath.Join(dir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o700))
+
+	// The crashed run's PID now names this very test process: alive, but not the
+	// owner. An unheld lock file is what the kernel leaves after the owner dies.
+	recordPendingWithPID(t, dir, "run-1", "demo", time.Now().Add(-3*time.Minute), os.Getpid())
+	require.NoError(t, os.WriteFile(runner.PendingLockPath(lockDir, "run-1"), nil, 0o600))
+	store := state.LoadSchedule(dir, nil)
+
+	out := captureStdout(t, func() { printStatus(bs, store, lockDir, time.Hour, 0, nil, nil, nil) })
+	assert.NotContains(t, out, "running", "an unheld liveness lock outranks a recycled PID")
+	assert.Contains(t, out, "due now")
+
+	doc := buildStatusDoc(bs, store, lockDir, time.Hour, 0, nil, nil, nil, time.Now())
+	require.Len(t, doc.Groups, 1)
+	assert.Nil(t, doc.Groups[0].Running, "status --json agrees with the table")
+}
+
+// The mirror image: a held lock keeps the run visible even though the record
+// carries no usable PID. Over-hiding would claim a live backup is not running.
+func TestStatusKeepsPendingRunWhoseLivenessLockIsHeld(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	dir := t.TempDir()
+	lockDir := filepath.Join(dir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o700))
+
+	recordPendingWithPID(t, dir, "run-1", "demo", time.Now().Add(-3*time.Minute), deadPID(t))
+	lock, acquired, err := lockfile.TryExclusive(runner.PendingLockPath(lockDir, "run-1"))
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer lock.Release()
+
+	out := captureStdout(t, func() { printStatus(bs, state.LoadSchedule(dir, nil), lockDir, time.Hour, 0, nil, nil, nil) })
+
+	assert.Contains(t, out, "running", "a held lock proves the owner is alive, whatever the PID says")
+}
+
+// A record whose lock file the owner never got to create falls back to the PID,
+// matching reapStalePendingRuns' handling of the same no-lock-file case.
+func TestStatusFallsBackToPIDWhenNoLivenessLockFile(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	dir := t.TempDir()
+	lockDir := filepath.Join(dir, "locks")
+	require.NoError(t, os.MkdirAll(lockDir, 0o700))
+	recordDeadPending(t, dir, "run-1", "demo", time.Now().Add(-3*time.Minute))
+
+	out := captureStdout(t, func() { printStatus(bs, state.LoadSchedule(dir, nil), lockDir, time.Hour, 0, nil, nil, nil) })
+
+	assert.NotContains(t, out, "running", "no lock file and a dead PID: the owner is gone")
+	// Probing must not mint the lock file: the daemon's sweep reads a
+	// present-unheld lock as a crashed run and would reap against it.
+	_, statErr := os.Stat(runner.PendingLockPath(lockDir, "run-1"))
+	assert.True(t, os.IsNotExist(statErr), "a status read never creates a liveness lock")
 }
 
 func TestStatusFlagsStaleRunningPastTimeout(t *testing.T) {
@@ -193,7 +270,7 @@ func TestStatusFlagsStaleRunningPastTimeout(t *testing.T) {
 	store.RecordPending("run-1", "demo", time.Now().Add(-2*time.Hour))
 
 	// run_timeout of 30m: a 2h "run" is past it and reads as suspect.
-	out := captureStdout(t, func() { printStatus(bs, store, time.Hour, 30*time.Minute, nil, nil, nil) })
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 30*time.Minute, nil, nil, nil) })
 
 	assert.Contains(t, out, "running?", "past run_timeout, a run is flagged as possibly stale")
 }
@@ -349,7 +426,7 @@ func TestBuildStatusDoc(t *testing.T) {
 	// "busy" is mid-run, started 5m ago, with a 1m run_timeout: stale.
 	store.RecordPending("run-1", "busy", now.Add(-5*time.Minute))
 
-	doc := buildStatusDoc(bs, store, time.Hour, time.Minute,
+	doc := buildStatusDoc(bs, store, "", time.Hour, time.Minute,
 		map[string]time.Duration{"done": 30 * time.Minute},
 		map[string]string{"blocked": "shared repo"}, nil, now)
 
@@ -402,7 +479,7 @@ func TestDiscoverAndStatusShowOfflineMembers(t *testing.T) {
 	assert.NotRegexp(t, `\(offline\)[^\n]*postgres`, discover, "the live volume is not tagged")
 	assert.NotRegexp(t, `app\b[^\n]*\(offline\)`, discover, "a partly-live group is not fully offline")
 
-	status := captureStdout(t, func() { printStatus(bs, store, time.Hour, 0, nil, nil, off) })
+	status := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, off) })
 	assert.Regexp(t, `app \(partial\)[^\n]*due now`, status, "a partly-offline group is tagged partial and keeps its schedule")
 }
 
@@ -412,7 +489,7 @@ func TestBuildStatusDocMarksOfflineMembersButKeepsSchedule(t *testing.T) {
 	store := state.LoadSchedule(t.TempDir(), nil)
 	off := &state.Offline{Volumes: map[string]map[string]bool{"gone": {"gone_vol": true}}}
 
-	doc := buildStatusDoc(bs, store, time.Hour, 0, nil, nil, off, time.Now())
+	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, off, time.Now())
 	require.Len(t, doc.Groups, 1)
 	g := doc.Groups[0]
 	assert.True(t, g.Offline, "no live container: the group is offline")
