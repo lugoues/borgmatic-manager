@@ -25,8 +25,12 @@ type statusGroupJSON struct {
 	PeriodSeconds int64  `json:"period_seconds"`
 	// LastRun is the persisted most-recent outcome (log tail stripped).
 	LastRun *state.RunOutcome `json:"last_run,omitempty"`
-	Running *statusRunning    `json:"running,omitempty"`
-	Refused string            `json:"refused,omitempty"`
+	// Repositories is the per-destination breakdown for a fan-out group: each
+	// repo's last outcome and its own last_success, which advances independently
+	// so a healthy destination stays fresh while a sibling fails.
+	Repositories map[string]state.RepoRecord `json:"repositories,omitempty"`
+	Running      *statusRunning              `json:"running,omitempty"`
+	Refused      string                      `json:"refused,omitempty"`
 	// Offline is true when the group has no live container; it is still backed
 	// up (its volumes are data at rest) and keeps its normal schedule.
 	Offline bool `json:"offline,omitempty"`
@@ -86,6 +90,9 @@ func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, lockDir 
 			lr := *rec.LastRun
 			lr.LogTail = nil // logs belong to inspect; keep status output bounded
 			g.LastRun = &lr
+		}
+		if ok && len(rec.Repositories) > 0 {
+			g.Repositories = rec.Repositories
 		}
 
 		// Offline groups are still backed up, so they carry a normal schedule.

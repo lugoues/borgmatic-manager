@@ -90,6 +90,55 @@ func TestStatusFailurePointsToInspect(t *testing.T) {
 	assert.Contains(t, out, "inspect", "and the pointer must send the user to inspect")
 }
 
+func TestStatusShowsPartialFanOut(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	// Group failed, but one of two destinations still backed up.
+	store.RecordRun("demo", state.RunOutcome{
+		Finished:  time.Now(),
+		Result:    state.ResultFailed,
+		ExitCode:  1,
+		LastError: "Repository /mnt/offsite does not exist.",
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK},
+			{ID: "offsite", Result: state.ResultFailed},
+		},
+	})
+
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) })
+
+	assert.Contains(t, out, "partial (1/2 ok)", "a fan-out with one live destination reads as partial")
+	assert.Contains(t, out, "1 group partial", "and is called out separately from a flat failure")
+	assert.NotContains(t, out, "1 group failed", "a partial group is not counted as a full failure")
+}
+
+func TestInspectShowsPerRepositoryBreakdown(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	group := bs.Groups["demo"]
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now(),
+		Result:   state.ResultFailed,
+		ExitCode: 1,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Files: 1234, OriginalBytes: 5 << 30},
+			{ID: "offsite", Result: state.ResultFailed},
+		},
+	})
+	rec, _ := store.Record("demo")
+
+	out := captureStdout(t, func() {
+		printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil)
+	})
+
+	assert.Contains(t, out, "Repositories", "the per-destination section renders for a fan-out")
+	assert.Contains(t, out, "local")
+	assert.Contains(t, out, "offsite")
+	assert.Contains(t, out, "1234 files", "a healthy destination shows its size")
+}
+
 // Interrupting a multi-group run must not report the groups it never reached as
 // backed up: "ok" is what actually ran, not everything minus the failures.
 func TestAdhocSummaryDoesNotCountInterruptedGroupsAsOk(t *testing.T) {
