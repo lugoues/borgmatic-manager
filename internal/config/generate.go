@@ -32,11 +32,22 @@ const defaultArchiveNameFormat = "{hostname}-{group}-{now:%Y-%m-%d_%H:%M:%S}"
 // literal token keeps groups sharing a repository distinguishable at prune time.
 const groupTokenPlaceholder = "{group}"
 
+// RepoRef identifies a configured repository for per-repository outcome
+// tracking. Label is borgmatic's repository label (empty if unset); Path is the
+// configured path/URL, matched against borgmatic's reported repository location.
+type RepoRef struct {
+	Path  string
+	Label string
+}
+
 // GroupRunMeta is scheduling metadata extracted from a group's generated config.
 type GroupRunMeta struct {
 	// Repos are canonicalized repository keys. Groups sharing a key must not
 	// run concurrently (Borg 1.x locks repositories exclusively).
 	Repos []string
+	// Repositories are the configured repositories (path + label) in config
+	// order, used to attribute per-repository backup outcomes.
+	Repositories []RepoRef
 	// SnapshotHooks is true when the config enables btrfs/zfs/lvm hooks.
 	SnapshotHooks bool
 	// RunID is minted fresh each generation and stamped onto dump helper
@@ -266,6 +277,7 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			groupToken: hasGroupToken,
 			meta: GroupRunMeta{
 				Repos:         extractRepoKeys(final),
+				Repositories:  extractRepoRefs(final),
 				SnapshotHooks: snapshotHooks,
 				RunID:         runID,
 			},
@@ -653,6 +665,32 @@ func extractRepoKeys(final map[string]interface{}) []string {
 		}
 	}
 	return keys
+}
+
+// extractRepoRefs returns the configured repositories with their labels, in
+// config order, for per-repository outcome attribution.
+func extractRepoRefs(final map[string]interface{}) []RepoRef {
+	repos, ok := final["repositories"].([]interface{})
+	if !ok {
+		return nil
+	}
+	refs := make([]RepoRef, 0, len(repos))
+	for _, r := range repos {
+		switch v := r.(type) {
+		case string:
+			if v != "" {
+				refs = append(refs, RepoRef{Path: v})
+			}
+		case map[string]interface{}:
+			path, _ := v["path"].(string)
+			if path == "" {
+				continue
+			}
+			label, _ := v["label"].(string)
+			refs = append(refs, RepoRef{Path: path, Label: label})
+		}
+	}
+	return refs
 }
 
 // canonicalRepoKey normalizes a repository path for use as a lock key.

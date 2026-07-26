@@ -285,3 +285,41 @@ func TestScheduleRetainProtectedGroupNeverPruned(t *testing.T) {
 	_, ok = s.Record("gone")
 	assert.False(t, ok, "unprotected groups still age out")
 }
+
+func TestRecordRunTracksPerRepositoryLastSuccess(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, discardLogger())
+	t0 := time.Now()
+
+	// Run 1: both repos succeed.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: t0, Result: state.ResultOK,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Files: 10},
+			{ID: "offsite", Result: state.ResultOK, Files: 10},
+		},
+	})
+	// Run 2 (an hour later): offsite fails, local still succeeds.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: t0.Add(time.Hour), Result: state.ResultFailed,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Files: 12},
+			{ID: "offsite", Result: state.ResultFailed},
+		},
+	})
+
+	rec, ok := state.LoadSchedule(dir, discardLogger()).Record("g")
+	require.True(t, ok)
+	require.Contains(t, rec.Repositories, "local")
+	require.Contains(t, rec.Repositories, "offsite")
+
+	assert.Equal(t, t0.Add(time.Hour).Unix(), rec.Repositories["local"].LastSuccess.Unix(),
+		"local's last success advances to run 2")
+	assert.Equal(t, t0.Unix(), rec.Repositories["offsite"].LastSuccess.Unix(),
+		"offsite's last success stays at run 1, since run 2 failed for it")
+	assert.Equal(t, state.ResultFailed, rec.Repositories["offsite"].LastRun.Result)
+
+	// Per-repo detail is not duplicated into group history entries.
+	require.NotEmpty(t, rec.History)
+	assert.Nil(t, rec.History[len(rec.History)-1].Repositories)
+}

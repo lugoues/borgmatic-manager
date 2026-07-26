@@ -762,3 +762,25 @@ func TestPlanAndRenderGroupDoNotMintRealRunIDs(t *testing.T) {
 	assert.NotEqual(t, config.PlaceholderRunID, gen["db-group"].RunID)
 	assert.Regexp(t, `^[0-9a-f]{16}$`, gen["db-group"].RunID)
 }
+
+func TestGenerateExtractsRepositoryRefsWithLabels(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{
+			map[string]interface{}{"path": "/mnt/local", "label": "local"},
+			map[string]interface{}{"path": "ssh://borg@host/./r", "label": "offsite"},
+			"/bare/path", // no label: ref carries just the path
+		},
+	}}
+	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	meta, err := g.Generate(state)
+	require.NoError(t, err)
+
+	refs := meta["app"].Repositories
+	require.Len(t, refs, 3)
+	assert.Equal(t, config.RepoRef{Path: "/mnt/local", Label: "local"}, refs[0])
+	assert.Equal(t, config.RepoRef{Path: "ssh://borg@host/./r", Label: "offsite"}, refs[1])
+	assert.Equal(t, config.RepoRef{Path: "/bare/path"}, refs[2])
+}
