@@ -241,3 +241,40 @@ func TestRestoreWithSwapClearsAFlagInheritedFromTheParent(t *testing.T) {
 	require.True(t, ok)
 	assert.Zero(t, after&fsNoCoWFlag, "the volume silently gained nodatacow it never had")
 }
+
+// A read-only subvolume is a deliberate protection the in-place restore could
+// not write through at all. The staged swap builds a writable replacement and
+// promotes it, so the volume quietly becomes writable while the restore reports
+// success.
+func TestRestoreWithSwapKeepsAReadOnlySubvolumeReadOnly(t *testing.T) {
+	data := btrfsVolume(t)
+	if err := setBtrfsSubvolumeReadOnly(data, true); err != nil {
+		t.Skipf("cannot set a subvolume read-only here: %v", err)
+	}
+	t.Cleanup(func() { _ = setBtrfsSubvolumeReadOnly(data, false) })
+	ro, known := btrfsSubvolumeReadOnly(data)
+	require.True(t, known)
+	require.True(t, ro, "precondition: the volume really is read-only")
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		// borg must still be able to write while staging, which is why this is
+		// applied after the extract rather than at creation.
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+
+	after, known := btrfsSubvolumeReadOnly(data)
+	require.True(t, known)
+	assert.True(t, after, "the volume silently became writable")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data), "and the restore still landed")
+}
+
+// A writable subvolume must stay writable: the restriction is only ever added.
+func TestRestoreWithSwapLeavesAWritableSubvolumeWritable(t *testing.T) {
+	data := btrfsVolume(t)
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil))
+	ro, known := btrfsSubvolumeReadOnly(data)
+	require.True(t, known)
+	assert.False(t, ro, "a writable volume must not come back read-only")
+}
