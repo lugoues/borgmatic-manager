@@ -390,7 +390,14 @@ func (e *Emitter) observe(o metric.Observer,
 		// The empty repository label is this codebase's existing way of saying
 		// "the group, with no destination attributable", which is exactly what a
 		// legacy record knows. It disappears the first time the group runs.
-		if len(rec.Repositories) == 0 && !rec.LastSuccess.IsZero() {
+		//
+		// Only while the inventory is unknown. A current group changed to
+		// "repositories: []" also has no repository records and keeps its older
+		// group success, and standing in for that one would contradict an
+		// inventory that has already been reported as empty, suppressing the
+		// never-attempted alert for a group that now backs up nowhere.
+		_, inventoryKnown := configuredRepos[group]
+		if !inventoryKnown && len(rec.Repositories) == 0 && !rec.LastSuccess.IsZero() {
 			legacyAttrs := metric.WithAttributes(
 				attribute.String("group", group), attribute.String("repository", ""))
 			o.ObserveInt64(repoInfo, 1, legacyAttrs)

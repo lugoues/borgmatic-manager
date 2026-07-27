@@ -1052,3 +1052,38 @@ func TestTheWholeQueryIsRedactedNotJustItsFirstField(t *testing.T) {
 		assert.Contains(t, got, `": dial tcp`, "the text between the URL and the reason is not eaten")
 	})
 }
+
+// A current group changed to "repositories: []" also has no repository records
+// and keeps its older group success. Standing in for that one contradicts an
+// inventory already reported as empty and suppresses the never-attempted alert
+// for a group that now backs up nowhere.
+func TestTheLegacyStandInDoesNotCoverAKnownEmptyInventory(t *testing.T) {
+	now := time.Now()
+	src := fakeSource{snap: map[string]state.GroupRecord{
+		"emptied": {LastSuccess: now.Add(-time.Hour)}, // records cleared, success kept
+	}}
+	e, reader := newTestEmitter(t, src)
+	e.now = func() time.Time { return now }
+
+	bs := models.NewBackupState()
+	bs.AddVolume("emptied", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+
+	// Before the inventory is known, the stand-in applies: this could be an
+	// upgraded record.
+	require.Len(t, findMetric(t, collect(t, reader), "backup_repository_info").
+		Data.(metricdata.Gauge[int64]).DataPoints, 1)
+
+	// Once the group reports that it configures no repositories, it does not.
+	e.ObserveRepositories(map[string][]string{"emptied": {}})
+
+	rm := collect(t, reader)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			assert.NotEqual(t, "backup_repository_info", m.Name,
+				"a group that backs up nowhere must not look like one that has")
+		}
+	}
+	assert.NotNil(t, findMetric(t, rm, "backup_group_info"),
+		"the group itself is still reported, so the alert can fire")
+}
