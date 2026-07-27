@@ -176,7 +176,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// The restore is done and durable. Failing to delete the copy it replaced is
 	// wasted disk, not a failed restore, so it must not become a nonzero exit
 	// for an operation that succeeded.
-	if rmErr := os.RemoveAll(displaced); rmErr != nil {
+	if rmErr := removeScratchDir(displaced); rmErr != nil {
 		// On the exchange path this *is* the staging path, and the next restore
 		// clears staging as its very first act and refuses to start if it
 		// cannot. Left here, a restore that succeeded today becomes the reason
@@ -209,11 +209,24 @@ var swapIntoPlaceFn = swapIntoPlace
 // of exactly two syscalls; recoverInterruptedSwap repairs that window if the
 // process dies inside it.
 func swapIntoPlace(staging, targetData string, logger *slog.Logger) (displaced string, err error) {
+	// The exchange sends the live inode to the staging name, and that inode has
+	// never been this tool's, so it arrives there carrying no proof. A kill
+	// before the cleanup below then leaves a volume-sized directory under a
+	// staging name that no later run will delete, because it cannot tell it from
+	// something an application put there. Claiming it first costs one syscall
+	// and travels with the inode through the exchange.
+	claimed := markAsOurs(targetData)
 	switch exErr := unix.Renameat2(unix.AT_FDCWD, staging, unix.AT_FDCWD, targetData, unix.RENAME_EXCHANGE); {
 	case exErr == nil:
 		// The directories traded places: the old data is now under the staging
 		// name, which is what the caller removes.
 		return staging, nil
+	case claimed:
+		// It did not happen, so the claim on the live volume means nothing and
+		// must not be left behind. Cleared on every path out of the switch that
+		// is not the exchange itself.
+		_ = removeXattr(targetData, scratchMarkerAttr)
+		fallthrough
 	case errors.Is(exErr, unix.ENOSYS), errors.Is(exErr, unix.EINVAL),
 		errors.Is(exErr, unix.EOPNOTSUPP), errors.Is(exErr, unix.ENOTSUP):
 		// No atomic exchange on this kernel or filesystem; use the rename pair.
@@ -368,6 +381,19 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 	// back.
 	if targetPresent {
 		for _, m := range matches {
+			// Ownership first. Asking whether an unrelated directory is empty
+			// needs permission to read it, and an application-owned one this
+			// user cannot read would otherwise abort every restore before the
+			// check that would have dismissed it ever ran.
+			ours, known, ownErr := provablyOurs(m)
+			if ownErr != nil {
+				return ownErr
+			}
+			if !ours || !known {
+				logger.Warn("a directory beside this volume is named like one this tool creates but carries no "+
+					"mark showing it did, so it is being left alone", "path", m)
+				continue
+			}
 			empty, emptyErr := isEmptyDir(m)
 			if emptyErr != nil {
 				return emptyErr
@@ -376,15 +402,6 @@ func recoverInterruptedSwap(targetData string, logger *slog.Logger) error {
 				logger.Warn("a directory displaced by an earlier restore is beside this volume and holds data; "+
 					"the volume itself is fine, so remove it once you have looked at it",
 					"path", m, "volume", targetData)
-				continue
-			}
-			ours, known, ownErr := provablyOurs(m)
-			if ownErr != nil {
-				return ownErr
-			}
-			if !ours || !known {
-				logger.Warn("an empty directory beside this volume is named like a reservation this tool makes "+
-					"but carries no mark showing it created it, so it is being left alone", "path", m)
 				continue
 			}
 			// Left in place these accumulate, and a later genuine interruption
@@ -568,6 +585,8 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 		if err := applySELinuxContext(staging, label); err != nil {
 			return "", err
 		}
+	} else if err := clearInheritedSELinuxContext(staging, logger); err != nil {
+		return "", err
 	}
 	if err := copyAccessControlLists(model, staging); err != nil {
 		return "", err
@@ -578,7 +597,7 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 	if err := copyInodeFlags(model, staging, logger); err != nil {
 		return "", err
 	}
-	warnAboutProjectQuota(model, logger)
+	warnAboutProjectQuota(model, staging, logger)
 	return staging, nil
 }
 
@@ -693,15 +712,20 @@ var setInodeFlagsExactly = func(path string, want int) error {
 // no filesystem supporting project quotas can be mounted in the environment
 // this was written in, so that code could not have been tested. Untested
 // pointer work in a restore path is a worse trade than an accurate warning.
-func warnAboutProjectQuota(model string, logger *slog.Logger) {
-	id, known := projectQuotaID(model)
-	if !known || id == 0 {
+func warnAboutProjectQuota(model, staging string, logger *slog.Logger) {
+	want, wantKnown := projectQuotaID(model)
+	got, gotKnown := projectQuotaID(staging)
+	if !wantKnown || !gotKnown || want == got {
 		return
 	}
-	logger.Warn("this volume's data directory has a filesystem project quota id, which lives in the inode "+
-		"rather than in an extended attribute and so does not carry to the directory replacing it; "+
-		"the restored volume will be outside that quota until the id is set again (chattr -p)",
-		"path", model, "project_id", id)
+	// Both directions matter, and comparing against zero caught only one of
+	// them. A parent with a project id and PROJINHERIT gives staging that id,
+	// so a volume charged to nothing can be promoted into someone else's quota
+	// as easily as one under a quota can escape it.
+	logger.Warn("the directory replacing this volume has a different filesystem project quota id, which lives "+
+		"in the inode rather than in an extended attribute and cannot be copied with the rest; the restored "+
+		"volume will be charged to the project shown as replacement_project_id until it is set again (chattr -p)",
+		"path", model, "project_id", want, "replacement_project_id", got)
 }
 
 // projectQuotaID reports the project quota id on path, and whether it could be
@@ -1344,6 +1368,34 @@ func applySELinuxContext(path, label string) error {
 		return fmt.Errorf("the volume carries the SELinux label %q, which could not be applied to %s, "+
 			"so a swap would leave the volume unreadable by its container (nothing was changed); "+
 			"run the restore as root, or use --merge to write in place: %w", label, path, err)
+	}
+	return nil
+}
+
+// clearInheritedSELinuxContext removes a label the staging directory was given
+// that the volume it replaces does not have.
+//
+// On a labelled filesystem a fresh directory is assigned a context from policy,
+// which the repository's own SELinux test observes happening. The label copying
+// only ever applies one the model already carries, and the general xattr copying
+// excludes this attribute, so an unlabelled volume could be replaced by a
+// labelled root and quietly gain or lose access.
+//
+// Best effort, and warned about rather than fatal: removing a context is not
+// always permitted, and refusing a completed restore over it would be worse
+// than reporting that the label differs.
+func clearInheritedSELinuxContext(staging string, logger *slog.Logger) error {
+	_, present, err := readXattrFn(staging, seLinuxAttr)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	if rmErr := removeXattr(staging, seLinuxAttr); rmErr != nil {
+		logger.Warn("this volume has no SELinux label but the directory replacing it was given one by policy, "+
+			"and it could not be removed, so the restored volume will carry a label the original did not",
+			"path", staging, "error", rmErr)
 	}
 	return nil
 }

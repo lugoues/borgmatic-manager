@@ -1366,6 +1366,23 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 					"stop it and run the restore again, or pass --force to overrule", plan.targetVolume)
 			}
 		}
+		// This path empties the volume and then extracts, so nothing downstream
+		// can notice that the extract produced nothing: the staged path's
+		// empty-result refusal does not exist here. That makes the pre-flight
+		// probe the only protection, and an unpinned archive defeats it, because
+		// borg resolves "latest" separately for the probe and for the extract. A
+		// backup finishing in between means the probe approved one archive and
+		// the wipe is followed by an extract from another, which can match
+		// nothing and exit successfully.
+		//
+		// The staged path tolerates this by refusing an empty result. Here there
+		// is nothing left to refuse with, so the archive has to be named.
+		if archive == latestArchive {
+			return fmt.Errorf("this volume can only be restored in place, which empties it before extracting, "+
+				"and %q is resolved again when the extract runs, so the archive checked beforehand may not be "+
+				"the one restored (nothing was changed); name the archive explicitly: "+
+				"borgmatic-manager borgmatic %s list", latestArchive, group)
+		}
 		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (in place)\n", group, volume, archive, plan.targetData)
 		if wipeErr := emptyVolumeData(plan.targetData, volumeIdentity); wipeErr != nil {
 			return fmt.Errorf("emptying the target before a mirror restore: %w", wipeErr)
