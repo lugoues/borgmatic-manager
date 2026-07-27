@@ -26,6 +26,12 @@ type RunOutcome struct {
 	Finished time.Time `json:"finished"`
 	Result   string    `json:"result"` // ok | failed | terminated
 	ExitCode int       `json:"exit_code"`
+	// ConfiguredRepositories are the repository ids the group currently
+	// configures, which is not the same as the ids in Repositories: a failed run
+	// deliberately omits repositories it could neither implicate nor confirm, so
+	// the outcome alone cannot say whether a missing one was skipped or removed.
+	// Empty leaves the persisted set untouched.
+	ConfiguredRepositories []string `json:"-"`
 	// LastError is the first CRITICAL/ERROR message from a failed run, so
 	// status can show why without the journal.
 	LastError       string `json:"last_error,omitempty"`
@@ -67,6 +73,22 @@ type RepoOutcome struct {
 type RepoRecord struct {
 	LastSuccess time.Time    `json:"last_success"`
 	LastRun     *RepoOutcome `json:"last_run,omitempty"`
+	// LastStats is the most recent outcome that actually carried archive
+	// statistics, kept separately from LastRun.
+	//
+	// Two outcomes are successes without stats: a later failure replaces
+	// LastRun entirely, and a repository confirmed by the fallback probe is
+	// recorded ok with nothing measured. Reading sizes from LastRun therefore
+	// either stopped reporting them or reported zeros, and a dataset that
+	// appears to shrink to nothing is worse than one that stops updating.
+	LastStats *RepoOutcome `json:"last_stats,omitempty"`
+}
+
+// hasStats reports whether an outcome carries archive measurements. A
+// probe-confirmed success has none.
+func (r RepoOutcome) hasStats() bool {
+	return r.Files > 0 || r.OriginalBytes > 0 || r.CompressedBytes > 0 ||
+		r.DeduplicatedBytes > 0 || r.DurationSeconds > 0
 }
 
 // GroupRecord is one group's persisted schedule state.
@@ -322,8 +344,28 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 			rr.LastRun = &roCopy
 			if ro.Result == ResultOK {
 				rr.LastSuccess = outcome.Finished
+				if ro.hasStats() {
+					statsCopy := ro
+					rr.LastStats = &statsCopy
+				}
 			}
 			rec.Repositories[ro.ID] = rr
+		}
+
+		// Repositories the group no longer configures are dropped. Left in place
+		// they linger forever in status, inspect and the exported series, and
+		// runRepoHealth counts them in the total, so a removed destination
+		// permanently reports the group as partial.
+		if len(outcome.ConfiguredRepositories) > 0 && rec.Repositories != nil {
+			current := make(map[string]bool, len(outcome.ConfiguredRepositories))
+			for _, id := range outcome.ConfiguredRepositories {
+				current[id] = true
+			}
+			for id := range rec.Repositories {
+				if !current[id] {
+					delete(rec.Repositories, id)
+				}
+			}
 		}
 
 		slim := outcome
