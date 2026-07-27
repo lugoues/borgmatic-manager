@@ -331,6 +331,7 @@ manager:
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `backup_runs_total` | counter | `group`, `repository`, `result` | One increment per repository per run. A fan-out with one failed destination records both an `ok` and a `failed`. `result` is `ok`, `failed`, `terminated` or `unknown`; `unknown` is a destination the run reached but could not judge, and it is a counter label only, never stored state. |
+| `backup_group_runs_total` | counter | `group`, `result` | One increment per run, carrying the group's own verdict. Not derivable from the per-repository counter: a run whose `create` reached every destination still fails when a later `prune`, `compact` or `check` does, and every repository sample is `ok`. |
 | `backup_group_info` | gauge | `group` | Always 1, one per configured group. |
 | `backup_repository_info` | gauge | `group`, `repository` | Always 1, once per repository the group has attempted. Join target for staleness alerts. |
 | `backup_last_size_bytes` | gauge | `group`, `repository`, `kind` | Last successful archive size; `kind` is `original`, `compressed` or `deduplicated`. |
@@ -362,6 +363,14 @@ Joining on `group` alone is wrong for a fan-out group: one fresh repository
 satisfies the right-hand side, removes the group from the result, and reports the
 whole group healthy while a second destination is stale or has never produced an
 archive. A fan-out group is only as healthy as its worst destination.
+
+Alert on maintenance failures with the group counter, not the repository one:
+
+```promql
+# runs that failed for any reason, including a create that reached every
+# destination followed by a prune or check that did not
+rate(backup_group_runs_total{result="failed"}[1h]) > 0
+```
 
 The `last_*` gauges deliberately reflect the last **successful** backup: a
 failed run carries no stats, and reporting its zeros would read as the dataset

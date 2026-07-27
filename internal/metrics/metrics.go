@@ -50,7 +50,8 @@ type Emitter struct {
 	source   StateSource
 	now      func() time.Time
 
-	runsTotal metric.Int64Counter
+	runsTotal      metric.Int64Counter
+	groupRunsTotal metric.Int64Counter
 
 	// inventory is the latest cycle's per-group offline volume count and the
 	// set of known groups (so an all-online group still reports 0). Guarded.
@@ -138,6 +139,27 @@ func countDataPoints(rm *metricdata.ResourceMetrics) int {
 	return n
 }
 
+// instanceID identifies this process among the ones exporting these metrics.
+//
+// backup_runs_total is cumulative, and a one-shot "run" is supported while the
+// daemon is up, so two processes can export the same metric with the same
+// attributes at once. Each SDK owns its own counter with its own start time, so
+// without a distinguishing resource attribute a collector sees one stream from
+// two producers: the manual run reads as a counter reset, or is overwritten by
+// the daemon's next push. Both lose the manual backup, which is the run an
+// operator is most likely to be watching.
+//
+// The pid alone would be reused across reboots, so it is paired with the process
+// start time. Deriving it rather than minting a random id keeps a restarted
+// daemon distinguishable from the one it replaced while staying reproducible
+// within a process.
+func instanceID() string {
+	return fmt.Sprintf("%d-%d", os.Getpid(), processStart.UnixNano())
+}
+
+// processStart is stamped once so every call in this process agrees.
+var processStart = time.Now()
+
 // newEmitter wires the meter provider around any reader (an OTLP periodic reader
 // in production, a manual reader in tests) and registers the instruments.
 func newEmitter(ctx context.Context, reader sdkmetric.Reader, version string, source StateSource, logger *slog.Logger) (*Emitter, error) {
@@ -152,6 +174,7 @@ func newEmitter(ctx context.Context, reader sdkmetric.Reader, version string, so
 		resource.WithAttributes(
 			semconv.ServiceName("borgmatic-manager"),
 			semconv.ServiceVersion(version),
+			semconv.ServiceInstanceID(instanceID()),
 		),
 		resource.WithFromEnv(), // OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME
 	)
@@ -188,6 +211,14 @@ func (e *Emitter) register(m metric.Meter) error {
 		metric.WithDescription("Count of borgmatic runs recorded, per repository and result."))
 	if err != nil {
 		return fmt.Errorf("creating backup_runs_total: %w", err)
+	}
+
+	e.groupRunsTotal, err = m.Int64Counter("backup_group_runs_total",
+		metric.WithDescription("Count of borgmatic runs recorded, per group and result. The group's own verdict, "+
+			"which is not always the per-repository one: a run whose create reached every destination still fails "+
+			"when a later prune, compact or check does."))
+	if err != nil {
+		return fmt.Errorf("creating backup_group_runs_total: %w", err)
 	}
 
 	lastSize, err := m.Int64ObservableGauge("backup_last_size_bytes",
@@ -327,6 +358,7 @@ func counterResult(result string) string {
 // not persist anything: it composes with the schedule store as a Recorder.
 func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 	ctx := context.Background()
+
 	// A maintenance-only cycle (prune, compact, check, with no create) exits zero
 	// having written no archive anywhere. The runner already refuses to record a
 	// per-repository success for one; counting it here would put the same lie in
@@ -339,6 +371,17 @@ func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 	if !o.CreateAttempted && o.Result == state.ResultOK {
 		return
 	}
+
+	// The group's own verdict, recorded separately because it is a different
+	// question from any destination's. When create reaches every repository and
+	// a later prune, compact or check fails, every per-repository sample is
+	// correctly ok and the run is still a failure: derived from the repository
+	// samples alone, a recurring maintenance failure is invisible to anything
+	// selecting failed runs. Recording it as another backup_runs_total sample
+	// would instead make the two double-count when summed.
+	e.groupRunsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("group", group), attribute.String("result", counterResult(o.Result))))
+
 	if len(o.Repositories) == 0 {
 		// A timeout, a signal, or a failure that cannot be attributed leaves
 		// Repositories empty while ConfiguredRepositories still names every
