@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -780,4 +781,120 @@ func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
 		"a group no other name prefixes keeps a usable pattern")
 	assert.NotEmpty(t, meta["app"].ArchivePattern,
 		"the pattern is still produced; it is retention that still needs it")
+}
+
+// Overlap is a property of the names a format generates, not of the group names
+// and not of the patterns as sets of strings. A hyphen-shaped name check misses
+// a format that puts no separator before {now}; comparing patterns as sets calls
+// every pair of groups a collision, because "*-app-*" and "*-other-*" both match
+// "x-app--other-y".
+func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
+	generate := func(t *testing.T, format string, groups ...string) map[string]config.GroupRunMeta {
+		t.Helper()
+		st := models.NewBackupState()
+		for i, name := range groups {
+			st.AddVolume(name, models.VolumeInfo{Name: fmt.Sprintf("v%d", i), HostPath: fmt.Sprintf("/mnt/v%d", i)})
+		}
+		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+			"archive_name_format": format,
+		}}
+		g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+		meta, err := g.Generate(st)
+		require.NoError(t, err)
+		return meta
+	}
+
+	t.Run("no separator before the timestamp still collides", func(t *testing.T) {
+		meta := generate(t, "{group}{now}", "app", "apple")
+		assert.True(t, meta["app"].AmbiguousArchivePattern,
+			`"app*" matches the archives "apple" writes`)
+		assert.True(t, meta["apple"].AmbiguousArchivePattern)
+	})
+
+	t.Run("a trailing group name cannot collide", func(t *testing.T) {
+		meta := generate(t, "{now}-{group}", "app", "apple")
+		assert.False(t, meta["app"].AmbiguousArchivePattern,
+			`no name ends in both "-app" and "-apple"`)
+		assert.False(t, meta["apple"].AmbiguousArchivePattern)
+	})
+
+	t.Run("unrelated groups sharing a repository are not collisions", func(t *testing.T) {
+		meta := generate(t, "{hostname}-{group}-{now}", "app", "other", "third")
+		for _, name := range []string{"app", "other", "third"} {
+			assert.False(t, meta[name].AmbiguousArchivePattern,
+				"%s shares a repository but its archives are distinguishable", name)
+		}
+	})
+
+	t.Run("the prefix shape is still caught", func(t *testing.T) {
+		meta := generate(t, "{hostname}-{group}-{now}", "app", "app-prod")
+		assert.True(t, meta["app"].AmbiguousArchivePattern)
+		assert.True(t, meta["app-prod"].AmbiguousArchivePattern)
+	})
+}
+
+func TestGlobMatches(t *testing.T) {
+	for _, tc := range []struct {
+		pattern, name string
+		want          bool
+	}{
+		{"app*", "apple20260102150405", true},
+		{"apple*", "app20260102150405", false},
+		{"*-app-*", "host-app-prod-20260102150405", true},
+		{"*-app-*", "host-other-20260102150405", false},
+		{"*-app", "20260102150405-apple", false},
+		{"*-app", "20260102150405-app", true},
+		{"*", "anything", true},
+		{"exact", "exact", true},
+		{"exact", "exactly", false},
+		{"a*b*c", "axxbyyc", true},
+		{"a*b*c", "axxc", false},
+	} {
+		t.Run(tc.pattern+"_vs_"+tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, config.GlobMatchesForTest(tc.pattern, tc.name))
+		})
+	}
+}
+
+func TestPatternsCollide(t *testing.T) {
+	// The check runs in both directions because the two groups' formats need not
+	// be the same: a per-group override can give one group a format whose
+	// literal text is the other group's whole name. Only the second direction
+	// sees that, and group order here is alphabetical, which always puts a
+	// prefix before its extension, so the first direction alone would miss it.
+	t.Run("a collision only the second direction sees", func(t *testing.T) {
+		assert.False(t, config.GlobMatchesForTest("alpha", "alpha20260102150405"),
+			"alpha's own pattern does not match beta's names")
+		assert.True(t, config.PatternsCollideForTest(
+			"alpha", "alpha", // group alpha, format "{group}"
+			"alpha*", "alpha20260102150405"), // group beta, format "alpha{now}"
+			"but beta's pattern claims alpha's archives")
+	})
+
+	t.Run("distinguishable patterns do not collide", func(t *testing.T) {
+		assert.False(t, config.PatternsCollideForTest(
+			"*-app-*", "20260102150405-app-20260102150405",
+			"*-other-*", "20260102150405-other-20260102150405"))
+	})
+
+	// Unreachable through generation today, because a shared-repo group whose
+	// archive_name_format lacks the {group} token is refused before this runs.
+	// Kept because "nothing is known about this group's archive names" must not
+	// read as "its archives are distinguishable" if that ever changes.
+	t.Run("an unknown pattern is treated as colliding", func(t *testing.T) {
+		assert.True(t, config.PatternsCollideForTest("", "", "*-app-*", "x-app-y"))
+		assert.True(t, config.PatternsCollideForTest("*-app-*", "x-app-y", "", ""))
+	})
+}
+
+// The sample stands in for what borg expands at runtime. Dropping the
+// placeholders entirely would compare group names rather than archive names.
+func TestArchiveSampleName(t *testing.T) {
+	assert.Equal(t, "app20260102150405", config.ArchiveSampleNameForTest("app{now}"))
+	assert.Equal(t, "20260102150405-app-20260102150405",
+		config.ArchiveSampleNameForTest("{hostname}-app-{now}"))
+	assert.Equal(t, "plain", config.ArchiveSampleNameForTest("plain"))
+	assert.NotContains(t, config.ArchiveSampleNameForTest("app{now}"), "{",
+		"a placeholder left literal would never match a real archive name")
 }

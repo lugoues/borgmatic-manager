@@ -320,7 +320,14 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		kept = append(kept, e)
 	}
 
-	for _, name := range prefixCollidingGroups(repoGroups, g.logger) {
+	patterns := make(map[string]string, len(kept))
+	samples := make(map[string]string, len(kept))
+	for _, e := range kept {
+		patterns[e.name] = e.meta.ArchivePattern
+		format, _ := e.final["archive_name_format"].(string)
+		samples[e.name] = archiveSampleName(format)
+	}
+	for _, name := range overlappingPatternGroups(repoGroups, patterns, samples, g.logger) {
 		for i := range kept {
 			if kept[i].name == name {
 				kept[i].meta.AmbiguousArchivePattern = true
@@ -612,16 +619,25 @@ func volumeNamedPath(hostPath, volumeName string) string {
 	return hostPath[:idx] + string(filepath.Separator) + "." + hostPath[idx:]
 }
 
-// warnPrefixCollisions flags shared-repo groups where one name prefixes another:
-// their match_archives patterns overlap, so retention can cross group boundaries.
-// prefixCollidingGroups warns about shared-repo groups whose names prefix one
-// another and returns every group involved, both the prefix and the longer name.
+// overlappingPatternGroups reports every group whose archive pattern also
+// matches the archive names another group in a shared repository actually
+// produces, and warns once per colliding pair.
 //
-// Both are affected, not just one. "app"'s pattern matches "app-prod"'s
-// archives, so app can be falsely confirmed by its sibling's backup; and
-// "app-prod" shares the repository with a group whose retention can prune across
-// the boundary, so neither name's archives are reliably its own.
-func prefixCollidingGroups(repoGroups map[string][]string, logger *slog.Logger) []string {
+// The test is on the generated names, not on the group names, and not on the
+// patterns alone.
+//
+// Group names are the wrong question because a name-prefix check only catches
+// the shape a separator happens to produce: with a format like "{group}{now}",
+// groups "app" and "apple" yield "app*" and "apple*", which overlap with no
+// hyphen anywhere.
+//
+// Comparing two patterns as sets of strings is the wrong question in the other
+// direction, because it asks whether any string at all matches both. For the
+// common "{hostname}-{group}-{now}", "*-app-*" and "*-other-*" both match
+// "x-app--other-y", so every pair of groups would look like a collision. What
+// matters is narrower: whether one group's pattern matches a name the other
+// group's format would actually generate.
+func overlappingPatternGroups(repoGroups map[string][]string, patterns, samples map[string]string, logger *slog.Logger) []string {
 	var affected []string
 	add := func(name string) {
 		for _, n := range affected {
@@ -631,11 +647,6 @@ func prefixCollidingGroups(repoGroups map[string][]string, logger *slog.Logger) 
 		}
 		affected = append(affected, name)
 	}
-	warnPrefixCollisions(repoGroups, logger, func(a, b string) { add(a); add(b) })
-	return affected
-}
-
-func warnPrefixCollisions(repoGroups map[string][]string, logger *slog.Logger, onCollision func(a, b string)) {
 	for repo, groups := range repoGroups {
 		if len(groups) < 2 {
 			continue
@@ -643,17 +654,86 @@ func warnPrefixCollisions(repoGroups map[string][]string, logger *slog.Logger, o
 		sort.Strings(groups)
 		for i, a := range groups {
 			for _, b := range groups[i+1:] {
-				if strings.HasPrefix(b, a+"-") {
-					logger.Warn("group names where one prefixes another share a repository; their archive name patterns overlap and retention can cross group boundaries, rename a group or split repositories",
-						"repository", repo, "groups", a+", "+b)
-					if onCollision != nil {
-						onCollision(a, b)
-					}
+				if !patternsCollide(patterns[a], samples[a], patterns[b], samples[b]) {
+					continue
 				}
+				logger.Warn("groups sharing a repository have overlapping archive name patterns; retention can cross group boundaries and neither group's backups can be confirmed independently, rename a group or split repositories",
+					"repository", repo, "groups", a+", "+b,
+					"patterns", patterns[a]+", "+patterns[b])
+				add(a)
+				add(b)
 			}
 		}
 	}
+	return affected
 }
+
+// patternsCollide reports whether either group's pattern claims the other's
+// archives. An empty pattern or sample means the group's config names no archive
+// format, so nothing distinguishes its archives from anyone else's: treated as a
+// collision, which is the safe direction.
+func patternsCollide(patternA, sampleA, patternB, sampleB string) bool {
+	if patternA == "" || patternB == "" || sampleA == "" || sampleB == "" {
+		return true
+	}
+	return globMatches(patternA, sampleB) || globMatches(patternB, sampleA)
+}
+
+// globMatches reports whether pattern, in which "*" matches any run of
+// characters, matches name.
+func globMatches(pattern, name string) bool {
+	memo := make(map[[2]int]bool, len(pattern)*len(name))
+	var walk func(i, j int) bool
+	walk = func(i, j int) bool {
+		key := [2]int{i, j}
+		if v, seen := memo[key]; seen {
+			return v
+		}
+		var out bool
+		switch {
+		case i == len(pattern):
+			out = j == len(name)
+		case pattern[i] == '*':
+			// The star matches nothing here, or one more character of name.
+			out = walk(i+1, j) || (j < len(name) && walk(i, j+1))
+		case j == len(name):
+			out = false
+		default:
+			out = pattern[i] == name[j] && walk(i+1, j+1)
+		}
+		memo[key] = out
+		return out
+	}
+	return walk(0, 0)
+}
+
+// archiveSampleName renders one archive name a format would produce, standing in
+// for borg's runtime placeholders. The stand-in carries no separators of its
+// own, so it cannot manufacture a match against another group's literal text or
+// hide one.
+func archiveSampleName(format string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range format {
+		switch {
+		case r == '{':
+			if depth == 0 {
+				b.WriteString(samplePlaceholder)
+			}
+			depth++
+		case r == '}' && depth > 0:
+			depth--
+		case depth == 0:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// samplePlaceholder stands in for a runtime placeholder when rendering a sample
+// archive name. Digits only, so it introduces no separator that could
+// manufacture a match against another group's literal text or hide one.
+const samplePlaceholder = "20260102150405"
 
 // warnIfMissing warns when none of the candidate host binaries are on PATH;
 // a missing dump client is a guaranteed runtime failure.
