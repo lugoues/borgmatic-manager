@@ -398,3 +398,34 @@ func TestRemovedRepositoriesAreDroppedFromState(t *testing.T) {
 	assert.Contains(t, s.Snapshot()["g"].Repositories, "local",
 		"an unjudged repository is not a removed one")
 }
+
+// The other half of reconciliation. A destination added to an established group
+// whose next run cannot judge it (a pre-backup hook fails, the probe finds no
+// archive) appears in neither the outcome nor the record, so it is missing from
+// the inventory series and the alert join cannot see the one destination that
+// has never backed up.
+func TestConfiguredRepositoriesAppearEvenWhenARunCannotJudgeThem(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now().Add(-time.Hour), Result: state.ResultOK,
+		ConfiguredRepositories: []string{"local"},
+		Repositories:           []state.RepoOutcome{{ID: "local", Result: state.ResultOK, Files: 10}},
+	})
+
+	// "offsite" is added, and the next run fails before anything can be judged.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed,
+		ConfiguredRepositories: []string{"local", "offsite"},
+	})
+
+	repos := s.Snapshot()["g"].Repositories
+	require.Contains(t, repos, "offsite", "a configured destination must be in the inventory to be alertable")
+	assert.Nil(t, repos["offsite"].LastRun, "with nothing known about it yet")
+	assert.True(t, repos["offsite"].LastSuccess.IsZero())
+
+	// The placeholder must not overwrite what is already known about a sibling.
+	require.NotNil(t, repos["local"].LastStats)
+	assert.Equal(t, int64(10), repos["local"].LastStats.Files)
+}
