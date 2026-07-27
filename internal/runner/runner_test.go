@@ -986,9 +986,10 @@ func TestNewestArchiveAtOrAfter(t *testing.T) {
 		"an archive written before the run started did not come from it")
 	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-1500*time.Millisecond))), runStart),
 		"nor one from a second and a half earlier")
-	// Whole-second borg timestamps must still match a run that started mid-second.
-	assert.True(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Truncate(time.Second))), runStart),
-		"an archive stamped in the same second the run began still counts")
+	// With microseconds there is nothing to infer: an archive stamped at the top
+	// of the second the run began was written before the run began.
+	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Truncate(time.Second))), runStart),
+		"a precise timestamp earlier than the run start is not this run's archive")
 	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-time.Hour))), runStart))
 	assert.False(t, newestArchiveAtOrAfter([]byte(`[{"archives":[]}]`), runStart), "no archives")
 	assert.False(t, newestArchiveAtOrAfter([]byte("not json"), runStart))
@@ -1735,4 +1736,80 @@ func TestScopeAmbiguityMatchesOnCanonicalRepositoryIdentity(t *testing.T) {
 
 	assert.True(t, newArchiveScope(config.GroupRunMeta{ArchivePattern: "*-app-*"}).canConfirm("/anything"),
 		"a group with no collisions confirms everywhere")
+}
+
+// A whole-second timestamp cannot say where inside its second the archive was
+// written, so an archive stamped in the second the run began may predate the
+// run. The case that matters: a small backup succeeds and an immediate retry
+// fails inside the same second, and truncating the run start credits the failed
+// retry with the successful run's archive.
+func TestAnAmbiguousSecondDoesNotConfirmABackup(t *testing.T) {
+	wholeSecond := func(ts time.Time) string {
+		return fmt.Sprintf(`[{"archives":[{"time":%q}]}]`, ts.Format("2006-01-02T15:04:05"))
+	}
+	// Mid-second, so the archive's own second spans time both before and after.
+	runStart := time.Date(2026, 7, 27, 12, 0, 0, 500_000_000, time.Local)
+
+	assert.False(t, newestArchiveAtOrAfter([]byte(wholeSecond(runStart)), runStart),
+		"the run's own second is ambiguous and must not confirm")
+	assert.True(t, newestArchiveAtOrAfter([]byte(wholeSecond(runStart.Add(time.Second))), runStart),
+		"a later second is unambiguous")
+	assert.False(t, newestArchiveAtOrAfter([]byte(wholeSecond(runStart.Add(-time.Second))), runStart),
+		"an earlier second is unambiguously not this run's")
+
+	// Microseconds resolve the same instant exactly, so nothing is refused for
+	// being merely ambiguous.
+	assert.True(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(time.Millisecond))), runStart),
+		"a precise timestamp inside the run's own second still confirms")
+	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-time.Millisecond))), runStart))
+}
+
+// The unit, stated directly, because the whole point is which of two failure
+// directions is chosen when the data cannot answer.
+func TestArchiveIsFromThisRun(t *testing.T) {
+	runStart := time.Date(2026, 7, 27, 12, 0, 0, 500_000_000, time.Local)
+
+	t.Run("precise timestamps compare exactly", func(t *testing.T) {
+		assert.True(t, archiveIsFromThisRun(runStart, true, runStart))
+		assert.True(t, archiveIsFromThisRun(runStart.Add(time.Microsecond), true, runStart))
+		assert.False(t, archiveIsFromThisRun(runStart.Add(-time.Microsecond), true, runStart))
+	})
+
+	t.Run("an ambiguous second is refused rather than credited", func(t *testing.T) {
+		assert.False(t, archiveIsFromThisRun(runStart.Truncate(time.Second), false, runStart),
+			"the archive may have been written before the run inside this second")
+		assert.True(t, archiveIsFromThisRun(runStart.Truncate(time.Second).Add(time.Second), false, runStart))
+	})
+
+	t.Run("a run starting exactly on a second is not special", func(t *testing.T) {
+		onSecond := runStart.Truncate(time.Second)
+		assert.False(t, archiveIsFromThisRun(onSecond, false, onSecond),
+			"still ambiguous: the archive could have been written microseconds earlier")
+		assert.True(t, archiveIsFromThisRun(onSecond, true, onSecond),
+			"precise, so the same instant is this run's")
+	})
+}
+
+// borgmatic resolves ${BORG_REPO} from the environment this process hands it, so
+// borg names the resolved location in errors while the config holds the literal
+// expression. Left unexpanded, a destination borg said had failed is recorded as
+// unknown, which is the one thing it definitely was not.
+func TestFailureAttributionExpandsEnvironmentBackedPaths(t *testing.T) {
+	t.Setenv("BORG_REPO", "/srv/borg/resolved")
+
+	assert.True(t, mentionedInErrors("${BORG_REPO}",
+		[]string{"Error: Repository /srv/borg/resolved does not exist."}),
+		"the resolved location identifies the configured repository")
+	assert.True(t, mentionedInErrors("${BORG_REPO}",
+		[]string{"Error: Repository ${BORG_REPO} does not exist."}),
+		"and the literal spelling still does")
+	assert.False(t, mentionedInErrors("${BORG_REPO}",
+		[]string{"Error: Repository /srv/borg/other does not exist."}))
+
+	t.Run("an unset variable adds no spelling", func(t *testing.T) {
+		t.Setenv("BORG_REPO", "")
+		assert.False(t, mentionedInErrors("${BORG_REPO}",
+			[]string{"Error: Repository /srv/borg/resolved does not exist."}),
+			"expanding to nothing must not match everything")
+	})
 }
