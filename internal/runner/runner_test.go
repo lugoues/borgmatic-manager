@@ -2208,3 +2208,37 @@ func TestTheProbeIsGivenTheResolvedRepositoryPath(t *testing.T) {
 		"the probe must reach the repository borg actually writes to")
 	assert.Equal(t, []string{"/srv/borg/resolved"}, pf.probed())
 }
+
+// Two destinations can overlap at different offsets rather than sharing a start:
+// "host:/mnt/repo" contains "/mnt/repo" five bytes in. Reserving only the start
+// marked both failed and left the healthy one unprobed.
+func TestAttributionReservesTheWholeMatchedRange(t *testing.T) {
+	local := config.RepoRef{Path: "/mnt/repo", Label: "local"}
+	remote := config.RepoRef{Path: "host:/mnt/repo", Label: "remote"}
+
+	t.Run("an error about the remote does not implicate the local", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{local, remote},
+			[]string{"Error: Repository host:/mnt/repo is unreachable."})
+		assert.Equal(t, []bool{false, true}, got)
+	})
+
+	t.Run("the local is implicated when it is the one named", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{local, remote},
+			[]string{"Error: Repository /mnt/repo does not exist."})
+		assert.Equal(t, []bool{true, false}, got)
+	})
+
+	t.Run("both when both are named", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{local, remote}, []string{
+			"Error: Repository host:/mnt/repo is unreachable.",
+			"Error: Repository /mnt/repo does not exist.",
+		})
+		assert.Equal(t, []bool{true, true}, got)
+	})
+
+	t.Run("configuration order does not decide it", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{remote, local},
+			[]string{"Error: Repository host:/mnt/repo is unreachable."})
+		assert.Equal(t, []bool{true, false}, got)
+	})
+}
