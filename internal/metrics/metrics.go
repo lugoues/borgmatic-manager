@@ -121,7 +121,13 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 // export was non-empty.
 // urlInText matches a URL in a message, quoted or bare, in one alternation.
 //
-// Matched on "://" rather than on a spelled-out scheme, because an endpoint
+// Matched on ":/" rather than on "://", because an endpoint can be malformed in
+// either direction: "https:/collector?token=..." has one slash and reaches the
+// exporter unvalidated just as readily. RedactEndpoint treats a value it cannot
+// parse as unprintable, so a broader match lands on the safer branch, and a value
+// with nothing to hide passes through unchanged.
+//
+// Matched on the separator rather than on a spelled-out scheme, because an endpoint
 // whose scheme is malformed still carries its query: an exporter rejecting
 // "ht!tp://collector/path?token=..." returns the whole value, and a pattern
 // anchored on "https?://" walked straight past it. RedactEndpoint handles a
@@ -139,7 +145,7 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 // One alternation rather than two passes, because a second pass re-matches what
 // the first already redacted and eats the closing quote with it, taking the rest
 // of the message's punctuation along.
-var urlInText = regexp.MustCompile(`"[^"\s]*://[^"]*"|\S*://\S+`)
+var urlInText = regexp.MustCompile(`"[^"\s]*:/[^"]*"|\S*:/+\S+`)
 
 // RedactErrorText strips credentials from any URL inside an error message, for
 // callers that log an error this package returned before it reached a decorator.
@@ -475,6 +481,19 @@ func (e *Emitter) observe(o metric.Observer,
 			if !rr.LastSuccess.IsZero() {
 				o.ObserveFloat64(staleness, now.Sub(rr.LastSuccess).Seconds(), repoAttrs)
 			}
+		}
+
+		// A repository added to an already-successful group has no record yet,
+		// and repository settings do not make the group due, so none may appear
+		// for a whole period. Iterating records alone left the new destination
+		// with no series at all, and the group-level fallback cannot reveal it
+		// because a healthy sibling already supplies the group's info series.
+		for id := range configuredRepos[group] {
+			if _, known := rec.Repositories[id]; known {
+				continue
+			}
+			o.ObserveInt64(repoInfo, 1, metric.WithAttributes(
+				attribute.String("group", group), attribute.String("repository", id)))
 		}
 	}
 
