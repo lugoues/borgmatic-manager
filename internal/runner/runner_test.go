@@ -1997,3 +1997,44 @@ func TestNonASCIIBytesContinueAPathToken(t *testing.T) {
 		[]string{"Error: Repository /mnt/repo does not exist."}),
 		"and the plain name still matches when it is the one named")
 }
+
+// A space ends the shorter path's token, so its match looked genuine and
+// "/mnt/repo" was implicated by a message about "/mnt/repo old". At a given
+// position only one repository can be the one named, so the decision has to be
+// made across the configured set rather than one path at a time.
+func TestAttributionPicksTheLongestMatchingRepository(t *testing.T) {
+	short := config.RepoRef{Path: "/mnt/repo", Label: "short"}
+	long := config.RepoRef{Path: "/mnt/repo old", Label: "long"}
+
+	t.Run("only the repository actually named is implicated", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{short, long},
+			[]string{"Error: Repository /mnt/repo old does not exist."})
+		assert.Equal(t, []bool{false, true}, got)
+	})
+
+	t.Run("the shorter one is still implicated when it is the one named", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{short, long},
+			[]string{"Error: Repository /mnt/repo does not exist."})
+		assert.Equal(t, []bool{true, false}, got)
+	})
+
+	t.Run("configuration order does not decide it", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{long, short},
+			[]string{"Error: Repository /mnt/repo old does not exist."})
+		assert.Equal(t, []bool{true, false}, got)
+	})
+
+	t.Run("both are implicated when both are named", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{short, long}, []string{
+			"Error: Repository /mnt/repo does not exist.",
+			"Error: Repository /mnt/repo old does not exist.",
+		})
+		assert.Equal(t, []bool{true, true}, got)
+	})
+
+	t.Run("an unrelated message implicates nobody", func(t *testing.T) {
+		got := implicatedRepos([]config.RepoRef{short, long},
+			[]string{"Error: Repository /mnt/other does not exist."})
+		assert.Equal(t, []bool{false, false}, got)
+	})
+}

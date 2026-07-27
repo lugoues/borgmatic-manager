@@ -576,3 +576,62 @@ func TestRepositoryFreshnessComesFromTheArchiveNotTheRunEnd(t *testing.T) {
 		assert.WithinDuration(t, finished, rec.LastSuccess, time.Second)
 	})
 }
+
+// A labelled repository keeps its key when it is repointed, so without noticing
+// the path change the new destination inherits the old one's last success and
+// reports as recently backed up having never produced an archive.
+func TestRepointingALabelledRepositoryResetsItsHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{
+			{ID: "offsite", Path: "/mnt/old", Result: state.ResultOK, Files: 9, Measured: true},
+		},
+	})
+	require.False(t, s.Snapshot()["g"].Repositories["offsite"].LastSuccess.IsZero())
+
+	// Repointed to a new destination, and the first attempt fails.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{
+			{ID: "offsite", Path: "/mnt/new", Result: state.ResultFailed},
+		},
+	})
+
+	rec := s.Snapshot()["g"].Repositories["offsite"]
+	assert.True(t, rec.LastSuccess.IsZero(),
+		"a destination that has never succeeded must not inherit the old one's freshness")
+	assert.Nil(t, rec.LastStats, "nor its measurements")
+	assert.Equal(t, "/mnt/new", rec.Path)
+
+	t.Run("an unchanged path keeps its history", func(t *testing.T) {
+		s.RecordRun("h", state.RunOutcome{
+			Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+			Repositories: []state.RepoOutcome{{ID: "local", Path: "/mnt/a", Result: state.ResultOK, Files: 4, Measured: true}},
+		})
+		s.RecordRun("h", state.RunOutcome{
+			Finished: time.Now(), Result: state.ResultFailed, CreateAttempted: true,
+			Repositories: []state.RepoOutcome{{ID: "local", Path: "/mnt/a", Result: state.ResultFailed}},
+		})
+		rec := s.Snapshot()["h"].Repositories["local"]
+		assert.False(t, rec.LastSuccess.IsZero())
+		require.NotNil(t, rec.LastStats)
+		assert.Equal(t, int64(4), rec.LastStats.Files)
+	})
+
+	t.Run("a record written before paths were stored is adopted, not reset", func(t *testing.T) {
+		s.RecordRun("i", state.RunOutcome{
+			Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+			Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK, Files: 7, Measured: true}},
+		})
+		s.RecordRun("i", state.RunOutcome{
+			Finished: time.Now(), Result: state.ResultFailed, CreateAttempted: true,
+			Repositories: []state.RepoOutcome{{ID: "local", Path: "/mnt/a", Result: state.ResultFailed}},
+		})
+		rec := s.Snapshot()["i"].Repositories["local"]
+		assert.False(t, rec.LastSuccess.IsZero(), "an upgrade must not wipe every repository's freshness")
+		assert.Equal(t, "/mnt/a", rec.Path)
+	})
+}
