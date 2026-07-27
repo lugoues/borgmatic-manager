@@ -149,7 +149,7 @@ func runStatus(ctx context.Context, jsonOut bool) error {
 	}
 	// Plan (no writes) surfaces groups generation refuses, so status can
 	// say "refused" instead of a forever-"due now" that never runs.
-	_, refusals, err := e.newGenerator(e.configsDir, logger).Plan(backupState)
+	planned, refusals, err := e.newGenerator(e.configsDir, logger).Plan(backupState)
 	if err != nil {
 		return err
 	}
@@ -164,7 +164,8 @@ func runStatus(ctx context.Context, jsonOut bool) error {
 	}
 
 	if jsonOut {
-		return printStatusJSON(backupState, stateStore(e, logger), e.locksDir(), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
+		return printStatusJSON(backupState, stateStore(e, logger), e.locksDir(), period, runTimeout,
+			e.cfg.GroupPeriods, refused, scheduler.RepositoryInventory(planned), offline)
 	}
 	printStatus(backupState, stateStore(e, logger), e.locksDir(), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
 	return nil
@@ -726,6 +727,12 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	// longer configured" would be missing exactly where it is needed.
 	if emitter != nil {
 		emitter.ObserveInventory(backupState, offline)
+		// And the repository inventory with it. A one-shot run may target a
+		// subset of groups, and its final collection at shutdown still reports
+		// every group from persisted state, so without this a repository removed
+		// from a group this run never touched is exported as though it were
+		// still configured.
+		emitter.ObserveRepositories(scheduler.RepositoryInventory(meta))
 	}
 
 	now := time.Now()
