@@ -26,3 +26,11 @@ func ArchiveSampleNameForTest(format string) string { return archiveSampleName(f
 func PatternsCollideForTest(patternA, sampleA, patternB, sampleB string) bool {
 	return patternsCollide(patternA, sampleA, patternB, sampleB)
 }
+
+// SetSampleHostname pins the hostname the sample renderer uses, so a collision
+// that depends on the hostname can be tested on any machine.
+func SetSampleHostname(name string) func() {
+	prev := sampleHostname
+	sampleHostname = func() string { return name }
+	return func() { sampleHostname = prev }
+}

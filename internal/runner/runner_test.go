@@ -1585,7 +1585,7 @@ func TestAnOverlappingArchivePatternCannotConfirmSuccess(t *testing.T) {
 		run := &runState{logger: r.logger, group: "app"}
 
 		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, nil,
-			archiveScope{pattern: "*-app-*", ambiguous: true}, run, runStart)
+			archiveScope{pattern: "*-app-*", ambiguous: map[string]bool{offsite.Path: true}}, run, runStart)
 
 		assert.Nil(t, out, "a probe that cannot tell the groups apart confirms nothing")
 		assert.Empty(t, pf.probed(), "and is not worth running")
@@ -1614,7 +1614,7 @@ func TestAnOverlappingArchivePatternCannotConfirmSuccess(t *testing.T) {
 		run := &runState{logger: r.logger, group: "app"}
 
 		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite},
-			[]createResult{res}, archiveScope{pattern: "*-app-*", ambiguous: true}, run, runStart)
+			[]createResult{res}, archiveScope{pattern: "*-app-*", ambiguous: map[string]bool{offsite.Path: true}}, run, runStart)
 
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultOK, out[0].Result)
@@ -1685,4 +1685,54 @@ func TestTheTimeoutBranchRecordsMeasuredDestinations(t *testing.T) {
 	require.Len(t, o.Repositories, 1, "and the destination that finished is still recorded")
 	assert.Equal(t, state.ResultOK, o.Repositories[0].Result)
 	assert.Equal(t, int64(42), o.Repositories[0].Files)
+}
+
+// A group can share one destination with a colliding sibling and have another
+// to itself. Only the shared one is in question: nothing else writes to the
+// private repository, so an archive found there is this group's, and treating
+// the whole group as ambiguous leaves that destination's last-success stale for
+// a backup that could have been confirmed.
+func TestAmbiguityIsScopedToTheSharedRepository(t *testing.T) {
+	runStart := time.Now().Add(-time.Minute)
+	fresh := runStart.Add(10 * time.Second)
+	shared := config.RepoRef{Path: "/mnt/shared", Label: "shared"}
+	private := config.RepoRef{Path: "/mnt/private", Label: "private"}
+
+	pf := &probeFake{out: map[string]string{
+		shared.Path:  listJSON(fresh),
+		private.Path: listJSON(fresh),
+	}}
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", nil, 0)
+	r.execCommand = pf.exec
+	run := &runState{logger: r.logger, group: "app"}
+
+	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+		[]config.RepoRef{shared, private}, nil,
+		archiveScope{pattern: "*-app-*", ambiguous: map[string]bool{shared.Path: true}},
+		run, runStart)
+
+	require.Len(t, out, 1, "only the destination that could be confirmed is recorded")
+	assert.Equal(t, "private", out[0].ID)
+	assert.Equal(t, state.ResultOK, out[0].Result)
+	assert.Equal(t, []string{private.Path}, pf.probed(),
+		"the shared destination is not probed, the private one is")
+}
+
+// The scope keys on canonical repository identity, so a configured path that
+// borg would normalize still matches the repository generation flagged.
+func TestScopeAmbiguityMatchesOnCanonicalRepositoryIdentity(t *testing.T) {
+	dir := t.TempDir()
+	scope := newArchiveScope(config.GroupRunMeta{
+		ArchivePattern: "*-app-*",
+		AmbiguousRepos: []string{config.CanonicalRepoKey(dir + "/repo")},
+	})
+
+	assert.False(t, scope.canConfirm(dir+"/repo/"), "a trailing separator is not a different repository")
+	assert.False(t, scope.canConfirm(dir+"/./repo"))
+	assert.True(t, scope.canConfirm(dir+"/other"))
+	assert.True(t, scope.anyAmbiguous())
+
+	assert.True(t, newArchiveScope(config.GroupRunMeta{ArchivePattern: "*-app-*"}).canConfirm("/anything"),
+		"a group with no collisions confirms everywhere")
 }

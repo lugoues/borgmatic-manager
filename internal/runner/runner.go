@@ -337,7 +337,7 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	close(done)
 
 	return r.interpretResult(ctx, groupName, configPath, meta.Repositories,
-		archiveScope{pattern: meta.ArchivePattern, ambiguous: meta.AmbiguousArchivePattern},
+		newArchiveScope(meta),
 		waitErr, run, start, time.Since(start), timedOut.Load())
 }
 
@@ -590,13 +590,35 @@ func refID(ref config.RepoRef) string {
 // this one prefixes, so "*-app-*" also matches "*-app-prod-*". It cannot confirm
 // that this group wrote anything.
 type archiveScope struct {
-	pattern   string
-	ambiguous bool
+	pattern string
+	// ambiguous holds the canonical keys of the repositories where another
+	// group's archives also match this pattern. Per repository, because a group
+	// can share one destination with a colliding sibling and have another to
+	// itself, and only the shared one is in question.
+	ambiguous map[string]bool
 }
 
-// canConfirm reports whether a probe using this scope proves this group's backup
-// reached a repository, rather than merely proving that some archive exists.
-func (a archiveScope) canConfirm() bool { return !a.ambiguous }
+// canConfirm reports whether a probe against this repository proves this group's
+// backup reached it, rather than merely proving that some archive is there.
+func (a archiveScope) canConfirm(repoPath string) bool {
+	return !a.ambiguous[config.CanonicalRepoKey(repoPath)]
+}
+
+// anyAmbiguous reports whether any repository in this run lost confirmation, for
+// the one warning emitted per run rather than per repository.
+func (a archiveScope) anyAmbiguous() bool { return len(a.ambiguous) > 0 }
+
+// newArchiveScope builds the scope for a group's run.
+func newArchiveScope(meta config.GroupRunMeta) archiveScope {
+	scope := archiveScope{pattern: meta.ArchivePattern}
+	if len(meta.AmbiguousRepos) > 0 {
+		scope.ambiguous = make(map[string]bool, len(meta.AmbiguousRepos))
+		for _, key := range meta.AmbiguousRepos {
+			scope.ambiguous[key] = true
+		}
+	}
+	return scope
+}
 
 // matchResults pairs each configured repository with the create result borgmatic
 // reported for it, by index into configured.
@@ -780,7 +802,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	}
 	errText := run.errorMessages()
 
-	if !scope.canConfirm() && len(results) == 0 {
+	if scope.anyAmbiguous() && len(results) == 0 {
 		r.logger.Warn("cannot confirm which destinations this group reached: its archive pattern also matches another group's archives; rename a group or split repositories",
 			"group", run.group, "pattern", scope.pattern)
 	}
@@ -821,7 +843,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 		if _, ok := measured[i]; ok {
 			continue // borgmatic already reported its archive; nothing to probe
 		}
-		if !scope.canConfirm() {
+		if !scope.canConfirm(ref.Path) {
 			// The pattern also matches a sibling group's archives, so a probe
 			// answers a different question from the one being asked: a sibling
 			// backup landing in the same whole second would confirm a success

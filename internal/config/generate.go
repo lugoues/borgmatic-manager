@@ -53,12 +53,18 @@ type GroupRunMeta struct {
 	// RunID is minted fresh each generation and stamped onto dump helper
 	// containers so the runner reaps only this run's orphans.
 	RunID string
-	// AmbiguousArchivePattern is set when another group sharing a repository has
-	// a name this one prefixes, so their archive patterns overlap: this group's
-	// "*-app-*" also matches "*-app-prod-*". The pattern is still correct for
-	// retention (borgmatic's own concern) but it cannot answer "did this group
-	// write an archive here", so it must not be used to confirm a success.
-	AmbiguousArchivePattern bool
+	// AmbiguousRepos are the canonical keys of repositories this group shares
+	// with a group whose archive pattern overlaps its own: this group's
+	// "*-app-*" also matches "*-app-prod-*". The pattern stays correct for
+	// retention (borgmatic's own concern) but in those repositories it cannot
+	// answer "did this group write an archive here", so it must not be used to
+	// confirm a success there.
+	//
+	// Per repository, not per group. A group can have a destination it shares
+	// with a colliding sibling and another that is its own, and the second one's
+	// probe is unaffected: nothing else writes to it, so an archive found there
+	// is this group's.
+	AmbiguousRepos []string
 	// ArchivePattern matches the archive names this group's config produces,
 	// with borg's date placeholders replaced by wildcards. Groups are allowed to
 	// share a repository, so "the newest archive here" is not the same question
@@ -327,10 +333,10 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		format, _ := e.final["archive_name_format"].(string)
 		samples[e.name] = archiveSampleName(format)
 	}
-	for _, name := range overlappingPatternGroups(repoGroups, patterns, samples, g.logger) {
+	for name, repos := range overlappingPatternRepos(repoGroups, patterns, samples, g.logger) {
 		for i := range kept {
 			if kept[i].name == name {
-				kept[i].meta.AmbiguousArchivePattern = true
+				kept[i].meta.AmbiguousRepos = repos
 			}
 		}
 	}
@@ -619,35 +625,46 @@ func volumeNamedPath(hostPath, volumeName string) string {
 	return hostPath[:idx] + string(filepath.Separator) + "." + hostPath[idx:]
 }
 
-// overlappingPatternGroups reports every group whose archive pattern also
-// matches the archive names another group in a shared repository actually
-// produces, and warns once per colliding pair.
+// overlappingPatternRepos maps each group to the repositories in which its
+// archive pattern also matches another group's archives, and warns once per
+// colliding pair.
 //
-// The test is on the generated names, not on the group names, and not on the
-// patterns alone.
+// The result is per repository rather than per group. A group can share one
+// destination with a colliding sibling and have another to itself, and only the
+// shared one loses the ability to confirm a success.
 //
-// Group names are the wrong question because a name-prefix check only catches
-// the shape a separator happens to produce: with a format like "{group}{now}",
-// groups "app" and "apple" yield "app*" and "apple*", which overlap with no
-// hyphen anywhere.
+// The test is on the archive names a format generates, not on the group names
+// and not on the patterns alone.
 //
-// Comparing two patterns as sets of strings is the wrong question in the other
-// direction, because it asks whether any string at all matches both. For the
-// common "{hostname}-{group}-{now}", "*-app-*" and "*-other-*" both match
+// Group names are the wrong question because a name check only catches the shape
+// a separator happens to produce: with "{group}{now}", groups "app" and "apple"
+// yield "app*" and "apple*", which collide with no separator anywhere. And a
+// collision can come from the hostname rather than the group name at all, which
+// is why the sample renders the placeholders whose values this host knows.
+//
+// Comparing two patterns as sets of strings is wrong in the other direction,
+// because it asks whether any string matches both. For the common
+// "{hostname}-{group}-{now}", "*-app-*" and "*-other-*" both match
 // "x-app--other-y", so every pair of groups would look like a collision. What
 // matters is narrower: whether one group's pattern matches a name the other
 // group's format would actually generate.
-func overlappingPatternGroups(repoGroups map[string][]string, patterns, samples map[string]string, logger *slog.Logger) []string {
-	var affected []string
-	add := func(name string) {
-		for _, n := range affected {
-			if n == name {
+func overlappingPatternRepos(repoGroups map[string][]string, patterns, samples map[string]string, logger *slog.Logger) map[string][]string {
+	affected := map[string][]string{}
+	add := func(name, repo string) {
+		for _, r := range affected[name] {
+			if r == repo {
 				return
 			}
 		}
-		affected = append(affected, name)
+		affected[name] = append(affected[name], repo)
 	}
-	for repo, groups := range repoGroups {
+	repos := make([]string, 0, len(repoGroups))
+	for repo := range repoGroups {
+		repos = append(repos, repo)
+	}
+	sort.Strings(repos)
+	for _, repo := range repos {
+		groups := repoGroups[repo]
 		if len(groups) < 2 {
 			continue
 		}
@@ -657,11 +674,11 @@ func overlappingPatternGroups(repoGroups map[string][]string, patterns, samples 
 				if !patternsCollide(patterns[a], samples[a], patterns[b], samples[b]) {
 					continue
 				}
-				logger.Warn("groups sharing a repository have overlapping archive name patterns; retention can cross group boundaries and neither group's backups can be confirmed independently, rename a group or split repositories",
+				logger.Warn("groups sharing a repository have overlapping archive name patterns; retention can cross group boundaries and neither group's backups can be confirmed independently in it, rename a group or split repositories",
 					"repository", repo, "groups", a+", "+b,
 					"patterns", patterns[a]+", "+patterns[b])
-				add(a)
-				add(b)
+				add(a, repo)
+				add(b, repo)
 			}
 		}
 	}
@@ -714,20 +731,63 @@ func globMatches(pattern, name string) bool {
 func archiveSampleName(format string) string {
 	var b strings.Builder
 	depth := 0
+	var token strings.Builder
 	for _, r := range format {
 		switch {
 		case r == '{':
-			if depth == 0 {
-				b.WriteString(samplePlaceholder)
-			}
 			depth++
+			if depth == 1 {
+				token.Reset()
+			}
 		case r == '}' && depth > 0:
 			depth--
-		case depth == 0:
+			if depth == 0 {
+				b.WriteString(samplePlaceholderValue(token.String()))
+			}
+		case depth > 0:
+			token.WriteRune(r)
+		default:
 			b.WriteRune(r)
 		}
 	}
 	return b.String()
+}
+
+// samplePlaceholderValue renders one of borg's runtime placeholders.
+//
+// The ones whose value this host already knows are rendered as that value,
+// because a stand-in can hide a real collision. With the default format and a
+// hostname like "db-app-node", groups "app" and "prod" produce the archives
+// "db-app-node-app-..." and "db-app-node-prod-...", and the second matches the
+// first group's "*-app-*" pattern through the hostname alone. Substituting
+// digits for the hostname makes those two look disjoint when they are not.
+//
+// Timestamps stay a digits-only stand-in: their value differs every run, so no
+// single rendering is the right one, and digits introduce no separator that
+// could manufacture a match or hide one.
+func samplePlaceholderValue(token string) string {
+	name, _, _ := strings.Cut(token, ":")
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "hostname", "fqdn", "reverse-hostname":
+		if h := sampleHostname(); h != "" {
+			return h
+		}
+	case "user", "username":
+		if u := os.Getenv("USER"); u != "" {
+			return u
+		}
+	}
+	return samplePlaceholder
+}
+
+// sampleHostname is a seam: the value borg will expand {hostname} to is this
+// host's, and tests need to pin it.
+var sampleHostname = func() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // samplePlaceholder stands in for a runtime placeholder when rendering a sample

@@ -773,11 +773,11 @@ func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
 	meta, err := g.Generate(state)
 	require.NoError(t, err)
 
-	assert.True(t, meta["app"].AmbiguousArchivePattern,
+	assert.NotEmpty(t, meta["app"].AmbiguousRepos,
 		"the prefix matches the longer group's archives")
-	assert.True(t, meta["app-prod"].AmbiguousArchivePattern,
+	assert.NotEmpty(t, meta["app-prod"].AmbiguousRepos,
 		"and it shares a repository with a group whose retention crosses into its own")
-	assert.False(t, meta["other"].AmbiguousArchivePattern,
+	assert.Empty(t, meta["other"].AmbiguousRepos,
 		"a group no other name prefixes keeps a usable pattern")
 	assert.NotEmpty(t, meta["app"].ArchivePattern,
 		"the pattern is still produced; it is retention that still needs it")
@@ -807,30 +807,30 @@ func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
 
 	t.Run("no separator before the timestamp still collides", func(t *testing.T) {
 		meta := generate(t, "{group}{now}", "app", "apple")
-		assert.True(t, meta["app"].AmbiguousArchivePattern,
+		assert.NotEmpty(t, meta["app"].AmbiguousRepos,
 			`"app*" matches the archives "apple" writes`)
-		assert.True(t, meta["apple"].AmbiguousArchivePattern)
+		assert.NotEmpty(t, meta["apple"].AmbiguousRepos)
 	})
 
 	t.Run("a trailing group name cannot collide", func(t *testing.T) {
 		meta := generate(t, "{now}-{group}", "app", "apple")
-		assert.False(t, meta["app"].AmbiguousArchivePattern,
+		assert.Empty(t, meta["app"].AmbiguousRepos,
 			`no name ends in both "-app" and "-apple"`)
-		assert.False(t, meta["apple"].AmbiguousArchivePattern)
+		assert.Empty(t, meta["apple"].AmbiguousRepos)
 	})
 
 	t.Run("unrelated groups sharing a repository are not collisions", func(t *testing.T) {
 		meta := generate(t, "{hostname}-{group}-{now}", "app", "other", "third")
 		for _, name := range []string{"app", "other", "third"} {
-			assert.False(t, meta[name].AmbiguousArchivePattern,
+			assert.Empty(t, meta[name].AmbiguousRepos,
 				"%s shares a repository but its archives are distinguishable", name)
 		}
 	})
 
 	t.Run("the prefix shape is still caught", func(t *testing.T) {
 		meta := generate(t, "{hostname}-{group}-{now}", "app", "app-prod")
-		assert.True(t, meta["app"].AmbiguousArchivePattern)
-		assert.True(t, meta["app-prod"].AmbiguousArchivePattern)
+		assert.NotEmpty(t, meta["app"].AmbiguousRepos)
+		assert.NotEmpty(t, meta["app-prod"].AmbiguousRepos)
 	})
 }
 
@@ -891,10 +891,97 @@ func TestPatternsCollide(t *testing.T) {
 // The sample stands in for what borg expands at runtime. Dropping the
 // placeholders entirely would compare group names rather than archive names.
 func TestArchiveSampleName(t *testing.T) {
+	defer config.SetSampleHostname("myhost")()
+
 	assert.Equal(t, "app20260102150405", config.ArchiveSampleNameForTest("app{now}"))
-	assert.Equal(t, "20260102150405-app-20260102150405",
-		config.ArchiveSampleNameForTest("{hostname}-app-{now}"))
 	assert.Equal(t, "plain", config.ArchiveSampleNameForTest("plain"))
 	assert.NotContains(t, config.ArchiveSampleNameForTest("app{now}"), "{",
 		"a placeholder left literal would never match a real archive name")
+
+	// The hostname is known, so it is rendered rather than stood in for: a
+	// stand-in hides a collision that the real value creates.
+	assert.Equal(t, "myhost-app-20260102150405",
+		config.ArchiveSampleNameForTest("{hostname}-app-{now}"))
+	assert.Equal(t, "myhost-app-20260102150405",
+		config.ArchiveSampleNameForTest("{fqdn}-app-{now:%Y-%m-%d}"))
+
+	// The name is what precedes the colon. Reading the whole token would leave a
+	// placeholder whose value is known standing in as digits, which is how the
+	// hostname collision hid in the first place.
+	assert.Equal(t, "myhost-x", config.ArchiveSampleNameForTest("{hostname:%s}-x"),
+		"a format spec does not change which placeholder it is")
+	assert.Equal(t, "myhost-x", config.ArchiveSampleNameForTest("{ HOSTNAME }-x"),
+		"nor does case or padding")
+}
+
+// The collision the digits-only stand-in hid: with this hostname, group "prod"
+// writes "db-app-node-prod-..." and group "app" claims it with "*-app-*".
+func TestAHostnameCanCreateACollision(t *testing.T) {
+	defer config.SetSampleHostname("db-app-node")()
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+	}}
+
+	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	meta, err := g.Generate(st)
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, meta["app"].AmbiguousRepos,
+		`"*-app-*" matches "db-app-node-prod-..." through the hostname`)
+	assert.NotEmpty(t, meta["prod"].AmbiguousRepos)
+}
+
+// The control: an ordinary hostname leaves those same two groups distinguishable.
+func TestAnOrdinaryHostnameLeavesGroupsDistinguishable(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+	}}
+
+	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	meta, err := g.Generate(st)
+	require.NoError(t, err)
+
+	assert.Empty(t, meta["app"].AmbiguousRepos)
+	assert.Empty(t, meta["prod"].AmbiguousRepos)
+}
+
+// Ambiguity belongs to a repository, not to a group. A group sharing one
+// destination with a colliding sibling and holding another to itself keeps
+// confirmation on the second: nothing else writes there.
+func TestAmbiguityNamesOnlyTheSharedRepository(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("app-prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+	}}
+	// app also backs up to a repository of its own.
+	overrides := map[string]map[string]interface{}{
+		"app": {"repositories": []interface{}{
+			map[string]interface{}{"path": "/mnt/shared"},
+			map[string]interface{}{"path": "/mnt/app-only"},
+		}},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	meta, err := g.Generate(st)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{config.CanonicalRepoKey("/mnt/shared")}, meta["app"].AmbiguousRepos,
+		"only the destination it shares with the colliding sibling")
+	assert.NotContains(t, meta["app"].AmbiguousRepos, config.CanonicalRepoKey("/mnt/app-only"),
+		"the repository it has to itself can still confirm")
+	assert.Equal(t, []string{config.CanonicalRepoKey("/mnt/shared")}, meta["app-prod"].AmbiguousRepos)
 }
