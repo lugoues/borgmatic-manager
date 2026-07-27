@@ -246,7 +246,7 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	configPath := filepath.Join(r.configDir, groupName+".yaml")
 	runID := meta.RunID
 
-	if err := r.validateConfig(ctx, groupName, configPath); err != nil {
+	if err := r.validateConfig(ctx, groupName, configPath, meta.Repositories); err != nil {
 		return err
 	}
 
@@ -336,7 +336,8 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	waitErr := cmd.Wait()
 	close(done)
 
-	return r.interpretResult(ctx, groupName, configPath, meta.Repositories, meta.ArchivePattern,
+	return r.interpretResult(ctx, groupName, configPath, meta.Repositories,
+		archiveScope{pattern: meta.ArchivePattern, ambiguous: meta.AmbiguousArchivePattern},
 		waitErr, run, start, time.Since(start), timedOut.Load())
 }
 
@@ -346,7 +347,7 @@ const validateTimeout = 2 * time.Minute
 
 // validateConfig gates each cycle on 'borgmatic config validate', turning schema
 // drift into a precise, recorded failure instead of a broken backup run.
-func (r *Runner) validateConfig(ctx context.Context, groupName, configPath string) error {
+func (r *Runner) validateConfig(ctx context.Context, groupName, configPath string, repos []config.RepoRef) error {
 	cmd := r.execCommand(ctx, r.borgmaticPath, "--config", configPath, "config", "validate")
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -390,7 +391,7 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 	if err != nil {
 		r.logger.Error("generated config failed borgmatic validation; skipping group this cycle",
 			"group", groupName, "config", configPath, "output", strings.TrimSpace(out.String()))
-		r.recordValidationFailure(groupName)
+		r.recordValidationFailure(groupName, repos)
 		return fmt.Errorf("config validation failed for group %s", groupName)
 	}
 	return nil
@@ -408,20 +409,32 @@ func (r *Runner) terminateGroup(cmd *exec.Cmd, exited <-chan struct{}, groupName
 	}
 }
 
-// recordValidationFailure surfaces validation failures in status instead of a stale green last run.
-func (r *Runner) recordValidationFailure(groupName string) {
+// recordValidationFailure surfaces validation failures in status instead of a
+// stale green last run.
+//
+// The configured repositories go with it. A config that fails schema validation
+// still names its destinations (the manager wrote them), so this is not the
+// "nothing to attribute it to" case: without them the run counts once under an
+// empty repository, which drops it out of every repository-filtered dashboard,
+// and the inventory cannot reconcile a destination added or removed in the same
+// edit that broke the config.
+func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRef) {
 	if r.recorder == nil {
 		return
 	}
-	r.recorder.RecordRun(groupName, state.RunOutcome{
+	outcome := state.RunOutcome{
 		Finished: time.Now(),
 		Result:   "config-invalid",
-	})
+	}
+	for _, ref := range repos {
+		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
+	}
+	r.recorder.RecordRun(groupName, outcome)
 }
 
 // interpretResult turns exit state into logs and an error. borgmatic exits 0
 // even with warnings (output-only), 1 on error, 143 on SIGTERM.
-func (r *Runner) interpretResult(ctx context.Context, groupName, configPath string, repos []config.RepoRef, archivePattern string, waitErr error, run *runState, start time.Time, duration time.Duration, timedOut bool) error {
+func (r *Runner) interpretResult(ctx context.Context, groupName, configPath string, repos []config.RepoRef, scope archiveScope, waitErr error, run *runState, start time.Time, duration time.Duration, timedOut bool) error {
 	warnings := run.warnings.Load()
 	exitCode := 0
 	if waitErr != nil {
@@ -495,13 +508,13 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 	// External SIGKILL (OOM killer, kill -9) counts as failed: "terminated"
 	// would hide the group from status's failed-groups alert.
 	case exitCode == sigkillExit:
-		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, results, archivePattern, run, start))
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, results, scope, run, start))
 		r.logger.Error("borgmatic killed (SIGKILL), likely the OOM killer or an external kill -9", "group", groupName,
 			"exit_code", exitCode, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s was killed (exit %d); not a manager timeout, check for OOM", groupName, exitCode)
 
 	default:
-		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, results, archivePattern, run, start))
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, results, scope, run, start))
 		if run.repoMissing.Load() {
 			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
 				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
@@ -563,6 +576,28 @@ func refID(ref config.RepoRef) string {
 	}
 	return ref.Path
 }
+
+// archiveScope is how the probe identifies this group's archives, and whether it
+// can be trusted to.
+//
+// An empty pattern means the group's config names no archive format to match on;
+// the probe then asks "is there a fresh archive here at all", which is the same
+// question only when no other group shares the repository. Generation refuses a
+// shared-repo group whose archive_name_format lacks the {group} token, so a
+// shared repository always yields a pattern.
+//
+// ambiguous is the case a pattern alone cannot express: the pattern exists and
+// is correct for retention, but another group sharing the repository has a name
+// this one prefixes, so "*-app-*" also matches "*-app-prod-*". It cannot confirm
+// that this group wrote anything.
+type archiveScope struct {
+	pattern   string
+	ambiguous bool
+}
+
+// canConfirm reports whether a probe using this scope proves this group's backup
+// reached a repository, rather than merely proving that some archive exists.
+func (a archiveScope) canConfirm() bool { return !a.ambiguous }
 
 // matchResults pairs each configured repository with the create result borgmatic
 // reported for it, by index into configured.
@@ -705,12 +740,17 @@ func (r *Runner) perRepoSuccess(configured []config.RepoRef, results []createRes
 // nor confirmed is left out (nil), so its persisted last-success is untouched
 // rather than falsely advanced or failed.
 func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configured []config.RepoRef,
-	results []createResult, archivePattern string, run *runState, runStart time.Time,
+	results []createResult, scope archiveScope, run *runState, runStart time.Time,
 ) []state.RepoOutcome {
 	if len(configured) == 0 {
 		return nil
 	}
 	errText := run.errorMessages()
+
+	if !scope.canConfirm() && len(results) == 0 {
+		r.logger.Warn("cannot confirm which destinations this group reached: its archive pattern also matches another group's archives; rename a group or split repositories",
+			"group", run.group, "pattern", scope.pattern)
+	}
 
 	// A create result is direct evidence: borgmatic reported the archive it
 	// wrote, with its measurements. A run can still fail afterwards, when a
@@ -748,13 +788,22 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 		if _, ok := measured[i]; ok {
 			continue // borgmatic already reported its archive; nothing to probe
 		}
+		if !scope.canConfirm() {
+			// The pattern also matches a sibling group's archives, so a probe
+			// answers a different question from the one being asked: a sibling
+			// backup landing in the same whole second would confirm a success
+			// this group never had. Refusing to confirm leaves the repository
+			// untouched, which is wrong in a way that shows up as a stale
+			// last-success rather than as a false fresh one.
+			continue
+		}
 		if ref.Path == "" || implicated[i] {
 			continue // named in an error: it failed, and probing it is pointless
 		}
 		wg.Add(1)
 		go func(i int, path string) {
 			defer wg.Done()
-			confirmed[i] = r.confirmRepoSucceeded(ctx, configPath, path, archivePattern, runStart)
+			confirmed[i] = r.confirmRepoSucceeded(ctx, configPath, path, scope.pattern, runStart)
 		}(i, ref.Path)
 	}
 	wg.Wait()
