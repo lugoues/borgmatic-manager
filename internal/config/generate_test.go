@@ -875,15 +875,15 @@ func TestPatternsCollide(t *testing.T) {
 		assert.False(t, config.GlobMatchesForTest("alpha", "alpha20260102150405"),
 			"alpha's own pattern does not match beta's names")
 		assert.True(t, config.PatternsCollideForTest(
-			"alpha", "alpha", // group alpha, format "{group}"
-			"alpha*", "alpha20260102150405"), // group beta, format "alpha{now}"
+			"alpha", []string{"alpha"}, // group alpha, format "{group}"
+			"alpha*", []string{"alpha20260102150405"}), // group beta, format "alpha{now}"
 			"but beta's pattern claims alpha's archives")
 	})
 
 	t.Run("distinguishable patterns do not collide", func(t *testing.T) {
 		assert.False(t, config.PatternsCollideForTest(
-			"*-app-*", "20260102150405-app-20260102150405",
-			"*-other-*", "20260102150405-other-20260102150405"))
+			"*-app-*", []string{"20260102150405-app-20260102150405"},
+			"*-other-*", []string{"20260102150405-other-20260102150405"}))
 	})
 
 	// Unreachable through generation today, because a shared-repo group whose
@@ -891,35 +891,81 @@ func TestPatternsCollide(t *testing.T) {
 	// Kept because "nothing is known about this group's archive names" must not
 	// read as "its archives are distinguishable" if that ever changes.
 	t.Run("an unknown pattern is treated as colliding", func(t *testing.T) {
-		assert.True(t, config.PatternsCollideForTest("", "", "*-app-*", "x-app-y"))
-		assert.True(t, config.PatternsCollideForTest("*-app-*", "x-app-y", "", ""))
+		assert.True(t, config.PatternsCollideForTest("", nil, "*-app-*", []string{"x-app-y"}))
+		assert.True(t, config.PatternsCollideForTest("*-app-*", []string{"x-app-y"}, "", nil))
 	})
 }
 
-// The sample stands in for what borg expands at runtime. Dropping the
-// placeholders entirely would compare group names rather than archive names.
+// The sample renders what borg would actually write. A placeholder whose value
+// this host knows is rendered as that value; one whose value cannot be known
+// falls back to a digits-only stand-in that introduces no separators.
 func TestArchiveSampleName(t *testing.T) {
 	defer config.SetSampleHostname("myhost")()
 
-	assert.Equal(t, "app20260102150405", config.ArchiveSampleNameForTest("app{now}"))
 	assert.Equal(t, "plain", config.ArchiveSampleNameForTest("plain"))
-	assert.NotContains(t, config.ArchiveSampleNameForTest("app{now}"), "{",
+	assert.NotContains(t, config.ArchiveSampleNameForTest("app{unknowable}"), "{",
 		"a placeholder left literal would never match a real archive name")
 
-	// The hostname is known, so it is rendered rather than stood in for: a
-	// stand-in hides a collision that the real value creates.
-	assert.Equal(t, "myhost-app-20260102150405",
-		config.ArchiveSampleNameForTest("{hostname}-app-{now}"))
-	assert.Equal(t, "myhost-app-20260102150405",
-		config.ArchiveSampleNameForTest("{fqdn}-app-{now:%Y-%m-%d}"))
+	assert.Equal(t, "myhost-app-2026-07-27T16:04:26",
+		config.ArchiveSampleNameForTest("{hostname}-app-{now}"),
+		"the hostname is known, and {now} renders in borg's default form")
 
-	// The name is what precedes the colon. Reading the whole token would leave a
-	// placeholder whose value is known standing in as digits, which is how the
-	// hostname collision hid in the first place.
+	// The name is what precedes the colon.
 	assert.Equal(t, "myhost-x", config.ArchiveSampleNameForTest("{hostname:%s}-x"),
 		"a format spec does not change which placeholder it is")
 	assert.Equal(t, "myhost-x", config.ArchiveSampleNameForTest("{ HOSTNAME }-x"),
 		"nor does case or padding")
+
+	// A formatted timestamp renders through its directives, which is how a
+	// two-digit month can collide with a group named after one.
+	assert.Equal(t, "x-07-y", config.ArchiveSampleNameForTest("x-{now:%m}-y"))
+	assert.Equal(t, "2026-07-27", config.ArchiveSampleNameForTest("{now:%Y-%m-%d}"))
+
+	// An unsupported directive gives up rather than rendering half a value.
+	assert.Equal(t, "x-20260102150405-y", config.ArchiveSampleNameForTest("x-{now:%j}-y"))
+}
+
+func TestStrftimeLayout(t *testing.T) {
+	for _, tc := range []struct {
+		spec, layout string
+		ok           bool
+	}{
+		{spec: "%Y-%m-%d", layout: "2006-01-02", ok: true},
+		{spec: "%H:%M:%S", layout: "15:04:05", ok: true},
+		{spec: "%m", layout: "01", ok: true},
+		{spec: "%b %a", layout: "Jan Mon", ok: true},
+		{spec: "backup-%Y", layout: "backup-2006", ok: true},
+		{spec: "100%%", layout: "100%", ok: true},
+		{spec: "%j", ok: false},         // day of year has no Go layout
+		{spec: "%Y-%q", ok: false},      // unknown directive
+		{spec: "trailing %", ok: false}, // dangling percent
+	} {
+		t.Run(tc.spec, func(t *testing.T) {
+			layout, ok := config.StrftimeLayoutForTest(tc.spec)
+			assert.Equal(t, tc.ok, ok)
+			if tc.ok {
+				assert.Equal(t, tc.layout, layout)
+			}
+		})
+	}
+}
+
+// A single sample answers only for the date it used. Codex's case: group "07"
+// has the pattern "*-07-*", and a sibling whose format includes {now:%m} writes
+// "x-07-prod-..." every July. Whether they collide depends on the month, so the
+// check renders across the year.
+func TestACollisionThatOnlyExistsInSomeMonthsIsStillFound(t *testing.T) {
+	defer config.SetSampleHostname("myhost")()
+
+	names := config.ArchiveSampleNamesForTest("x-{now:%m}-prod-{now}")
+	require.Len(t, names, 12, "one rendering per month")
+	assert.Contains(t, names, "x-07-prod-2026-07-08T14:28:35",
+		"July is among them, and that is the month this collision exists in")
+
+	assert.True(t, config.PatternsCollideForTest(
+		"x-07-*", config.ArchiveSampleNamesForTest("x-{group}-{now}"),
+		"x-*-prod-*", names),
+		`the group named "07" claims the July archives of its sibling`)
 }
 
 // The collision the digits-only stand-in hid: with this hostname, group "prod"
@@ -1024,4 +1070,30 @@ func TestARefusedGroupDoesNotMakeASurvivorAmbiguous(t *testing.T) {
 	require.Contains(t, meta, "good")
 	assert.Empty(t, meta["good"].AmbiguousRepos,
 		"the survivor has the repository to itself and can still confirm its backups")
+}
+
+// The end-to-end shape of the same collision, through generation: a group named
+// after a month number and a sibling that puts the month in its archive names.
+func TestAGroupNamedLikeADateCollidesWithAFormattedTimestamp(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("07", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+		"archive_name_format": "x-{group}-{now}",
+	}}
+	overrides := map[string]map[string]interface{}{
+		"prod": {"archive_name_format": "x-{now:%m}-{group}-{now}"},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	meta, err := g.Generate(st)
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, meta["07"].AmbiguousRepos,
+		`"x-07-*" claims the archives prod writes every July`)
+	assert.NotEmpty(t, meta["prod"].AmbiguousRepos)
 }

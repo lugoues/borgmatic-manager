@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 // SetLookPath replaces the exec.LookPath seam for tests.
 func (g *Generator) SetLookPath(fn func(string) (string, error)) {
 	g.lookPath = fn
@@ -18,13 +20,22 @@ func ArchiveMatchPattern(format string) string { return archiveMatchPattern(form
 // tested directly rather than only through generation.
 func GlobMatchesForTest(pattern, name string) bool { return globMatches(pattern, name) }
 
-// ArchiveSampleNameForTest exposes the sample renderer for the same reason.
-func ArchiveSampleNameForTest(format string) string { return archiveSampleName(format) }
+// ArchiveSampleNameForTest renders one sample at a fixed instant, so the
+// rendering of individual placeholders can be asserted directly.
+func ArchiveSampleNameForTest(format string) string {
+	return archiveSampleNameAt(format, time.Date(2026, 7, 27, 16, 4, 26, 0, time.Local))
+}
+
+// ArchiveSampleNamesForTest exposes the full spread the collision check uses.
+func ArchiveSampleNamesForTest(format string) []string { return archiveSampleNames(format) }
+
+// StrftimeLayoutForTest exposes the directive conversion.
+func StrftimeLayoutForTest(spec string) (string, bool) { return strftimeLayout(spec) }
 
 // PatternsCollideForTest exposes the collision decision so the asymmetric and
 // degenerate cases can be stated directly rather than reached through a config.
-func PatternsCollideForTest(patternA, sampleA, patternB, sampleB string) bool {
-	return patternsCollide(patternA, sampleA, patternB, sampleB)
+func PatternsCollideForTest(patternA string, samplesA []string, patternB string, samplesB []string) bool {
+	return patternsCollide(patternA, samplesA, patternB, samplesB)
 }
 
 // SetSampleHostname pins the hostname the sample renderer uses, so a collision
