@@ -165,7 +165,7 @@ func runStatus(ctx context.Context, jsonOut bool) error {
 
 	if jsonOut {
 		return printStatusJSON(backupState, stateStore(e, logger), e.locksDir(), period, runTimeout,
-			e.cfg.GroupPeriods, refused, scheduler.RepositoryInventory(planned), offline)
+			e.cfg.GroupPeriods, refused, scheduler.RepositoryInventory(planned, refusals), offline)
 	}
 	printStatus(backupState, stateStore(e, logger), e.locksDir(), period, runTimeout, e.cfg.GroupPeriods, refused, offline)
 	return nil
@@ -209,8 +209,11 @@ func runInspect(ctx context.Context, group string) error {
 	// inventory rather than history. A planning failure leaves it nil, which
 	// passes the record through unfiltered.
 	var configured map[string]string
-	if planned, _, planErr := e.newGenerator(e.configsDir, logger).Plan(backupState); planErr == nil {
-		configured = scheduler.RepositoryInventory(planned)[group]
+	if planned, planRefusals, planErr := e.newGenerator(e.configsDir, logger).Plan(backupState); planErr == nil {
+		// Refusals included: a group refused in the same edit that removed a
+		// repository is absent from planned, and reading that as "unknown"
+		// passes the stale record straight through.
+		configured = scheduler.RepositoryInventory(planned, planRefusals)[group]
 	}
 
 	printInspect(group, g, rec, haveRec, configYAML, configNote, configured, period, e.cfg.GroupPeriods[group], offline)

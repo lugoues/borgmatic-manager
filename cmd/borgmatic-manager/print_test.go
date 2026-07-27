@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/lugoues/borgmatic-manager/internal/runner"
@@ -766,4 +767,43 @@ func TestInspectShowsOnlyTheCurrentRepositories(t *testing.T) {
 		})
 		assert.Contains(t, out, "archive", "silence is not a report that it was removed")
 	})
+}
+
+// A group refused in the same edit that removed a repository is absent from the
+// planned metadata, and reading that absence as "unknown" passes the stale
+// record straight through, which is the failure the filtering was added to stop.
+func TestStatusInventoryCoversRefusedGroups(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		RepositoriesKnown:      true,
+		ConfiguredRepositories: []string{"local", "offsite"},
+		ConfiguredRepositoryPaths: map[string]string{
+			"local": "/mnt/local", "offsite": "/mnt/offsite",
+		},
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Path: "/mnt/local", Result: state.ResultOK, Measured: true},
+			{ID: "offsite", Path: "/mnt/offsite", Result: state.ResultOK, Measured: true},
+		},
+	})
+
+	// The group is now refused, and its config no longer lists offsite. The
+	// inventory has to come from the refusal, since it is absent from planned.
+	configured := scheduler.RepositoryInventory(
+		map[string]config.GroupRunMeta{},
+		[]config.Refusal{{
+			Group:        "demo",
+			Reason:       "archive_name_format must contain the {group} token when groups share a repository",
+			Repositories: []config.RepoRef{{Path: "/mnt/local", Label: "local"}},
+		}},
+	)
+	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil,
+		map[string]string{"demo": "refused"}, configured, nil, time.Now())
+
+	require.Len(t, doc.Groups, 1)
+	assert.Contains(t, doc.Groups[0].Repositories, "local")
+	assert.NotContains(t, doc.Groups[0].Repositories, "offsite",
+		"a refused group still says what it configures, and it no longer configures this")
 }
