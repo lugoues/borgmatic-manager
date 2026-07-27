@@ -11,6 +11,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +183,13 @@ func (e *Emitter) register(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
+	repoInfo, err := m.Int64ObservableGauge("backup_repository_info",
+		metric.WithDescription("Always 1, once per repository the group has attempted. Staleness is only "+
+			"reported for a repository that has succeeded at least once, so without this a destination that "+
+			"has never produced an archive has no series to alert on."))
+	if err != nil {
+		return err
+	}
 	offlineVolumes, err := m.Int64ObservableGauge("backup_offline_volumes",
 		metric.WithDescription("Number of a group's volumes whose container is currently offline."))
 	if err != nil {
@@ -190,10 +198,10 @@ func (e *Emitter) register(m metric.Meter) error {
 
 	_, err = m.RegisterCallback(
 		func(_ context.Context, o metric.Observer) error {
-			e.observe(o, lastSize, lastFiles, offlineVolumes, groupInfo, lastDuration, staleness)
+			e.observe(o, lastSize, lastFiles, offlineVolumes, groupInfo, repoInfo, lastDuration, staleness)
 			return nil
 		},
-		lastSize, lastDuration, lastFiles, staleness, offlineVolumes, groupInfo,
+		lastSize, lastDuration, lastFiles, staleness, offlineVolumes, groupInfo, repoInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("registering metrics callback: %w", err)
@@ -204,7 +212,7 @@ func (e *Emitter) register(m metric.Meter) error {
 // observe pulls current state and reports every gauge. Called by the SDK at
 // each collection.
 func (e *Emitter) observe(o metric.Observer,
-	lastSize, lastFiles, offlineVolumes, groupInfo metric.Int64Observable,
+	lastSize, lastFiles, offlineVolumes, groupInfo, repoInfo metric.Int64Observable,
 	lastDuration, staleness metric.Float64Observable,
 ) {
 	now := e.now()
@@ -216,7 +224,13 @@ func (e *Emitter) observe(o metric.Observer,
 			)
 			// last_* reflect the most recent successful backup: a failed run
 			// carries no stats, so reporting its zeros would read as a shrink.
-			if lr := rr.LastRun; lr != nil && lr.Result == state.ResultOK {
+			// Read from the last outcome that measured something, not the last
+			// run. A later failure replaces LastRun outright, and a
+			// probe-confirmed success carries no stats at all, so reading LastRun
+			// either stopped reporting sizes or reported zeros — and a dataset
+			// that appears to have shrunk to nothing is a worse lie than one that
+			// stops updating.
+			if lr := rr.LastStats; lr != nil {
 				o.ObserveInt64(lastSize, lr.OriginalBytes, metric.WithAttributes(
 					attribute.String("group", group), attribute.String("repository", id), attribute.String("kind", "original")))
 				o.ObserveInt64(lastSize, lr.CompressedBytes, metric.WithAttributes(
@@ -226,8 +240,13 @@ func (e *Emitter) observe(o metric.Observer,
 				o.ObserveFloat64(lastDuration, float64(lr.DurationSeconds), repoAttrs)
 				o.ObserveInt64(lastFiles, lr.Files, repoAttrs)
 			}
-			// A repository that has never succeeded has no meaningful staleness
-			// value; its failing state is visible via backup_runs_total instead.
+			// One series per repository the group has attempted, so an alert can
+			// join against it. A repository that has never succeeded has no
+			// meaningful staleness value, and a fan-out group's info series says
+			// nothing about which destination is behind: without a per-repository
+			// sample, a newly added second repository that has never once
+			// completed is invisible to any staleness rule.
+			o.ObserveInt64(repoInfo, 1, repoAttrs)
 			if !rr.LastSuccess.IsZero() {
 				o.ObserveFloat64(staleness, now.Sub(rr.LastSuccess).Seconds(), repoAttrs)
 			}
@@ -296,18 +315,27 @@ func (e *Emitter) Shutdown(ctx context.Context) error {
 	return e.provider.Shutdown(ctx)
 }
 
+// OTLP transport names and the standard environment variables that select one.
+const (
+	protocolGRPC       = "grpc"
+	protocolHTTP       = "http"
+	protocolHTTPProto  = "http/protobuf"
+	envMetricsProtocol = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"
+	envProtocol        = "OTEL_EXPORTER_OTLP_PROTOCOL"
+)
+
 // newExporter builds an OTLP metric exporter for the configured protocol. An
 // empty endpoint lets the exporter fall back to OTEL_EXPORTER_OTLP_ENDPOINT and
 // then the OTLP default host and port.
 func newExporter(ctx context.Context, cfg config.MetricsSettings) (sdkmetric.Exporter, error) {
-	switch strings.ToLower(strings.TrimSpace(cfg.Protocol)) {
-	case "grpc":
+	switch resolveProtocol(cfg.Protocol) {
+	case protocolGRPC:
 		var opts []otlpmetricgrpc.Option
 		if cfg.Endpoint != "" {
 			opts = append(opts, otlpmetricgrpc.WithEndpointURL(cfg.Endpoint))
 		}
 		return otlpmetricgrpc.New(ctx, opts...)
-	case "", "http", "http/protobuf":
+	case "", protocolHTTP, protocolHTTPProto:
 		var opts []otlpmetrichttp.Option
 		if cfg.Endpoint != "" {
 			opts = append(opts, otlpmetrichttp.WithEndpointURL(cfg.Endpoint))
@@ -316,4 +344,25 @@ func newExporter(ctx context.Context, cfg config.MetricsSettings) (sdkmetric.Exp
 	default:
 		return nil, fmt.Errorf("unknown metrics protocol %q (want \"http\" or \"grpc\")", cfg.Protocol)
 	}
+}
+
+// resolveProtocol picks the OTLP transport, falling back to the standard
+// environment variables when the config does not name one.
+//
+// Each transport exporter reads the OTEL_* endpoint and TLS settings for
+// itself, but neither can switch into the other implementation, so choosing
+// which one to construct has to happen here. Without this a deployment relying
+// on the documented OTEL_EXPORTER_OTLP_PROTOCOL=grpc sent HTTP to a gRPC
+// collector and exported nothing at all.
+func resolveProtocol(configured string) string {
+	if p := strings.ToLower(strings.TrimSpace(configured)); p != "" {
+		return p
+	}
+	// Metrics-specific wins over the generic one, as the OTLP spec requires.
+	for _, key := range []string{envMetricsProtocol, envProtocol} {
+		if p := strings.ToLower(strings.TrimSpace(os.Getenv(key))); p != "" {
+			return p
+		}
+	}
+	return ""
 }

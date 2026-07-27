@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"testing"
 	"time"
 
@@ -83,7 +84,11 @@ func TestObservableGaugesReadFromState(t *testing.T) {
 		"web": {Repositories: map[string]state.RepoRecord{
 			"local": {
 				LastSuccess: now.Add(-90 * time.Second),
-				LastRun: &state.RepoOutcome{
+				// The measurements come from the last run that measured
+				// anything, not the last run. LastRun here is a later failure
+				// carrying zeros, which is what the gauges must not report.
+				LastRun: &state.RepoOutcome{Result: state.ResultFailed},
+				LastStats: &state.RepoOutcome{
 					Result: state.ResultOK, Files: 1234,
 					OriginalBytes: 5000, CompressedBytes: 3000, DeduplicatedBytes: 800,
 					DurationSeconds: 42,
@@ -155,6 +160,46 @@ func TestNewExporterProtocol(t *testing.T) {
 	require.Error(t, err, "an unknown protocol is rejected")
 }
 
+// The OTLP spec makes these variables the standard way to point an application
+// at a collector, and every other OTLP setting here is already read from the
+// environment by the exporter itself. Ignoring the protocol meant a deployment
+// that set OTEL_EXPORTER_OTLP_PROTOCOL=grpc got an HTTP exporter talking to a
+// gRPC collector: no error, no metrics.
+func TestProtocolFallsBackToTheStandardEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured string
+		env        map[string]string
+		want       string
+	}{
+		{name: "config wins over both", configured: "grpc",
+			env:  map[string]string{envMetricsProtocol: "http", envProtocol: "http"},
+			want: "grpc"},
+		{name: "metrics-specific wins over generic",
+			env:  map[string]string{envMetricsProtocol: "grpc", envProtocol: "http/protobuf"},
+			want: "grpc"},
+		{name: "generic applies when metrics-specific is unset",
+			env: map[string]string{envProtocol: "grpc"}, want: "grpc"},
+		{name: "an empty metrics-specific value does not mask the generic one",
+			env:  map[string]string{envMetricsProtocol: "  ", envProtocol: "grpc"},
+			want: "grpc"},
+		{name: "case and padding are ignored",
+			env: map[string]string{envProtocol: " GRPC "}, want: "grpc"},
+		{name: "nothing set leaves the default", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range []string{envMetricsProtocol, envProtocol} {
+				t.Setenv(k, "")
+				require.NoError(t, os.Unsetenv(k))
+			}
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			assert.Equal(t, tc.want, resolveProtocol(tc.configured))
+		})
+	}
+}
+
 // Every other series here appears only after a run, so without this a group
 // that has never succeeded is indistinguishable from one that was deleted, and
 // an alert on "no recent backup" cannot fire for the group that most needs it.
@@ -174,4 +219,45 @@ func TestGroupInfoIsEmittedForAGroupThatHasNeverRun(t *testing.T) {
 	require.Len(t, gauge.DataPoints, 1, "one series per configured group, run or not")
 	assert.Equal(t, int64(1), gauge.DataPoints[0].Value)
 	assert.Equal(t, "never-run", attr(gauge.DataPoints[0].Attributes, "group"))
+}
+
+// Staleness only exists once a repository has succeeded, so a newly added
+// second destination that has never completed emits nothing at all. Alerting on
+// the group's inventory does not catch it either: the sibling that is backing
+// up fine satisfies any group-level join. Without a per-repository series there
+// is nothing to alert on.
+func TestRepositoryInfoCoversADestinationThatHasNeverSucceeded(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"db": {Repositories: map[string]state.RepoRecord{
+			"local":   {LastSuccess: now.Add(-time.Hour)},
+			"offsite": {LastRun: &state.RepoOutcome{ID: "offsite", Result: state.ResultFailed}},
+		}},
+	}})
+	e.ObserveInventory(models.NewBackupState(), nil)
+
+	rm := collect(t, reader)
+	info := findMetric(t, rm, "backup_repository_info")
+	gauge, ok := info.Data.(metricdata.Gauge[int64])
+	require.True(t, ok, "backup_repository_info must be an int64 gauge")
+
+	seen := map[string]int64{}
+	for _, dp := range gauge.DataPoints {
+		repo, present := dp.Attributes.Value(attribute.Key("repository"))
+		require.True(t, present, "every sample carries a repository label to join on")
+		group, present := dp.Attributes.Value(attribute.Key("group"))
+		require.True(t, present, "every sample carries a group label to join on")
+		seen[group.AsString()+"/"+repo.AsString()] = dp.Value
+	}
+	assert.Equal(t, map[string]int64{"db/local": 1, "db/offsite": 1}, seen,
+		"one sample per attempted repository, succeeded or not")
+
+	// The point of the pair: offsite has an inventory sample and no staleness
+	// sample, which is exactly what the alerting join keys on.
+	stale := findMetric(t, rm, "backup_seconds_since_last_success")
+	sg, ok := stale.Data.(metricdata.Gauge[float64])
+	require.True(t, ok)
+	require.Len(t, sg.DataPoints, 1, "staleness is reported only for a repository that has succeeded")
+	repo, _ := sg.DataPoints[0].Attributes.Value(attribute.Key("repository"))
+	assert.Equal(t, "local", repo.AsString())
 }
