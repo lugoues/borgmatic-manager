@@ -1265,23 +1265,9 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		}
 	}
 
-	// Preserve the current data before overwriting it: a btrfs CoW copy the
-	// operator can roll back from, then removed once the restore is verified.
-	if snapshot {
-		snap, snapErr := snapshotVolume(ctx, plan.targetData)
-		if snapErr != nil {
-			return snapErr
-		}
-		logger.Warn("snapshotted the volume before restore; remove it once you have verified the restore", "snapshot", snap)
-	}
-
-	// extract runs borgmatic against a chosen destination. Strip
-	// "<sourceVolume>/_data" so files land directly in it, which is also what
-	// lets --into retarget a differently-named volume.
-	extract := func(destination string) error {
-		return runBorgmaticExtract(ctx, borgmaticPath, configPath, archive, plan.archivePath, destination)
-	}
-
+	// Every reason a restore cannot stage, decided before anything is created.
+	// A snapshot is a side effect an operator has to clean up, so a restore that
+	// is going to be refused has to be refused before one is taken.
 	// A _data that is its own mount point (an NFS, CIFS, or bind-backed volume)
 	// cannot be renamed, and its staging sibling would land on the parent
 	// filesystem. Decide that here rather than after a full extract that would
@@ -1311,6 +1297,38 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	inPlace, inPlaceErr := resolveInPlaceReason(merge, force, mounted, encrypted, encryptionReason, plan.targetData)
 	if inPlaceErr != nil {
 		return inPlaceErr
+	}
+
+	// The in-place path empties the volume and then extracts, so nothing
+	// downstream can notice that the extract produced nothing: the staged path's
+	// empty-result refusal does not exist here. That makes the pre-flight probe
+	// the only protection, and an unpinned archive defeats it, because borg
+	// resolves "latest" separately for the probe and for the extract. A backup
+	// finishing in between means the probe approved one archive and the wipe is
+	// followed by an extract from another, which can match nothing and exit
+	// successfully.
+	if !merge && inPlace != "" && archive == latestArchive {
+		return fmt.Errorf("this volume can only be restored in place, which empties it before extracting, "+
+			"and %q is resolved again when the extract runs, so the archive checked beforehand may not be "+
+			"the one restored (nothing was changed); name the archive explicitly: "+
+			"borgmatic-manager borgmatic %s list", latestArchive, group)
+	}
+
+	// Preserve the current data before overwriting it: a btrfs CoW copy the
+	// operator can roll back from, then removed once the restore is verified.
+	if snapshot {
+		snap, snapErr := snapshotVolume(ctx, plan.targetData)
+		if snapErr != nil {
+			return snapErr
+		}
+		logger.Warn("snapshotted the volume before restore; remove it once you have verified the restore", "snapshot", snap)
+	}
+
+	// extract runs borgmatic against a chosen destination. Strip
+	// "<sourceVolume>/_data" so files land directly in it, which is also what
+	// lets --into retarget a differently-named volume.
+	extract := func(destination string) error {
+		return runBorgmaticExtract(ctx, borgmaticPath, configPath, archive, plan.archivePath, destination)
 	}
 
 	// Mirror restores stage and swap, so the live data is never destroyed
@@ -1365,23 +1383,6 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 					"and this volume can only be restored in place, which would empty it underneath that container; "+
 					"stop it and run the restore again, or pass --force to overrule", plan.targetVolume)
 			}
-		}
-		// This path empties the volume and then extracts, so nothing downstream
-		// can notice that the extract produced nothing: the staged path's
-		// empty-result refusal does not exist here. That makes the pre-flight
-		// probe the only protection, and an unpinned archive defeats it, because
-		// borg resolves "latest" separately for the probe and for the extract. A
-		// backup finishing in between means the probe approved one archive and
-		// the wipe is followed by an extract from another, which can match
-		// nothing and exit successfully.
-		//
-		// The staged path tolerates this by refusing an empty result. Here there
-		// is nothing left to refuse with, so the archive has to be named.
-		if archive == latestArchive {
-			return fmt.Errorf("this volume can only be restored in place, which empties it before extracting, "+
-				"and %q is resolved again when the extract runs, so the archive checked beforehand may not be "+
-				"the one restored (nothing was changed); name the archive explicitly: "+
-				"borgmatic-manager borgmatic %s list", latestArchive, group)
 		}
 		fmt.Fprintf(os.Stderr, "restoring %s/%s from archive %s into %s (in place)\n", group, volume, archive, plan.targetData)
 		if wipeErr := emptyVolumeData(plan.targetData, volumeIdentity); wipeErr != nil {
