@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -921,7 +920,11 @@ func TestFormatDirectiveDomains(t *testing.T) {
 	assert.Len(t, domainOf("{now:%S}"), 60)
 	assert.Contains(t, domainOf("{now:%b}"), "Jul")
 	assert.Contains(t, domainOf("{now:%A}"), "Wednesday")
-	assert.Contains(t, domainOf("{now:%Y}"), fmt.Sprintf("%d", time.Now().Year()))
+	// Years are open-ended, so they are a digit run rather than a value set: any
+	// enumeration would call two groups disjoint the moment a retained archive
+	// predates the window.
+	assert.Equal(t, [][]string{{"<4 digits>"}}, config.FormatAlternativesForTest("{now:%Y}"))
+	assert.Equal(t, [][]string{{"<2 digits>"}}, config.FormatAlternativesForTest("{now:%y}"))
 
 	// A known host value is a literal, not a domain.
 	assert.Equal(t, [][]string{{"myhost"}}, config.FormatAlternativesForTest("{hostname}"))
@@ -939,10 +942,18 @@ func TestFormatDirectiveDomains(t *testing.T) {
 	// The same for a directive inside a spec that this code does not know: the
 	// segment must widen, not narrow. Narrowing it to a fixed value would make
 	// two formats look disjoint because a value nobody can predict happened not
-	// to match.
-	assert.Equal(t, [][]string{{"x-"}, nil, {"-y"}}, config.FormatAlternativesForTest("x-{now:%j}-y"))
-	assert.True(t, config.PatternMatchesFormatForTest("x-anything-at-all-y", "x-{now:%j}-y"))
-	assert.True(t, config.PatternMatchesFormatForTest("x-*-y", "x-{now:%j}-y"))
+	// to match. %Z is a timezone abbreviation, which has no shape worth
+	// characterizing.
+	assert.Equal(t, [][]string{{"x-"}, nil, {"-y"}}, config.FormatAlternativesForTest("x-{now:%Z}-y"))
+	assert.True(t, config.PatternMatchesFormatForTest("x-anything-at-all-y", "x-{now:%Z}-y"))
+	assert.True(t, config.PatternMatchesFormatForTest("x-*-y", "x-{now:%Z}-y"))
+
+	// A directive whose length is known but whose values are not is a digit run:
+	// bounded, so it does not mark unrelated groups ambiguous, and complete, so
+	// it does not miss one.
+	assert.Equal(t, [][]string{{"x-"}, {"<3 digits>"}, {"-y"}}, config.FormatAlternativesForTest("x-{now:%j}-y"))
+	assert.True(t, config.PatternMatchesFormatForTest("x-366-y", "x-{now:%j}-y"))
+	assert.False(t, config.PatternMatchesFormatForTest("x-abc-y", "x-{now:%j}-y"))
 }
 
 // The collision the digits-only stand-in hid: with this hostname, group "prod"
@@ -1107,4 +1118,33 @@ func TestLocalPathsWithAtSignsAreNotRemote(t *testing.T) {
 	// A colon with nothing usable in front of it is not a host spec either, so
 	// it is still cleaned like the local path it is.
 	assert.Equal(t, "8080/repo", config.CanonicalRepoKey(":8080/../8080/repo"))
+}
+
+// A repository outlives any window of years that could be enumerated, and its
+// retained archives still carry the year they were written in. A group named
+// after a past year therefore claims those archives, and its retention can prune
+// them, however far back the year is.
+func TestYearsOutsideAnyWindowStillCollide(t *testing.T) {
+	defer config.SetSampleHostname("myhost")()
+
+	for _, year := range []string{"2020", "1999", "2031", "2026"} {
+		assert.True(t, config.PatternMatchesFormatForTest("x-"+year+"-*", "x-{now:%Y}-prod-{now}"),
+			"a group named %q claims the archives written in that year", year)
+	}
+
+	// Still a year-shaped run, not anything at all: three digits or letters are
+	// not a four-digit year, and reporting them as one would mark unrelated
+	// groups ambiguous.
+	assert.False(t, config.PatternMatchesFormatForTest("x-202-*", "x-{now:%Y}-prod-{now}"))
+	assert.False(t, config.PatternMatchesFormatForTest("x-20200-*", "x-{now:%Y}-prod-{now}"))
+	assert.False(t, config.PatternMatchesFormatForTest("x-abcd-*", "x-{now:%Y}-prod-{now}"))
+
+	// Two-digit years the same way.
+	assert.True(t, config.PatternMatchesFormatForTest("x-99-*", "x-{now:%y}-prod-{now}"))
+	assert.False(t, config.PatternMatchesFormatForTest("x-999-*", "x-{now:%y}-prod-{now}"))
+
+	// And through the collision decision, which is where it matters.
+	assert.True(t, config.PatternsCollideForTest(
+		"x-2020-*", "x-{group}-{now}",
+		"x-*-prod-*", "x-{now:%Y}-prod-{now}"))
 }

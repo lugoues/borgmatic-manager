@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // SetLookPath replaces the exec.LookPath seam for tests.
 func (g *Generator) SetLookPath(fn func(string) (string, error)) {
 	g.lookPath = fn
@@ -25,11 +27,14 @@ func PatternMatchesFormatForTest(pattern, format string) bool {
 func FormatAlternativesForTest(format string) [][]string {
 	var out [][]string
 	for _, seg := range archiveFormatSegments(format) {
-		if seg.any {
+		switch {
+		case seg.any:
 			out = append(out, nil)
-			continue
+		case seg.digits > 0:
+			out = append(out, []string{fmt.Sprintf("<%d digits>", seg.digits)})
+		default:
+			out = append(out, seg.alts)
 		}
-		out = append(out, seg.alts)
 	}
 	return out
 }
