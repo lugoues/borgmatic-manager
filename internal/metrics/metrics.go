@@ -90,19 +90,50 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 		l.logger.Warn("metrics export failed; the OTLP collector is unreachable or rejecting", "error", err)
 		return err
 	}
+	// The first success is news and the rest are not, so exactly one of the two
+	// lines is emitted: logging both for the same export reads as two events.
+	// The count is computed once either way; it walks every data point, and this
+	// runs on every export interval for the life of the daemon.
+	series := countDataPoints(rm)
+	announced := false
 	l.firstOK.Do(func() {
-		l.logger.Info("metrics export succeeded; backup metrics are flowing to the collector", "series", countDataPoints(rm))
+		announced = true
+		l.logger.Info("metrics export succeeded; backup metrics are flowing to the collector", "series", series)
 	})
-	l.logger.Debug("metrics export succeeded", "series", countDataPoints(rm))
+	if !announced {
+		l.logger.Debug("metrics export succeeded", "series", series)
+	}
 	return nil
 }
 
 // countDataPoints totals the series pushed, so the confirmation log shows the
 // export was non-empty.
+// countDataPoints counts the exported time series, not the instruments. The two
+// differ by an order of magnitude here: nearly every metric is per repository,
+// and backup_last_size_bytes is per repository per size kind, so a handful of
+// instruments is dozens of series. The number exists to tell an operator that
+// metrics are flowing and roughly how much, which counting instruments does not.
+//
+// The type switch covers the aggregations this program emits; anything else
+// counts as one rather than zero, so an added instrument is undercounted rather
+// than invisible.
 func countDataPoints(rm *metricdata.ResourceMetrics) int {
 	n := 0
 	for _, sm := range rm.ScopeMetrics {
-		n += len(sm.Metrics)
+		for _, m := range sm.Metrics {
+			switch d := m.Data.(type) {
+			case metricdata.Gauge[int64]:
+				n += len(d.DataPoints)
+			case metricdata.Gauge[float64]:
+				n += len(d.DataPoints)
+			case metricdata.Sum[int64]:
+				n += len(d.DataPoints)
+			case metricdata.Sum[float64]:
+				n += len(d.DataPoints)
+			default:
+				n++
+			}
+		}
 	}
 	return n
 }
