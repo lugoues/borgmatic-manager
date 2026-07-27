@@ -10,6 +10,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -61,7 +62,7 @@ type Emitter struct {
 	allGroups map[string]struct{}
 	// repos is each group's currently configured repository ids, reported after
 	// generation. Nil until a cycle reports one.
-	repos map[string][]string
+	repos map[string]map[string]string
 	// observed records that a cycle has reported an inventory, which an empty
 	// allGroups cannot: the last group being removed and no cycle having run yet
 	// are the same empty map and opposite situations.
@@ -343,13 +344,13 @@ func (e *Emitter) observe(o metric.Observer,
 
 	e.mu.Lock()
 	observed := e.observed
-	configuredRepos := make(map[string]map[string]bool, len(e.repos))
-	for group, ids := range e.repos {
-		set := make(map[string]bool, len(ids))
-		for _, id := range ids {
-			set[id] = true
+	configuredRepos := make(map[string]map[string]string, len(e.repos))
+	for group, byID := range e.repos {
+		inner := make(map[string]string, len(byID))
+		for id, path := range byID {
+			inner[id] = path
 		}
-		configuredRepos[group] = set
+		configuredRepos[group] = inner
 	}
 	known := make(map[string]struct{}, len(e.allGroups))
 	for g := range e.allGroups {
@@ -407,8 +408,17 @@ func (e *Emitter) observe(o metric.Observer,
 			// A repository removed from a group the group still has. The record
 			// survives until the next run reconciles it, and that run may be a
 			// whole period away, so the reconciliation has to happen here too.
-			if set, ok := configuredRepos[group]; ok && !set[id] {
-				continue
+			if configured, ok := configuredRepos[group]; ok {
+				path, stillConfigured := configured[id]
+				if !stillConfigured {
+					continue
+				}
+				// The id survives a repoint but the history does not belong to
+				// the new destination. Until a run reconciles the record, its
+				// stored path is what says which one these numbers describe.
+				if path != "" && rr.Path != "" && rr.Path != path {
+					continue
+				}
 			}
 			repoAttrs := metric.WithAttributes(
 				attribute.String("group", group),
@@ -592,10 +602,14 @@ func (e *Emitter) ObserveInventory(bs *models.BackupState, off *state.Offline) {
 // the removed destination's inventory, staleness and last-value series for a
 // whole backup period, and the documented alert keeps firing for something that
 // is no longer configured.
-func (e *Emitter) ObserveRepositories(repos map[string][]string) {
-	copied := make(map[string][]string, len(repos))
-	for group, ids := range repos {
-		copied[group] = append([]string(nil), ids...)
+func (e *Emitter) ObserveRepositories(repos map[string]map[string]string) {
+	copied := make(map[string]map[string]string, len(repos))
+	for group, byID := range repos {
+		inner := make(map[string]string, len(byID))
+		for id, path := range byID {
+			inner[id] = path
+		}
+		copied[group] = inner
 	}
 	e.mu.Lock()
 	e.repos = copied
@@ -603,8 +617,17 @@ func (e *Emitter) ObserveRepositories(repos map[string][]string) {
 }
 
 // Shutdown flushes buffered metrics and stops the exporter.
+//
+// The error is redacted here rather than at each caller. The exporter decorator
+// sanitizes its own warning and then returns the original error, which reaches
+// whatever logs a failed shutdown: on a one-shot run that is the only export
+// there is, so the collector URL and any token in it would go to the journal by
+// the shortest path available.
 func (e *Emitter) Shutdown(ctx context.Context) error {
-	return e.provider.Shutdown(ctx)
+	if err := e.provider.Shutdown(ctx); err != nil {
+		return errors.New(redactURLsIn(err.Error()))
+	}
+	return nil
 }
 
 // OTLP transport names and the standard environment variables that select one.

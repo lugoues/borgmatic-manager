@@ -223,7 +223,7 @@ func TestStatusIgnoresPendingRunWhoseProcessIsGone(t *testing.T) {
 	assert.NotContains(t, out, "running", "a dead owner's record is not an in-flight run")
 	assert.Contains(t, out, "due now", "and the group's real due state is visible again")
 
-	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, nil, time.Now())
+	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, nil, nil, time.Now())
 	require.Len(t, doc.Groups, 1)
 	assert.Nil(t, doc.Groups[0].Running, "status --json agrees with the table")
 	require.NotNil(t, doc.Groups[0].Due)
@@ -268,7 +268,7 @@ func TestStatusUsesLivenessLockNotPIDWhenPIDIsRecycled(t *testing.T) {
 	assert.NotContains(t, out, "running", "an unheld liveness lock outranks a recycled PID")
 	assert.Contains(t, out, "due now")
 
-	doc := buildStatusDoc(bs, store, lockDir, time.Hour, 0, nil, nil, nil, time.Now())
+	doc := buildStatusDoc(bs, store, lockDir, time.Hour, 0, nil, nil, nil, nil, time.Now())
 	require.Len(t, doc.Groups, 1)
 	assert.Nil(t, doc.Groups[0].Running, "status --json agrees with the table")
 }
@@ -477,7 +477,7 @@ func TestBuildStatusDoc(t *testing.T) {
 
 	doc := buildStatusDoc(bs, store, "", time.Hour, time.Minute,
 		map[string]time.Duration{"done": 30 * time.Minute},
-		map[string]string{"blocked": "shared repo"}, nil, now)
+		map[string]string{"blocked": "shared repo"}, nil, nil, now)
 
 	require.Len(t, doc.Groups, 3, "empty groups are excluded")
 	byName := map[string]statusGroupJSON{}
@@ -538,7 +538,7 @@ func TestBuildStatusDocMarksOfflineMembersButKeepsSchedule(t *testing.T) {
 	store := state.LoadSchedule(t.TempDir(), nil)
 	off := &state.Offline{Volumes: map[string]map[string]bool{"gone": {"gone_vol": true}}}
 
-	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, off, time.Now())
+	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, nil, off, time.Now())
 	require.Len(t, doc.Groups, 1)
 	g := doc.Groups[0]
 	assert.True(t, g.Offline, "no live container: the group is offline")
@@ -680,4 +680,49 @@ func TestInspectRendersAMeasuredEmptyArchive(t *testing.T) {
 
 	assert.Contains(t, out, "0 files", "an archive measured as empty reports zero, not nothing")
 	assert.Contains(t, out, "5 files")
+}
+
+// Repository settings do not enter the scheduler fingerprint, so removing a
+// repository from a recently successful group leaves it not due, no run
+// reconciles the record, and status would report the deleted destination for a
+// whole period.
+func TestStatusJSONReportsTheCurrentRepositoriesNotThePersistedOnes(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		RepositoriesKnown:      true,
+		ConfiguredRepositories: []string{"local", "offsite"},
+		ConfiguredRepositoryPaths: map[string]string{
+			"local": "/mnt/local", "offsite": "/mnt/offsite",
+		},
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Path: "/mnt/local", Result: state.ResultOK, Measured: true},
+			{ID: "offsite", Path: "/mnt/offsite", Result: state.ResultOK, Measured: true},
+		},
+	})
+
+	// offsite has since been removed from the configuration, and the group is
+	// not due, so nothing has reconciled the record.
+	configured := map[string]map[string]string{"demo": {"local": "/mnt/local"}}
+	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, configured, nil, time.Now())
+
+	require.Len(t, doc.Groups, 1)
+	assert.Contains(t, doc.Groups[0].Repositories, "local")
+	assert.NotContains(t, doc.Groups[0].Repositories, "offsite",
+		"a destination the group no longer configures is history, not inventory")
+
+	t.Run("a repointed label is dropped too", func(t *testing.T) {
+		configured := map[string]map[string]string{"demo": {"local": "/mnt/local", "offsite": "/mnt/elsewhere"}}
+		doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, configured, nil, time.Now())
+		assert.NotContains(t, doc.Groups[0].Repositories, "offsite",
+			"the id survived the repoint; this history belongs to the old destination")
+	})
+
+	t.Run("a group nobody reported on is passed through", func(t *testing.T) {
+		doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, nil, nil, time.Now())
+		assert.Len(t, doc.Groups[0].Repositories, 2,
+			"silence is not a report that the group configures nothing")
+	})
 }

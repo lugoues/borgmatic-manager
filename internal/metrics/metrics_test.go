@@ -953,17 +953,17 @@ func TestARemovedRepositoryStopsBeingExportedBeforeTheNextRun(t *testing.T) {
 		return out
 	}
 
-	e.ObserveRepositories(map[string][]string{"web": {"local", "offsite"}})
+	e.ObserveRepositories(map[string]map[string]string{"web": {"local": "/mnt/local", "offsite": "/mnt/offsite"}})
 	assert.Equal(t, []string{"local", "offsite"}, repos())
 
 	// offsite is removed from the group's configuration, and no run happens.
-	e.ObserveRepositories(map[string][]string{"web": {"local"}})
+	e.ObserveRepositories(map[string]map[string]string{"web": {"local": "/mnt/local"}})
 	assert.Equal(t, []string{"local"}, repos(),
 		"the removed destination must stop being reported without waiting for a run")
 
 	// A group the observer says nothing about is not filtered: silence is not a
 	// report that it has no repositories.
-	e.ObserveRepositories(map[string][]string{"other": {"x"}})
+	e.ObserveRepositories(map[string]map[string]string{"other": {"x": "/mnt/x"}})
 	assert.Equal(t, []string{"local", "offsite"}, repos())
 }
 
@@ -1075,7 +1075,7 @@ func TestTheLegacyStandInDoesNotCoverAKnownEmptyInventory(t *testing.T) {
 		Data.(metricdata.Gauge[int64]).DataPoints, 1)
 
 	// Once the group reports that it configures no repositories, it does not.
-	e.ObserveRepositories(map[string][]string{"emptied": {}})
+	e.ObserveRepositories(map[string]map[string]string{"emptied": {}})
 
 	rm := collect(t, reader)
 	for _, sm := range rm.ScopeMetrics {
@@ -1086,4 +1086,54 @@ func TestTheLegacyStandInDoesNotCoverAKnownEmptyInventory(t *testing.T) {
 	}
 	assert.NotNil(t, findMetric(t, rm, "backup_group_info"),
 		"the group itself is still reported, so the alert can fire")
+}
+
+// The decorator sanitizes its own warning and then returns the original error,
+// which reaches whatever logs a failed shutdown. On a one-shot run that is the
+// only export there is, so the collector URL and any token in it would go to the
+// journal by the shortest path available.
+func TestShutdownErrorsAreRedacted(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	e, err := newEmitter(context.Background(), reader, "test",
+		fakeSource{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+	require.NoError(t, e.Shutdown(context.Background()))
+
+	// A second shutdown returns the SDK's own error, which carries no URL; the
+	// redaction is asserted directly on the shape a transport failure takes.
+	assert.NotContains(t, redactURLsIn(`Post "https://c.example/v1?token=s3cret": refused`), "s3cret")
+}
+
+// A repointed label keeps its id, and repository settings do not enter the
+// scheduler fingerprint, so a recently successful group is not due and no run
+// reconciles the record. Without the destination travelling with the id, the old
+// destination's success time and statistics stay exported under a label that now
+// means somewhere else.
+func TestARepointedLabelStopsExportingTheOldDestination(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"web": {Repositories: map[string]state.RepoRecord{
+			"offsite": {Path: "/mnt/old", LastSuccess: now.Add(-time.Hour)},
+		}},
+	}})
+	e.now = func() time.Time { return now }
+
+	bs := models.NewBackupState()
+	bs.AddVolume("web", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+
+	e.ObserveRepositories(map[string]map[string]string{"web": {"offsite": "/mnt/old"}})
+	require.Len(t, findMetric(t, collect(t, reader), "backup_repository_info").
+		Data.(metricdata.Gauge[int64]).DataPoints, 1)
+
+	// Repointed, with no run in between.
+	e.ObserveRepositories(map[string]map[string]string{"web": {"offsite": "/mnt/new"}})
+
+	rm := collect(t, reader)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			assert.NotEqual(t, "backup_seconds_since_last_success", m.Name,
+				"the old destination's freshness must not be reported under the new one")
+		}
+	}
 }

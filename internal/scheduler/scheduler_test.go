@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/lugoues/borgmatic-manager/internal/runner"
@@ -667,4 +669,30 @@ func TestCycleObserverRunsAfterReconcileAndBeforeTheRun(t *testing.T) {
 	if calls := runner.getCalls(); len(calls) != 1 {
 		t.Fatalf("expected the run to follow the observer, got %v", calls)
 	}
+}
+
+// The inventory carries each repository's destination alongside its id, because
+// an id does not change when a labelled repository is repointed and
+// GroupFingerprint excludes repository settings: a recently successful group is
+// not due, no run reconciles it, and consumers would keep the old destination's
+// numbers under a label that now means somewhere else.
+func TestRepositoryInventoryCarriesDestinations(t *testing.T) {
+	t.Setenv("BORG_REPO", "/srv/borg/resolved")
+
+	got := RepositoryInventory(map[string]config.GroupRunMeta{
+		"web": {Repositories: []config.RepoRef{
+			{Path: "/mnt/local", Label: "local"},
+			{Path: "${BORG_REPO}", Label: "offsite"},
+			{Path: "/mnt/plain"},
+		}},
+		"empty": {},
+	})
+
+	assert.Equal(t, map[string]string{
+		"local":      "/mnt/local",
+		"offsite":    "/srv/borg/resolved",
+		"/mnt/plain": "/mnt/plain",
+	}, got["web"], "ids as persisted, paths as borg resolves them")
+	assert.Empty(t, got["empty"])
+	assert.Contains(t, got, "empty", "a group that configures none is still reported")
 }

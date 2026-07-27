@@ -82,7 +82,7 @@ type Scheduler struct {
 
 	// repoObserver, when set, receives each cycle's per-group repository ids
 	// after generation, which is the first point they are known.
-	repoObserver func(map[string][]string)
+	repoObserver func(map[string]map[string]string)
 	// cycleObserver, when set, receives each cycle's merged inventory and offline
 	// state (nil when no cache), so metrics can report offline volume counts.
 	cycleObserver func(*models.BackupState, *state.Offline)
@@ -112,8 +112,29 @@ func (s *Scheduler) SetCycleObserver(f func(*models.BackupState, *state.Offline)
 // reconciles per-repository state needs the second, and waiting for a run to
 // tell it means a group that is not due keeps reporting a repository that was
 // removed for as long as its backup period lasts.
-func (s *Scheduler) SetRepositoryObserver(f func(map[string][]string)) {
+func (s *Scheduler) SetRepositoryObserver(f func(map[string]map[string]string)) {
 	s.repoObserver = f
+}
+
+// RepositoryInventory maps each group to its repository ids and the destination
+// each one currently points at.
+//
+// The destinations travel with the ids because an id does not change when a
+// labelled repository is repointed, and GroupFingerprint excludes repository
+// settings, so a recently successful group is not due and no run happens to
+// reconcile it. Reporting ids alone leaves the old destination's success time
+// and statistics exported under a label that now means somewhere else, for up to
+// a whole backup period.
+func RepositoryInventory(meta map[string]config.GroupRunMeta) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(meta))
+	for name, m := range meta {
+		repos := make(map[string]string, len(m.Repositories))
+		for _, ref := range m.Repositories {
+			repos[repoID(ref)] = resolvedRepoPath(ref)
+		}
+		out[name] = repos
+	}
+	return out
 }
 
 // repoID mirrors the runner's persisted key for a repository, so the inventory
@@ -122,6 +143,13 @@ func repoID(ref config.RepoRef) string {
 	if ref.Label != "" {
 		return ref.Label
 	}
+	return resolvedRepoPath(ref)
+}
+
+// resolvedRepoPath mirrors the runner's notion of where a repository actually
+// is, so the inventory and the persisted records describe destinations the same
+// way.
+func resolvedRepoPath(ref config.RepoRef) string {
 	if strings.Contains(ref.Path, "${") {
 		if expanded := os.ExpandEnv(ref.Path); expanded != "" && expanded != ref.Path {
 			return expanded
@@ -408,15 +436,7 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 	}
 
 	if s.repoObserver != nil {
-		repos := make(map[string][]string, len(meta))
-		for name, m := range meta {
-			ids := make([]string, 0, len(m.Repositories))
-			for _, ref := range m.Repositories {
-				ids = append(ids, repoID(ref))
-			}
-			repos[name] = ids
-		}
-		s.repoObserver(repos)
+		s.repoObserver(RepositoryInventory(meta))
 	}
 
 	s.RunAllGroups(ctx, backupState, meta)

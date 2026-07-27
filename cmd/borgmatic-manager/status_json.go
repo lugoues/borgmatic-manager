@@ -49,7 +49,7 @@ type statusRunning struct {
 	Stale bool `json:"stale"`
 }
 
-func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, lockDir string, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline, now time.Time) statusDoc {
+func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, lockDir string, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, configured map[string]map[string]string, off *state.Offline, now time.Time) statusDoc {
 	running := runningGroups(store, lockDir)
 
 	names := make([]string, 0, len(bs.Groups))
@@ -92,7 +92,7 @@ func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, lockDir 
 			g.LastRun = &lr
 		}
 		if ok && len(rec.Repositories) > 0 {
-			g.Repositories = rec.Repositories
+			g.Repositories = currentRepositories(rec.Repositories, configured[name])
 		}
 
 		// Offline groups are still backed up, so they carry a normal schedule.
@@ -120,8 +120,40 @@ func buildStatusDoc(bs *models.BackupState, store *state.ScheduleStore, lockDir 
 	return doc
 }
 
-func printStatusJSON(bs *models.BackupState, store *state.ScheduleStore, lockDir string, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, off *state.Offline) error {
-	doc := buildStatusDoc(bs, store, lockDir, period, runTimeout, filePeriods, refused, off, time.Now())
+// currentRepositories drops persisted records for repositories the group no
+// longer configures, or that now point somewhere else.
+//
+// The persisted map is history, not inventory. Repository settings do not enter
+// the scheduler fingerprint, so removing a repository from a recently successful
+// group leaves it not due, no run reconciles the record, and status would report
+// the deleted destination for a whole period. A repointed label is the same
+// problem wearing the same name.
+//
+// A group the caller knows nothing about is passed through: silence is not a
+// report that it configures nothing.
+func currentRepositories(persisted map[string]state.RepoRecord, configured map[string]string) map[string]state.RepoRecord {
+	if configured == nil {
+		return persisted
+	}
+	out := make(map[string]state.RepoRecord, len(persisted))
+	for id, rr := range persisted {
+		path, stillConfigured := configured[id]
+		if !stillConfigured {
+			continue
+		}
+		if path != "" && rr.Path != "" && rr.Path != path {
+			continue // the id survived a repoint; this history is the old destination's
+		}
+		out[id] = rr
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func printStatusJSON(bs *models.BackupState, store *state.ScheduleStore, lockDir string, period, runTimeout time.Duration, filePeriods map[string]time.Duration, refused map[string]string, configured map[string]map[string]string, off *state.Offline) error {
+	doc := buildStatusDoc(bs, store, lockDir, period, runTimeout, filePeriods, refused, configured, off, time.Now())
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding status: %w", err)
