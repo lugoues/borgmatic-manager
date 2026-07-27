@@ -757,6 +757,11 @@ func TestArchiveMatchPatternReplacesBorgPlaceholders(t *testing.T) {
 // "app"'s pattern matches "app-prod"'s archives, and a probe using it cannot
 // tell whose backup it found.
 func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
+	// The default format contains {hostname}, so an unpinned hostname makes the
+	// assertions depend on the machine: a host named after one of these groups
+	// creates a collision that has nothing to do with what is being tested.
+	defer config.SetSampleHostname("backup01")()
+
 	state := models.NewBackupState()
 	state.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
 	state.AddVolume("app-prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
@@ -791,6 +796,9 @@ func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
 func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
 	generate := func(t *testing.T, format string, groups ...string) map[string]config.GroupRunMeta {
 		t.Helper()
+		// Pinned for the {hostname} cases: the machine's own name must not
+		// decide whether these patterns collide.
+		t.Cleanup(config.SetSampleHostname("backup01"))
 		st := models.NewBackupState()
 		for i, name := range groups {
 			st.AddVolume(name, models.VolumeInfo{Name: fmt.Sprintf("v%d", i), HostPath: fmt.Sprintf("/mnt/v%d", i)})
@@ -984,4 +992,36 @@ func TestAmbiguityNamesOnlyTheSharedRepository(t *testing.T) {
 	assert.NotContains(t, meta["app"].AmbiguousRepos, config.CanonicalRepoKey("/mnt/app-only"),
 		"the repository it has to itself can still confirm")
 	assert.Equal(t, []string{config.CanonicalRepoKey("/mnt/shared")}, meta["app-prod"].AmbiguousRepos)
+}
+
+// A group refused for lacking the {group} token never runs, so it writes nothing
+// that could contaminate a survivor's repository. Judging collisions against the
+// pre-refusal set instead punished the survivor twice: the refused group has no
+// pattern, which reads as "cannot be distinguished", so the survivor lost
+// success confirmation in a repository it now has entirely to itself, and warned
+// about a conflict with a group that is not running.
+func TestARefusedGroupDoesNotMakeASurvivorAmbiguous(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("good", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("bad", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+	}}
+	// "bad" shares the repository but names its archives without the {group}
+	// token, so generation refuses it.
+	overrides := map[string]map[string]interface{}{
+		"bad": {"archive_name_format": "{hostname}-fixed-{now}"},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	meta, err := g.Generate(st)
+	require.NoError(t, err)
+
+	require.NotContains(t, meta, "bad", "the group without the token is refused")
+	require.Contains(t, meta, "good")
+	assert.Empty(t, meta["good"].AmbiguousRepos,
+		"the survivor has the repository to itself and can still confirm its backups")
 }
