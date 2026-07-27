@@ -887,7 +887,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.")
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local}, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local}, nil, "", run, runStart)
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultFailed, out[0].Result)
 		assert.Empty(t, pf.probed(), "the implicated repo must not be probed")
@@ -899,7 +899,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.")
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultOK, out[0].Result)
 		assert.Equal(t, []string{offA.Path}, pf.probed())
@@ -910,7 +910,7 @@ func TestPerRepoFailure(t *testing.T) {
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
 		assert.Nil(t, out, "no fresh archive and not implicated: neither advanced nor failed")
 	})
 
@@ -919,7 +919,7 @@ func TestPerRepoFailure(t *testing.T) {
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
 		assert.Nil(t, out)
 	})
 
@@ -932,7 +932,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.") // local failed
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local, offA, offB}, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local, offA, offB}, nil, "", run, runStart)
 		byID := map[string]state.RepoOutcome{}
 		for _, o := range out {
 			byID[o.ID] = o
@@ -951,7 +951,7 @@ func TestPerRepoFailure(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		out := r.perRepoFailure(ctx, "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
+		out := r.perRepoFailure(ctx, "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
 		assert.Nil(t, out)
 		assert.Empty(t, pf.probed(), "no borgmatic work is started during shutdown")
 	})
@@ -960,7 +960,7 @@ func TestPerRepoFailure(t *testing.T) {
 		pf := &probeFake{}
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
-		assert.Nil(t, r.perRepoFailure(context.Background(), "/cfg.yaml", nil, "", run, runStart))
+		assert.Nil(t, r.perRepoFailure(context.Background(), "/cfg.yaml", nil, nil, "", run, runStart))
 	})
 }
 
@@ -1019,7 +1019,7 @@ func TestProbeIsScopedToThisGroupsArchives(t *testing.T) {
 	run.recordErrorText("something else went wrong")
 
 	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
-		[]config.RepoRef{offsite}, "host-g-*", run, runStart)
+		[]config.RepoRef{offsite}, nil, "host-g-*", run, runStart)
 	require.Len(t, out, 1)
 	assert.Equal(t, state.ResultOK, out[0].Result)
 
@@ -1047,7 +1047,7 @@ func TestProbeOmitsTheFilterWhenThereIsNoPattern(t *testing.T) {
 	run := &runState{logger: r.logger, group: "g"}
 	run.recordErrorText("something else went wrong")
 
-	_ = r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, "", run, runStart)
+	_ = r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, nil, "", run, runStart)
 	assert.NotContains(t, pf.argsOfLastProbe(), "--match-archives")
 }
 
@@ -1103,7 +1103,7 @@ func TestProbesRunConcurrentlySoLocksAreNotHeldPerRepository(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_ = r.perRepoFailure(context.Background(), "/cfg.yaml", repos, "", run, runStart)
+		_ = r.perRepoFailure(context.Background(), "/cfg.yaml", repos, nil, "", run, runStart)
 		close(done)
 	}()
 	select {
@@ -1328,4 +1328,90 @@ func TestSuccessCarriesStatsForARuntimeExpandedRepository(t *testing.T) {
 	assert.Equal(t, state.ResultOK, out[0].Result)
 	assert.Equal(t, int64(1234), out[0].Files, "the stats must survive the resolved-path mismatch")
 	assert.Equal(t, int64(5000), out[0].OriginalBytes)
+}
+
+// create succeeds everywhere and a later action (prune, compact, check) exits
+// nonzero. borgmatic has already reported each archive and its measurements, so
+// rebuilding every repository from confirmation probes throws away numbers that
+// were in hand: the probe can only answer "an archive exists", which records ok
+// with no stats, leaving the size, file count and duration stale or, after a
+// first backup, absent entirely.
+func TestALaterActionFailureKeepsTheCreateMeasurements(t *testing.T) {
+	runStart := time.Now().Add(-time.Minute)
+	fresh := runStart.Add(10 * time.Second)
+	local := config.RepoRef{Path: "/mnt/local", Label: "local"}
+	offsite := config.RepoRef{Path: "ssh://borg@a/./r", Label: "offsite"}
+
+	result := func(loc string, files, size int64) createResult {
+		var r createResult
+		r.Repository.Location = loc
+		r.Archive.Stats.NFiles = files
+		r.Archive.Stats.OriginalSize = size
+		r.Archive.Duration = 42
+		return r
+	}
+
+	newRunner := func(pf *probeFake) *Runner {
+		r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+			"/usr/bin/borgmatic-fake", nil, 0)
+		r.execCommand = pf.exec
+		return r
+	}
+
+	t.Run("measured repositories keep their stats and are not probed", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{local.Path: listJSON(fresh), offsite.Path: listJSON(fresh)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+		run.recordErrorText("Command error: borg prune exited with code 2")
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+			[]config.RepoRef{local, offsite},
+			[]createResult{result(local.Path, 1234, 5000), result(offsite.Path, 7, 90)},
+			"", run, runStart)
+
+		require.Len(t, out, 2)
+		assert.Equal(t, state.ResultOK, out[0].Result)
+		assert.Equal(t, int64(1234), out[0].Files, "the reported measurements must survive the run failing")
+		assert.Equal(t, int64(5000), out[0].OriginalBytes)
+		assert.Equal(t, int64(42), out[0].DurationSeconds)
+		assert.Equal(t, int64(7), out[1].Files)
+		assert.Empty(t, pf.probed(), "a repository borgmatic already measured needs no probe")
+	})
+
+	// Error matching is a substring test against the message text, and a prune
+	// failure names the same path the successful create just reported. Direct
+	// evidence of the archive has to win over that inference, or the destination
+	// that did back up is recorded as failed.
+	t.Run("a create result outweighs an error naming the same path", func(t *testing.T) {
+		pf := &probeFake{}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+		run.recordErrorText("Error running prune for /mnt/local")
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+			[]config.RepoRef{local}, []createResult{result(local.Path, 5, 60)}, "", run, runStart)
+
+		require.Len(t, out, 1)
+		assert.Equal(t, state.ResultOK, out[0].Result)
+		assert.Equal(t, int64(5), out[0].Files)
+	})
+
+	// The mixed case: one destination measured, one not. The unmeasured one must
+	// still go through the existing implicate-or-probe path.
+	t.Run("unmeasured repositories are still probed", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{offsite.Path: listJSON(fresh)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "g"}
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+			[]config.RepoRef{local, offsite},
+			[]createResult{result(local.Path, 3, 40)},
+			"", run, runStart)
+
+		require.Len(t, out, 2)
+		assert.Equal(t, int64(3), out[0].Files, "the measured one keeps its stats")
+		assert.Equal(t, state.ResultOK, out[1].Result, "the unmeasured one is confirmed by probe")
+		assert.Zero(t, out[1].Files, "a probe proves an archive exists, not how big it is")
+		assert.Equal(t, []string{offsite.Path}, pf.probed(), "and only it is probed")
+	})
 }
