@@ -37,6 +37,13 @@ type RunOutcome struct {
 	// the outcome alone cannot say whether a missing one was skipped or removed.
 	// Empty leaves the persisted set untouched.
 	ConfiguredRepositories []string `json:"-"`
+	// CreateAttempted records whether this run tried to write an archive at all.
+	// A maintenance-only cycle (prune, compact, check, with no create) exits
+	// zero having backed nothing up, and counting that as a successful backup
+	// per destination would report a manager configured that way as permanently
+	// healthy. Like ConfiguredRepositories this is an input to recording, not
+	// persisted state.
+	CreateAttempted bool `json:"-"`
 	// LastError is the first CRITICAL/ERROR message from a failed run, so
 	// status can show why without the journal.
 	LastError       string `json:"last_error,omitempty"`
@@ -70,6 +77,13 @@ type RepoOutcome struct {
 	CompressedBytes   int64  `json:"compressed_bytes,omitempty"`
 	DeduplicatedBytes int64  `json:"deduplicated_bytes,omitempty"`
 	DurationSeconds   int64  `json:"duration_seconds,omitempty"`
+	// Measured records that borgmatic reported this archive, as opposed to the
+	// outcome being inferred from a confirmation probe. It is not the same
+	// question as "are any of the numbers above nonzero": an empty archive that
+	// finishes in under a second is legitimately all zeros, and inferring
+	// measurement from nonzero values leaves such a backup reported under an
+	// older, larger archive forever.
+	Measured bool `json:"measured,omitempty"`
 }
 
 // RepoRecord persists a repository's last outcome and last success across runs,
@@ -91,6 +105,14 @@ type RepoRecord struct {
 
 // hasStats reports whether an outcome carries archive measurements. A
 // probe-confirmed success has none.
+// measuredStats reports whether this outcome carries archive statistics worth
+// preserving. Measured is authoritative; the nonzero check is the fallback for
+// an outcome written before that field existed, so upgrading does not lose the
+// stats already on disk.
+func (r RepoOutcome) measuredStats() bool {
+	return r.Measured || r.hasStats()
+}
+
 func (r RepoOutcome) hasStats() bool {
 	return r.Files > 0 || r.OriginalBytes > 0 || r.CompressedBytes > 0 ||
 		r.DeduplicatedBytes > 0 || r.DurationSeconds > 0
@@ -302,6 +324,15 @@ func (s *ScheduleStore) Record(name string) (GroupRecord, bool) {
 }
 
 // Snapshot returns a copy of all records, for schedule computations.
+// Snapshot returns the current per-group records.
+//
+// The returned GroupRecords share their Repositories map and History slice with
+// the stored records, which is safe because those are never mutated after
+// publication: every write goes through update, which parses a fresh copy from
+// disk, mutates that, and swaps it in wholesale. A previously returned map is
+// orphaned, not modified. TestSnapshotsAreNotMutatedByLaterWrites pins the
+// invariant, because in-place mutation is the obvious optimization to make here
+// and it would turn every snapshot into a concurrent map access.
 func (s *ScheduleStore) Snapshot() map[string]GroupRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -349,7 +380,7 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 			rr.LastRun = &roCopy
 			if ro.Result == ResultOK {
 				rr.LastSuccess = outcome.Finished
-				if ro.hasStats() {
+				if ro.measuredStats() {
 					statsCopy := ro
 					rr.LastStats = &statsCopy
 				}

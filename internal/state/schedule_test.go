@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -428,4 +429,119 @@ func TestConfiguredRepositoriesAppearEvenWhenARunCannotJudgeThem(t *testing.T) {
 	// The placeholder must not overwrite what is already known about a sibling.
 	require.NotNil(t, repos["local"].LastStats)
 	assert.Equal(t, int64(10), repos["local"].LastStats.Files)
+}
+
+// Snapshot and Record hand out GroupRecords whose Repositories map and History
+// slice are shared with the stored records. That is only safe because a write
+// replaces those structures rather than mutating them: update parses a fresh
+// copy from disk and swaps it in. Mutating in place is the obvious optimization
+// to make here (it would save a read and a parse per write) and it would turn
+// every concurrent snapshot into a concurrent map access, which is a crash
+// rather than a wrong number.
+//
+// Run under -race, this fails on both counts: the detector fires, and the
+// assertions below catch a snapshot changing under its holder even without it.
+func TestSnapshotsAreNotMutatedByLaterWrites(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		ConfiguredRepositories: []string{"local"},
+		Repositories:           []state.RepoOutcome{{ID: "local", Result: state.ResultOK, Files: 1, Measured: true}},
+	})
+
+	snap := s.Snapshot()["g"]
+	rec, ok := s.Record("g")
+	require.True(t, ok)
+	require.Len(t, snap.Repositories, 1)
+	historyLen := len(snap.History)
+
+	// Concurrent writers while the snapshots are held and read.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := range 200 {
+			s.RecordRun("g", state.RunOutcome{
+				Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+				ConfiguredRepositories: []string{"local", fmt.Sprintf("added-%d", i)},
+				Repositories: []state.RepoOutcome{
+					{ID: "local", Result: state.ResultOK, Files: int64(i), Measured: true},
+				},
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			for id := range snap.Repositories {
+				_ = id
+			}
+			for _, h := range rec.History {
+				_ = h.Result
+			}
+		}
+	}()
+	wg.Wait()
+
+	assert.Len(t, snap.Repositories, 1, "a held snapshot must not gain entries a later write added")
+	assert.Equal(t, int64(1), snap.Repositories["local"].LastRun.Files,
+		"nor have its values rewritten underneath it")
+	assert.Len(t, rec.History, historyLen, "and its history must not grow either")
+}
+
+// An empty archive is a legitimate backup: every count is zero, and if it
+// finishes in under a second its duration truncates to zero too. Inferring
+// "was this measured" from "is anything nonzero" leaves that backup reported
+// under an older, larger archive forever, which reads as a dataset that never
+// changed rather than one that emptied.
+func TestAMeasuredEmptyArchiveReplacesTheOlderStats(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Files: 900, OriginalBytes: 4000, Measured: true},
+		},
+	})
+
+	// The source emptied: a real archive, measured, all zeros.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK, Measured: true}},
+	})
+
+	stats := s.Snapshot()["g"].Repositories["local"].LastStats
+	require.NotNil(t, stats)
+	assert.Zero(t, stats.Files, "a measured empty archive is the current truth, not a missing measurement")
+	assert.Zero(t, stats.OriginalBytes)
+
+	// A probe-confirmed success is still not a measurement and must not zero it.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed,
+		Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK}},
+	})
+	stats = s.Snapshot()["g"].Repositories["local"].LastStats
+	require.NotNil(t, stats)
+	assert.True(t, stats.Measured, "the retained stats are still the measured ones")
+}
+
+// Records written before Measured existed carry stats and no flag. Reading the
+// flag alone would drop them on the first run after an upgrade.
+func TestStatsWrittenBeforeTheMeasuredFlagAreStillKept(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Files: 12, OriginalBytes: 34}, // no Measured
+		},
+	})
+
+	stats := s.Snapshot()["g"].Repositories["local"].LastStats
+	require.NotNil(t, stats, "an outcome carrying numbers is still a measurement")
+	assert.Equal(t, int64(12), stats.Files)
 }
