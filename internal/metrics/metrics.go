@@ -11,7 +11,6 @@ package metrics
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -184,10 +183,26 @@ func newEmitter(ctx context.Context, reader sdkmetric.Reader, version string, so
 		resource.WithFromEnv(), // OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME
 	)
 	if err != nil {
-		// A resource error is not worth aborting metrics over: fall back to the
-		// exporter default resource.
-		logger.Warn("building metrics resource failed; using defaults", "error", err)
-		res = resource.Default()
+		// A resource error is not worth aborting metrics over, but the fallback
+		// has to keep the identity attributes. service.instance.id is what stops
+		// a one-shot run and the daemon being read as one cumulative stream, and
+		// dropping it because OTEL_RESOURCE_ATTRIBUTES had a malformed entry
+		// would reintroduce that silently, at the moment the operator is least
+		// likely to be looking.
+		logger.Warn("building metrics resource failed; keeping the service identity and using defaults for the rest",
+			"error", err)
+		identity := resource.NewSchemaless(
+			semconv.ServiceName("borgmatic-manager"),
+			semconv.ServiceVersion(version),
+			semconv.ServiceInstanceID(instanceID()),
+		)
+		merged, mergeErr := resource.Merge(resource.Default(), identity)
+		if mergeErr != nil {
+			logger.Warn("merging the fallback metrics resource failed; exporting without a service identity",
+				"error", mergeErr)
+			merged = resource.Default()
+		}
+		res = merged
 	}
 
 	provider := sdkmetric.NewMeterProvider(
@@ -555,29 +570,7 @@ func EffectiveProtocol(cfg config.MetricsSettings) string {
 // and printing it whole hands that credential to every journal reader. The
 // scheme, host and path are what an operator needs to see; the secret is not.
 func EffectiveEndpoint(cfg config.MetricsSettings) string {
-	return redactEndpoint(rawEndpoint(cfg))
-}
-
-// redactEndpoint strips userinfo and query values from a URL, leaving the parts
-// that identify where metrics are going. A value that does not parse as a URL is
-// reported as unprintable rather than guessed at, since a malformed endpoint
-// could still contain a secret.
-func redactEndpoint(endpoint string) string {
-	if endpoint == "" || !strings.Contains(endpoint, "//") {
-		return endpoint
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return "(unparsable endpoint)"
-	}
-	if u.User != nil {
-		u.User = url.User("redacted")
-	}
-	if u.RawQuery != "" {
-		u.RawQuery = "redacted"
-	}
-	u.Fragment = ""
-	return u.String()
+	return config.RedactEndpoint(rawEndpoint(cfg))
 }
 
 func rawEndpoint(cfg config.MetricsSettings) string {

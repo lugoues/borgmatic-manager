@@ -853,3 +853,33 @@ func TestTheLoggedEndpointCarriesNoCredential(t *testing.T) {
 			"tok=1")
 	})
 }
+
+// A malformed OTEL_RESOURCE_ATTRIBUTES entry makes resource.New fail. Falling
+// back to the default resource then drops service.instance.id, which is what
+// stops a one-shot run and the daemon being read as one cumulative stream, so
+// the collision would return silently at the moment an operator is least likely
+// to be watching for it.
+func TestTheFallbackResourceKeepsTheServiceIdentity(t *testing.T) {
+	// A bare key with no value is rejected by the environment detector.
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "this-is-not-a-pair")
+
+	reader := sdkmetric.NewManualReader()
+	e, err := newEmitter(context.Background(), reader, "v1.2.3",
+		fakeSource{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err, "a resource error must not disable metrics")
+	t.Cleanup(func() { _ = e.Shutdown(context.Background()) })
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+
+	id, ok := rm.Resource.Set().Value("service.instance.id")
+	require.True(t, ok, "the identity that separates the streams must survive")
+	assert.Equal(t, instanceID(), id.AsString())
+
+	name, ok := rm.Resource.Set().Value("service.name")
+	require.True(t, ok)
+	assert.Equal(t, "borgmatic-manager", name.AsString())
+	version, ok := rm.Resource.Set().Value("service.version")
+	require.True(t, ok)
+	assert.Equal(t, "v1.2.3", version.AsString())
+}
