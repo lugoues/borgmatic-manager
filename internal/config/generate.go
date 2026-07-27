@@ -655,7 +655,7 @@ func extractRepoKeys(final map[string]interface{}) []string {
 		if path == "" {
 			continue
 		}
-		key := canonicalRepoKey(path)
+		key := CanonicalRepoKey(path)
 		if !seen[key] {
 			seen[key] = true
 			keys = append(keys, key)
@@ -690,12 +690,23 @@ func extractRepoRefs(final map[string]interface{}) []RepoRef {
 	return refs
 }
 
-// canonicalRepoKey normalizes a repository path for use as a lock key.
-func canonicalRepoKey(path string) string {
+// UnknownRepoKey is the lock key for a repository path the manager cannot
+// resolve, so every such repository serializes against every other.
+const UnknownRepoKey = "unknown"
+
+// CanonicalRepoKey normalizes a repository path so two spellings of the same
+// repository compare equal. It is the lock key, and it is also how the runner
+// correlates borgmatic's reported repository location back to the configured
+// entry, which borg may report in normalized form.
+//
+// UnknownRepoKey is returned for a path borgmatic resolves at runtime: the
+// manager cannot know what it becomes, so callers must treat it as "not
+// identifiable" rather than as an identity two paths can share.
+func CanonicalRepoKey(path string) string {
 	if strings.Contains(path, "${") {
 		// Env placeholders resolve at borgmatic runtime; two spellings could
 		// be the same repo. Serialize conservatively under one key.
-		return "unknown"
+		return UnknownRepoKey
 	}
 	if strings.Contains(path, "://") || strings.Contains(path, "@") {
 		// Remote URL or user@host:path form.

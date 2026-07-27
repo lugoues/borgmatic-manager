@@ -1184,3 +1184,148 @@ func TestRetainedErrorTextIsBoundedByBytesAsWellAsCount(t *testing.T) {
 		assert.True(t, mentionedInErrors("/mnt/repo1", rs.errText))
 	})
 }
+
+// borgmatic reports the repository location borg resolved, which is not always
+// the string the config held. When the pairing misses, the run is still recorded
+// as successful but carries no stats at all, so the repository's size, file
+// count and duration never appear for a backup that in fact completed.
+func TestResultsMatchRepositoriesBorgReportsDifferently(t *testing.T) {
+	res := func(loc, label string, files int64) createResult {
+		var r createResult
+		r.Repository.Location = loc
+		r.Repository.Label = label
+		r.Archive.Stats.NFiles = files
+		return r
+	}
+
+	t.Run("a runtime-expanded path pairs with the only result", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "${BORG_REPO}"}},
+			[]createResult{res("/srv/borg/repo", "", 42)},
+		)
+		require.Contains(t, matched, 0, "an unmatched lone repository takes the lone result")
+		assert.Equal(t, int64(42), matched[0].Archive.Stats.NFiles)
+	})
+
+	// Both repositories need normalizing and both results are unclaimed, so the
+	// single-leftover rule cannot rescue this: the pairing has to come from
+	// canonical identity, and it has to survive the results arriving in the
+	// opposite order.
+	t.Run("normalized paths pair by canonical identity, not by position", func(t *testing.T) {
+		dir := t.TempDir()
+		matched := matchResults(
+			[]config.RepoRef{{Path: dir + "/repo/"}, {Path: dir + "/other/"}},
+			[]createResult{res(dir+"/other", "", 7), res(dir+"/repo", "", 99)},
+		)
+		require.Contains(t, matched, 0)
+		require.Contains(t, matched, 1)
+		assert.Equal(t, int64(99), matched[0].Archive.Stats.NFiles, "a trailing slash is not an identity")
+		assert.Equal(t, int64(7), matched[1].Archive.Stats.NFiles)
+	})
+
+	t.Run("an exact match is never stolen by a later repository", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "/a"}, {Path: "${BORG_REPO}"}},
+			[]createResult{res("/a", "", 1), res("/resolved", "", 2)},
+		)
+		assert.Equal(t, int64(1), matched[0].Archive.Stats.NFiles)
+		assert.Equal(t, int64(2), matched[1].Archive.Stats.NFiles,
+			"the leftover pairing takes what the exact match did not claim")
+	})
+
+	// Two labelled repositories whose paths are both unresolvable: the label is
+	// the only usable identity, and the single-leftover rule cannot stand in for
+	// it because neither side has a lone candidate.
+	t.Run("labels identify repositories whose paths cannot", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "${BORG_REPO}", Label: "local"}, {Path: "${BORG_REPO_2}", Label: "offsite"}},
+			[]createResult{res("/resolved-b", "offsite", 5), res("/resolved-a", "local", 8)},
+		)
+		require.Contains(t, matched, 0)
+		require.Contains(t, matched, 1)
+		assert.Equal(t, int64(8), matched[0].Archive.Stats.NFiles)
+		assert.Equal(t, int64(5), matched[1].Archive.Stats.NFiles)
+	})
+
+	// The exact pass is what makes a reported location authoritative. Canonical
+	// identity cannot stand in for it here: the location borgmatic echoed back is
+	// one it never expanded, so it canonicalizes to "unknown" and the canonical
+	// pass has to skip it. Reported verbatim is still reported.
+	t.Run("a location reported verbatim is matched even when it cannot be canonicalized", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "${BORG_REPO}"}, {Path: "${OTHER_REPO}"}, {Path: "/plain"}},
+			[]createResult{res("${BORG_REPO}", "", 7), res("/elsewhere", "", 8), res("/plain", "", 9)},
+		)
+		require.Contains(t, matched, 0)
+		assert.Equal(t, int64(7), matched[0].Archive.Stats.NFiles, "the literal location still identifies it")
+		assert.Equal(t, int64(8), matched[1].Archive.Stats.NFiles, "leaving one unambiguous leftover pair")
+		assert.Equal(t, int64(9), matched[2].Archive.Stats.NFiles)
+	})
+
+	// "unknown" is what CanonicalRepoKey returns for a path it cannot resolve.
+	// It says "no identity", not "this identity", so two repositories that both
+	// canonicalize to it are not the same repository. If borgmatic ever reports a
+	// location it did not expand, treating that key as a match cross-attributes
+	// one destination's measurements to another.
+	t.Run("an unresolvable path is not an identity two repositories can share", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "${BORG_REPO}"}, {Path: "${BORG_REPO_2}"}},
+			[]createResult{res("${SOMETHING_ELSE}", "", 1), res("${AND_ANOTHER}", "", 2)},
+		)
+		assert.Empty(t, matched)
+	})
+
+	t.Run("two ambiguous repositories are left unmatched", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "${BORG_REPO}"}, {Path: "${BORG_REPO_2}"}},
+			[]createResult{res("/one", "", 1), res("/two", "", 2)},
+		)
+		assert.Empty(t, matched,
+			"guessing between two runtime-expanded paths would attribute one destination's "+
+				"measurements to another, which is worse than reporting none")
+	})
+
+	// The asymmetric case the two-and-two shape cannot detect: one result and
+	// two candidates for it. Handing it to whichever repository came first is a
+	// coin flip, and half the time it credits a backup to the wrong destination.
+	t.Run("one result and two candidates is still ambiguous", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "${BORG_REPO}"}, {Path: "${BORG_REPO_2}"}},
+			[]createResult{res("/one", "", 1)},
+		)
+		assert.Empty(t, matched, "a lone result must not be claimed by one of two candidates")
+	})
+
+	// A result carries one repository's measurements, so it can be spent once.
+	// A config that lists the same repository twice must not have its stats
+	// counted against both entries.
+	t.Run("a result is claimed by at most one repository", func(t *testing.T) {
+		matched := matchResults(
+			[]config.RepoRef{{Path: "/a"}, {Path: "/a"}},
+			[]createResult{res("/a", "", 3)},
+		)
+		assert.Len(t, matched, 1, "one result cannot satisfy two repositories")
+		assert.Equal(t, int64(3), matched[0].Archive.Stats.NFiles)
+	})
+}
+
+// The end-to-end shape of the same bug: a successful run over a repository
+// borgmatic reports under its resolved path must still carry its measurements
+// into state, or LastStats stays empty after every successful backup.
+func TestSuccessCarriesStatsForARuntimeExpandedRepository(t *testing.T) {
+	var res createResult
+	res.Repository.Location = "/srv/borg/resolved"
+	res.Archive.Name = "demo-2026-07-27"
+	res.Archive.Stats.NFiles = 1234
+	res.Archive.Stats.OriginalSize = 5000
+	res.Archive.Duration = 12.5
+
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", []string{actionCreate}, 0)
+	out := r.perRepoSuccess([]config.RepoRef{{Path: "${BORG_REPO}"}}, []createResult{res})
+
+	require.Len(t, out, 1)
+	assert.Equal(t, state.ResultOK, out[0].Result)
+	assert.Equal(t, int64(1234), out[0].Files, "the stats must survive the resolved-path mismatch")
+	assert.Equal(t, int64(5000), out[0].OriginalBytes)
+}

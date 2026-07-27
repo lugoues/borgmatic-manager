@@ -562,19 +562,89 @@ func refID(ref config.RepoRef) string {
 	return ref.Path
 }
 
-// indexResults keys create results by reported location and label, so a repo is
-// matched even when the configured path differs from borg's resolved location.
-func indexResults(results []createResult) map[string]createResult {
-	byKey := make(map[string]createResult, 2*len(results))
-	for _, res := range results {
-		if res.Repository.Location != "" {
-			byKey["path:"+res.Repository.Location] = res
-		}
-		if res.Repository.Label != "" {
-			byKey["label:"+res.Repository.Label] = res
+// matchResults pairs each configured repository with the create result borgmatic
+// reported for it, by index into configured.
+//
+// The reported location is not always the configured string. borg normalizes
+// what it is given (trailing slashes, relative paths, symlinks), and a path like
+// ${BORG_REPO} is only resolved at borgmatic runtime, so the literal spelling
+// the manager holds may never appear in the output at all. A missed pairing is
+// silent: the run is still recorded as successful, but with no stats, so the
+// repository's size, file count and duration simply never appear.
+//
+// Three passes, most trustworthy first:
+//  1. exact location or label, which is the normal case
+//  2. canonical path identity, which absorbs borg's normalization
+//  3. one unmatched repository and one unclaimed result, which is unambiguous
+//
+// Positional pairing beyond that single-leftover case is deliberately not done.
+// borgmatic emits results in configuration order today, but relying on it would
+// mean silently attributing one destination's measurements to another whenever
+// that stops holding, and wrong stats are worse than absent ones.
+func matchResults(configured []config.RepoRef, results []createResult) map[int]createResult {
+	out := make(map[int]createResult, len(configured))
+	claimed := make([]bool, len(results))
+
+	claim := func(refIdx, resIdx int) {
+		out[refIdx] = results[resIdx]
+		claimed[resIdx] = true
+	}
+
+	for i, ref := range configured {
+		for j, res := range results {
+			if claimed[j] {
+				continue
+			}
+			if (ref.Path != "" && res.Repository.Location == ref.Path) ||
+				(ref.Label != "" && res.Repository.Label == ref.Label) {
+				claim(i, j)
+				break
+			}
 		}
 	}
-	return byKey
+
+	for i, ref := range configured {
+		if _, done := out[i]; done || ref.Path == "" {
+			continue
+		}
+		key := config.CanonicalRepoKey(ref.Path)
+		if key == config.UnknownRepoKey {
+			continue // resolved at borgmatic runtime; nothing to compare against
+		}
+		for j, res := range results {
+			if claimed[j] || res.Repository.Location == "" {
+				continue
+			}
+			if config.CanonicalRepoKey(res.Repository.Location) == key {
+				claim(i, j)
+				break
+			}
+		}
+	}
+
+	var loneRef, loneRes = -1, -1
+	for i := range configured {
+		if _, done := out[i]; done {
+			continue
+		}
+		if loneRef >= 0 {
+			return out // more than one candidate: no unambiguous pairing
+		}
+		loneRef = i
+	}
+	for j := range results {
+		if claimed[j] {
+			continue
+		}
+		if loneRes >= 0 {
+			return out
+		}
+		loneRes = j
+	}
+	if loneRef >= 0 && loneRes >= 0 {
+		claim(loneRef, loneRes)
+	}
+	return out
 }
 
 // applyStats copies a create result's archive stats onto a repo outcome.
@@ -601,15 +671,11 @@ func (r *Runner) perRepoSuccess(configured []config.RepoRef, results []createRes
 	if !r.actionsInclude(actionCreate) {
 		return nil
 	}
-	byKey := indexResults(results)
+	matched := matchResults(configured, results)
 	out := make([]state.RepoOutcome, 0, len(configured))
-	for _, ref := range configured {
+	for i, ref := range configured {
 		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultOK}
-		res, ok := byKey["path:"+ref.Path]
-		if !ok && ref.Label != "" {
-			res, ok = byKey["label:"+ref.Label]
-		}
-		if ok {
+		if res, ok := matched[i]; ok {
 			applyStats(&ro, res)
 		}
 		out = append(out, ro)
