@@ -2283,3 +2283,33 @@ func TestAnUnreadableRepositoryListIsNotAKnownEmptyOne(t *testing.T) {
 	assert.False(t, o.RepositoriesKnown,
 		"an unreadable list is not a report that the group configures nothing")
 }
+
+// For an unlabelled repository the path is the key, so a spelling change that
+// SameDestination forgives on a labelled one becomes a different record here.
+// Repository settings do not make a group due, so the old history is suppressed
+// and the new id reports as never completed until the next scheduled run.
+func TestAnUnlabelledRepositoryIdIsCanonical(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(dir+"/repo", 0o755))
+
+	plain := refID(config.RepoRef{Path: dir + "/repo"})
+	assert.Equal(t, plain, refID(config.RepoRef{Path: dir + "/repo/"}),
+		"a trailing separator is the same destination and must be the same record")
+	assert.Equal(t, plain, refID(config.RepoRef{Path: dir + "/./repo"}))
+	assert.NotEqual(t, plain, refID(config.RepoRef{Path: dir + "/other"}))
+
+	t.Run("a label still wins", func(t *testing.T) {
+		assert.Equal(t, "offsite", refID(config.RepoRef{Path: dir + "/repo/", Label: "offsite"}))
+	})
+
+	t.Run("an unresolvable path keeps its own spelling", func(t *testing.T) {
+		t.Setenv("NOT_SET_ANYWHERE", "")
+		assert.Equal(t, "${NOT_SET_ANYWHERE}", refID(config.RepoRef{Path: "${NOT_SET_ANYWHERE}"}),
+			"collapsing every unresolvable path to one key would merge distinct repositories")
+	})
+
+	t.Run("an environment-backed path resolves and canonicalizes", func(t *testing.T) {
+		t.Setenv("BORG_REPO", dir+"/repo/")
+		assert.Equal(t, plain, refID(config.RepoRef{Path: "${BORG_REPO}"}))
+	})
+}
