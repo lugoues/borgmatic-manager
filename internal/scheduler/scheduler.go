@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -79,6 +80,9 @@ type Scheduler struct {
 	discoverFunc func(ctx context.Context) (*models.BackupState, error)
 	generateFunc func(state *models.BackupState) (map[string]config.GroupRunMeta, error)
 
+	// repoObserver, when set, receives each cycle's per-group repository ids
+	// after generation, which is the first point they are known.
+	repoObserver func(map[string][]string)
 	// cycleObserver, when set, receives each cycle's merged inventory and offline
 	// state (nil when no cache), so metrics can report offline volume counts.
 	cycleObserver func(*models.BackupState, *state.Offline)
@@ -97,6 +101,33 @@ func (s *Scheduler) SetGroupCache(cache *state.GroupCache) {
 // then fails or never starts. Optional; nil (the default) disables it.
 func (s *Scheduler) SetCycleObserver(f func(*models.BackupState, *state.Offline)) {
 	s.cycleObserver = f
+}
+
+// SetRepositoryObserver registers a callback invoked once per cycle with each
+// group's configured repository ids, after generation.
+//
+// Separate from SetCycleObserver because the two know different things at
+// different times: the inventory is known before generation, and which
+// repositories a group configures is only known after it. A consumer that
+// reconciles per-repository state needs the second, and waiting for a run to
+// tell it means a group that is not due keeps reporting a repository that was
+// removed for as long as its backup period lasts.
+func (s *Scheduler) SetRepositoryObserver(f func(map[string][]string)) {
+	s.repoObserver = f
+}
+
+// repoID mirrors the runner's persisted key for a repository, so the inventory
+// the emitter reconciles against is keyed the same way the records are.
+func repoID(ref config.RepoRef) string {
+	if ref.Label != "" {
+		return ref.Label
+	}
+	if strings.Contains(ref.Path, "${") {
+		if expanded := os.ExpandEnv(ref.Path); expanded != "" && expanded != ref.Path {
+			return expanded
+		}
+	}
+	return ref.Path
 }
 
 // cacheNames returns cached group names for retention protection, or nil.
@@ -374,6 +405,18 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 	meta, err := s.generateFunc(backupState)
 	if err != nil {
 		return err
+	}
+
+	if s.repoObserver != nil {
+		repos := make(map[string][]string, len(meta))
+		for name, m := range meta {
+			ids := make([]string, 0, len(m.Repositories))
+			for _, ref := range m.Repositories {
+				ids = append(ids, repoID(ref))
+			}
+			repos[name] = ids
+		}
+		s.repoObserver(repos)
 	}
 
 	s.RunAllGroups(ctx, backupState, meta)

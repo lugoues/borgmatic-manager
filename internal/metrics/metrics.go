@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,9 @@ type Emitter struct {
 	mu        sync.Mutex
 	offline   map[string]int
 	allGroups map[string]struct{}
+	// repos is each group's currently configured repository ids, reported after
+	// generation. Nil until a cycle reports one.
+	repos map[string][]string
 	// observed records that a cycle has reported an inventory, which an empty
 	// allGroups cannot: the last group being removed and no cycle having run yet
 	// are the same empty map and opposite situations.
@@ -92,7 +96,8 @@ type loggingExporter struct {
 func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
 	err := l.Exporter.Export(ctx, rm)
 	if err != nil {
-		l.logger.Warn("metrics export failed; the OTLP collector is unreachable or rejecting", "error", err)
+		l.logger.Warn("metrics export failed; the OTLP collector is unreachable or rejecting",
+			"error", redactURLsIn(err.Error()))
 		return err
 	}
 	// The first success is news and the rest are not, so exactly one of the two
@@ -113,6 +118,21 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 
 // countDataPoints totals the series pushed, so the confirmation log shows the
 // export was non-empty.
+// urlInText matches a URL embedded in prose, stopping at the characters a
+// message is likely to put after one.
+var urlInText = regexp.MustCompile(`https?://[^\s"'` + "`" + `,;)\]}>]+`)
+
+// redactURLsIn strips credentials from any URL inside a message.
+//
+// The transport builds its own error text, and for an HTTP exporter that text
+// can contain the full request URL: with a collector authenticated by a query
+// token, an unreachable collector writes that token to the journal on every
+// export interval, which is the loudest possible way to leak it. Redacting the
+// startup log alone covered the one line nobody was worried about.
+func redactURLsIn(msg string) string {
+	return urlInText.ReplaceAllStringFunc(msg, config.RedactEndpoint)
+}
+
 // countDataPoints counts the exported time series, not the instruments. The two
 // differ by an order of magnitude here: nearly every metric is per repository,
 // and backup_last_size_bytes is per repository per size kind, so a handful of
@@ -307,6 +327,14 @@ func (e *Emitter) observe(o metric.Observer,
 
 	e.mu.Lock()
 	observed := e.observed
+	configuredRepos := make(map[string]map[string]bool, len(e.repos))
+	for group, ids := range e.repos {
+		set := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			set[id] = true
+		}
+		configuredRepos[group] = set
+	}
 	known := make(map[string]struct{}, len(e.allGroups))
 	for g := range e.allGroups {
 		known[g] = struct{}{}
@@ -338,6 +366,12 @@ func (e *Emitter) observe(o metric.Observer,
 			}
 		}
 		for id, rr := range rec.Repositories {
+			// A repository removed from a group the group still has. The record
+			// survives until the next run reconciles it, and that run may be a
+			// whole period away, so the reconciliation has to happen here too.
+			if set, ok := configuredRepos[group]; ok && !set[id] {
+				continue
+			}
 			repoAttrs := metric.WithAttributes(
 				attribute.String("group", group),
 				attribute.String("repository", id),
@@ -508,6 +542,25 @@ func (e *Emitter) ObserveInventory(bs *models.BackupState, off *state.Offline) {
 	}
 	e.mu.Lock()
 	e.offline, e.allGroups, e.observed = counts, groups, true
+	e.mu.Unlock()
+}
+
+// ObserveRepositories records which repositories each group currently
+// configures, so the gauges can drop one that has been removed.
+//
+// A run is too late to learn this. Scheduler dueness is computed from the volume
+// and database fingerprint, not from repository settings, so a group whose
+// repository list changed is not due any sooner: without this it keeps exporting
+// the removed destination's inventory, staleness and last-value series for a
+// whole backup period, and the documented alert keeps firing for something that
+// is no longer configured.
+func (e *Emitter) ObserveRepositories(repos map[string][]string) {
+	copied := make(map[string][]string, len(repos))
+	for group, ids := range repos {
+		copied[group] = append([]string(nil), ids...)
+	}
+	e.mu.Lock()
+	e.repos = copied
 	e.mu.Unlock()
 }
 

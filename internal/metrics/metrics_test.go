@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -882,4 +883,86 @@ func TestTheFallbackResourceKeepsTheServiceIdentity(t *testing.T) {
 	version, ok := rm.Resource.Set().Value("service.version")
 	require.True(t, ok)
 	assert.Equal(t, "v1.2.3", version.AsString())
+}
+
+// The transport writes its own error text, and for an HTTP exporter that text
+// can contain the full request URL. With a collector authenticated by a query
+// token, an unreachable collector would write that token to the journal on every
+// export interval, which is a louder leak than the startup line ever was.
+func TestExporterErrorsAreRedacted(t *testing.T) {
+	var buf syncBuffer
+	l := &loggingExporter{
+		Exporter: &stubExporter{err: func() error {
+			return errors.New(`Post "https://collector.example/v1/metrics?token=s3cret": dial tcp: connection refused`)
+		}},
+		logger: slog.New(slog.NewTextHandler(&buf, nil)),
+	}
+	require.Error(t, l.Export(context.Background(), &metricdata.ResourceMetrics{}))
+
+	out := buf.String()
+	assert.NotContains(t, out, "s3cret")
+	assert.Contains(t, out, "collector.example", "the operator still needs to know which collector")
+	assert.Contains(t, out, "connection refused", "and why it failed")
+}
+
+func TestRedactURLsIn(t *testing.T) {
+	for _, tc := range []struct{ name, in, wantAbsent, wantPresent string }{
+		{name: "userinfo", in: `Post "https://u:pw@c.example/v1": refused`, wantAbsent: "pw", wantPresent: "c.example"},
+		{name: "query token", in: `Post "https://c.example/v1?token=abc": refused`, wantAbsent: "abc", wantPresent: "c.example"},
+		{name: "no url", in: "context deadline exceeded", wantPresent: "context deadline exceeded"},
+		{name: "trailing punctuation is not part of the url",
+			in: "failed (https://u:pw@c.example/v1), retrying", wantAbsent: "pw", wantPresent: "retrying"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactURLsIn(tc.in)
+			if tc.wantAbsent != "" {
+				assert.NotContains(t, got, tc.wantAbsent)
+			}
+			assert.Contains(t, got, tc.wantPresent)
+		})
+	}
+}
+
+// A repository removed from a group the group still has. Scheduler dueness comes
+// from the volume and database fingerprint, not from repository settings, so the
+// group is not due any sooner for having changed: waiting for a run to reconcile
+// means the removed destination keeps its inventory, staleness and last-value
+// series for a whole backup period, and the alert keeps firing for something
+// that is no longer configured.
+func TestARemovedRepositoryStopsBeingExportedBeforeTheNextRun(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"web": {Repositories: map[string]state.RepoRecord{
+			"local":   {LastSuccess: now.Add(-time.Hour)},
+			"offsite": {LastSuccess: now.Add(-time.Hour)},
+		}},
+	}})
+	e.now = func() time.Time { return now }
+
+	bs := models.NewBackupState()
+	bs.AddVolume("web", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+
+	repos := func() []string {
+		info := findMetric(t, collect(t, reader), "backup_repository_info").Data.(metricdata.Gauge[int64])
+		var out []string
+		for _, dp := range info.DataPoints {
+			out = append(out, attr(dp.Attributes, "repository"))
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	e.ObserveRepositories(map[string][]string{"web": {"local", "offsite"}})
+	assert.Equal(t, []string{"local", "offsite"}, repos())
+
+	// offsite is removed from the group's configuration, and no run happens.
+	e.ObserveRepositories(map[string][]string{"web": {"local"}})
+	assert.Equal(t, []string{"local"}, repos(),
+		"the removed destination must stop being reported without waiting for a run")
+
+	// A group the observer says nothing about is not filtered: silence is not a
+	// report that it has no repositories.
+	e.ObserveRepositories(map[string][]string{"other": {"x"}})
+	assert.Equal(t, []string{"local", "offsite"}, repos())
 }

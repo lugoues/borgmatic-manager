@@ -632,6 +632,7 @@ func runDaemon() error {
 	defer shutdownMetrics()
 	if emitter != nil {
 		s.SetCycleObserver(emitter.ObserveInventory)
+		s.SetRepositoryObserver(emitter.ObserveRepositories)
 	}
 
 	l := events.NewListener(e.rt, slog.Default())
