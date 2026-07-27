@@ -146,3 +146,29 @@ func TestManagerOptionsAtTheTopLevelAreRejected(t *testing.T) {
 		require.NoError(t, write(t, "x-anchors:\n  a: &a 1\nmanager:\n  period: 1h\n"))
 	})
 }
+
+// A scheme typo produces exactly this shape: malformed before the authority, so
+// url.Parse finds no host and every credential in it stays in the string. That
+// value then reaches the journal through the validation error, which is the path
+// the earlier redaction was supposed to close.
+func TestMalformedEndpointsWithoutDoubleSlashesAreNotEchoed(t *testing.T) {
+	for _, tc := range []struct{ name, endpoint, secret string }{
+		{name: "userinfo", endpoint: "https:/user:password@collector.example", secret: "password"},
+		{name: "query token", endpoint: "https:/collector.example/v1?token=s3cret", secret: "s3cret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.NotContains(t, config.RedactEndpoint(tc.endpoint), tc.secret)
+			err := config.MetricsSettings{Enabled: true, Endpoint: tc.endpoint}.Validate()
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), tc.secret,
+				"the value reaches the journal through this error")
+		})
+	}
+
+	t.Run("a plain host and port stays readable", func(t *testing.T) {
+		assert.Equal(t, "collector:4317", config.RedactEndpoint("collector:4317"))
+	})
+	t.Run("an empty endpoint is unchanged", func(t *testing.T) {
+		assert.Empty(t, config.RedactEndpoint(""))
+	})
+}

@@ -112,7 +112,18 @@ func (m MetricsSettings) Validate() error {
 // rather than guessed at: a malformed endpoint can still hold a secret, and a
 // typo in the scheme is one of the ways it gets malformed.
 func RedactEndpoint(endpoint string) string {
-	if endpoint == "" || !strings.Contains(endpoint, "//") {
+	if endpoint == "" {
+		return endpoint
+	}
+	if !strings.Contains(endpoint, "//") {
+		// Malformed before the authority, "https:/user:pw@host" being the shape
+		// a scheme typo produces, so url.Parse finds no host and every
+		// credential in it stays in the string. A value carrying userinfo or a
+		// query is unprintable when it cannot be parsed; a plain "host:port" has
+		// nothing to hide and stays readable.
+		if strings.ContainsAny(endpoint, "@?#") {
+			return "(unprintable endpoint)"
+		}
 		return endpoint
 	}
 	u, err := url.Parse(endpoint)
