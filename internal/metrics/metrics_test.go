@@ -637,21 +637,49 @@ func TestAGroupFailureIsCountedEvenWhenEveryDestinationSucceeded(t *testing.T) {
 	assert.False(t, hasRepo, "the group counter carries no repository label to sum across")
 }
 
-// The maintenance rule applies to both counters, or the group counter reports
-// the successful backups a create-less cycle never took.
-func TestAMaintenanceOnlyCycleCountsInNeitherCounter(t *testing.T) {
+// The two counters answer different questions, so a maintenance-only cycle
+// belongs in one and not the other: it is a run of the group, and it is not a
+// backup of anything. Counting its failures while dropping its successes, which
+// is what I had, makes any rate over the group counter read as a permanent 100%
+// failure for a manager configured that way.
+func TestAMaintenanceOnlyCycleCountsAsARunButNotAsABackup(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
 	e.RecordRun("web", state.RunOutcome{
 		Result: state.ResultOK, CreateAttempted: false,
 		ConfiguredRepositories: []string{"local"},
 	})
 	rm := collect(t, reader)
+
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			assert.NotContains(t, []string{"backup_runs_total", "backup_group_runs_total"}, m.Name,
-				"nothing was backed up, so no backup run happened at either level")
+			assert.NotEqual(t, "backup_runs_total", m.Name,
+				"nothing was backed up, so no backup happened at any destination")
 		}
 	}
+
+	group := findMetric(t, rm, "backup_group_runs_total").Data.(metricdata.Sum[int64])
+	require.Len(t, group.DataPoints, 1)
+	assert.Equal(t, state.ResultOK, attr(group.DataPoints[0].Attributes, "result"),
+		"the run itself succeeded, and a success rate has to be able to say so")
+}
+
+// The failure direction of the same rule, which was already right and must stay
+// right: a check that keeps failing is what wants alerting on.
+func TestAFailedMaintenanceCycleCountsInBothPlacesItCan(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	e.RecordRun("web", state.RunOutcome{
+		Result: state.ResultFailed, CreateAttempted: false,
+		ConfiguredRepositories: []string{"local"},
+	})
+	rm := collect(t, reader)
+
+	group := findMetric(t, rm, "backup_group_runs_total").Data.(metricdata.Sum[int64])
+	require.Len(t, group.DataPoints, 1)
+	assert.Equal(t, state.ResultFailed, attr(group.DataPoints[0].Attributes, "result"))
+
+	perRepo := findMetric(t, rm, "backup_runs_total").Data.(metricdata.Sum[int64])
+	require.Len(t, perRepo.DataPoints, 1)
+	assert.Equal(t, state.ResultFailed, attr(perRepo.DataPoints[0].Attributes, "result"))
 }
 
 // A one-shot run is supported while the daemon is up, so two processes export
@@ -678,4 +706,62 @@ func TestEachProcessExportsItsOwnCounterStream(t *testing.T) {
 	assert.Equal(t, id, instanceOf(t), "one identity per process, stable across emitters")
 	assert.Contains(t, id, fmt.Sprintf("%d", os.Getpid()),
 		"derived from the process, so a restart is distinguishable from its predecessor")
+}
+
+// A group removed from the inventory keeps its schedule record for two absent
+// cycles so a redeploy blip does not wipe its history. Exporting gauges from
+// that record while backup_group_info has already dropped the group leaves the
+// two inventory levels contradicting each other, and the documented join keeps
+// firing for a destination that no longer exists.
+func TestGaugesFollowTheInventoryRatherThanTheRetainedRecord(t *testing.T) {
+	now := time.Now()
+	src := fakeSource{snap: map[string]state.GroupRecord{
+		"live":    {Repositories: map[string]state.RepoRecord{"local": {LastSuccess: now.Add(-time.Hour)}}},
+		"removed": {Repositories: map[string]state.RepoRecord{"local": {LastSuccess: now.Add(-time.Hour)}}},
+	}}
+	e, reader := newTestEmitter(t, src)
+	e.now = func() time.Time { return now }
+
+	// Only "live" is still discovered; "removed" lingers in the schedule record.
+	bs := models.NewBackupState()
+	bs.AddVolume("live", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+
+	rm := collect(t, reader)
+	groups := func(name string) []string {
+		m := findMetric(t, rm, name)
+		var out []string
+		switch d := m.Data.(type) {
+		case metricdata.Gauge[int64]:
+			for _, dp := range d.DataPoints {
+				out = append(out, attr(dp.Attributes, "group"))
+			}
+		case metricdata.Gauge[float64]:
+			for _, dp := range d.DataPoints {
+				out = append(out, attr(dp.Attributes, "group"))
+			}
+		}
+		return out
+	}
+
+	assert.Equal(t, []string{"live"}, groups("backup_group_info"))
+	assert.Equal(t, []string{"live"}, groups("backup_repository_info"),
+		"the repository inventory must agree with the group inventory")
+	assert.Equal(t, []string{"live"}, groups("backup_seconds_since_last_success"),
+		"or the staleness alert keeps firing for a group that no longer exists")
+}
+
+// Before the first cycle there is no inventory to reconcile against, and the
+// point of reading these gauges from persisted state is that a restarted daemon
+// reports immediately rather than waiting for a run.
+func TestGaugesReportFromDiskBeforeAnyInventoryIsObserved(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"web": {Repositories: map[string]state.RepoRecord{"local": {LastSuccess: now.Add(-time.Hour)}}},
+	}})
+	e.now = func() time.Time { return now }
+
+	stale := findMetric(t, collect(t, reader), "backup_seconds_since_last_success").Data.(metricdata.Gauge[float64])
+	require.Len(t, stale.DataPoints, 1, "a fresh daemon reports what it knows from disk")
+	assert.InDelta(t, time.Hour.Seconds(), stale.DataPoints[0].Value, 1)
 }

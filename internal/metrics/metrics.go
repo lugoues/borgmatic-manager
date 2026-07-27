@@ -284,7 +284,35 @@ func (e *Emitter) observe(o metric.Observer,
 	lastDuration, staleness metric.Float64Observable,
 ) {
 	now := e.now()
+
+	e.mu.Lock()
+	known := make(map[string]struct{}, len(e.allGroups))
+	for g := range e.allGroups {
+		known[g] = struct{}{}
+	}
+	offline := make(map[string]int, len(e.offline))
+	for g, n := range e.offline {
+		offline[g] = n
+	}
+	e.mu.Unlock()
+
 	for group, rec := range e.source.Snapshot() {
+		// A group removed from the inventory keeps its schedule record for two
+		// absent cycles, so a redeploy blip does not wipe its history. Exporting
+		// gauges from that record while backup_group_info has already dropped the
+		// group puts the two inventory levels in contradiction: the documented
+		// join keeps firing for a destination that no longer exists, and does so
+		// during every transient disappearance. The record is the right thing to
+		// keep and the wrong thing to export.
+		//
+		// Only filtered once an inventory has actually been observed, so a
+		// collection that lands before the first cycle still reports from disk,
+		// which is the point of reading the gauges from persisted state.
+		if len(known) > 0 {
+			if _, ok := known[group]; !ok {
+				continue
+			}
+		}
 		for id, rr := range rec.Repositories {
 			repoAttrs := metric.WithAttributes(
 				attribute.String("group", group),
@@ -321,18 +349,16 @@ func (e *Emitter) observe(o metric.Observer,
 		}
 	}
 
-	e.mu.Lock()
-	for group := range e.allGroups {
+	for group := range known {
 		// One series per configured group, whether or not it has ever run. Every
 		// other metric here springs into existence only after a backup, so
 		// without this a group that has never succeeded looks exactly like one
 		// that was deleted, and an alert on "no recent backup" cannot fire for
 		// the group that most needs it.
 		o.ObserveInt64(groupInfo, 1, metric.WithAttributes(attribute.String("group", group)))
-		o.ObserveInt64(offlineVolumes, int64(e.offline[group]),
+		o.ObserveInt64(offlineVolumes, int64(offline[group]),
 			metric.WithAttributes(attribute.String("group", group)))
 	}
-	e.mu.Unlock()
 }
 
 // counterResult maps a stored outcome onto the counter's documented label set.
@@ -359,6 +385,23 @@ func counterResult(result string) string {
 func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 	ctx := context.Background()
 
+	// The group's own verdict, before the backup-specific guard below, because
+	// this counter is about runs and that guard is about backups.
+	//
+	// It is a different question from any destination's: when create reaches
+	// every repository and a later prune, compact or check fails, every
+	// per-repository sample is correctly ok and the run is still a failure.
+	// Derived from the repository samples alone, a recurring maintenance failure
+	// is invisible to anything selecting failed runs.
+	//
+	// A maintenance-only cycle counts here and not in backup_runs_total. Counting
+	// its failures and dropping its successes would have been the worst of both:
+	// any rate over this counter would read as a permanent 100% failure for a
+	// manager configured that way. "Did this run succeed" and "was anything
+	// backed up" are separate questions, and each counter answers one of them.
+	e.groupRunsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("group", group), attribute.String("result", counterResult(o.Result))))
+
 	// A maintenance-only cycle (prune, compact, check, with no create) exits zero
 	// having written no archive anywhere. The runner already refuses to record a
 	// per-repository success for one; counting it here would put the same lie in
@@ -371,16 +414,6 @@ func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 	if !o.CreateAttempted && o.Result == state.ResultOK {
 		return
 	}
-
-	// The group's own verdict, recorded separately because it is a different
-	// question from any destination's. When create reaches every repository and
-	// a later prune, compact or check fails, every per-repository sample is
-	// correctly ok and the run is still a failure: derived from the repository
-	// samples alone, a recurring maintenance failure is invisible to anything
-	// selecting failed runs. Recording it as another backup_runs_total sample
-	// would instead make the two double-count when summed.
-	e.groupRunsTotal.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("group", group), attribute.String("result", counterResult(o.Result))))
 
 	if len(o.Repositories) == 0 {
 		// A timeout, a signal, or a failure that cannot be attributed leaves
