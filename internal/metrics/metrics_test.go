@@ -239,7 +239,9 @@ func TestRepositoryInfoCoversADestinationThatHasNeverSucceeded(t *testing.T) {
 			"offsite": {LastRun: &state.RepoOutcome{ID: "offsite", Result: state.ResultFailed}},
 		}},
 	}})
-	e.ObserveInventory(models.NewBackupState(), nil)
+	bs := models.NewBackupState()
+	bs.AddVolume("db", models.VolumeInfo{Name: "data", HostPath: "/mnt/db"})
+	e.ObserveInventory(bs, nil)
 
 	rm := collect(t, reader)
 	info := findMetric(t, rm, "backup_repository_info")
@@ -764,4 +766,79 @@ func TestGaugesReportFromDiskBeforeAnyInventoryIsObserved(t *testing.T) {
 	stale := findMetric(t, collect(t, reader), "backup_seconds_since_last_success").Data.(metricdata.Gauge[float64])
 	require.Len(t, stale.DataPoints, 1, "a fresh daemon reports what it knows from disk")
 	assert.InDelta(t, time.Hour.Seconds(), stale.DataPoints[0].Value, 1)
+}
+
+// Removing the last group leaves an inventory that is empty and observed, which
+// is the opposite situation from one that was never filled, and an empty map
+// alone cannot tell them apart. Without the distinction the final destination's
+// gauges outlive it and the documented alert keeps firing for a group that is
+// gone.
+func TestRemovingTheLastGroupClearsItsGauges(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"web": {Repositories: map[string]state.RepoRecord{"local": {LastSuccess: now.Add(-time.Hour)}}},
+	}})
+	e.now = func() time.Time { return now }
+
+	// The group is discovered, then removed; its schedule record is retained.
+	bs := models.NewBackupState()
+	bs.AddVolume("web", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+	require.Len(t, findMetric(t, collect(t, reader), "backup_repository_info").
+		Data.(metricdata.Gauge[int64]).DataPoints, 1)
+
+	e.ObserveInventory(models.NewBackupState(), nil)
+
+	rm := collect(t, reader)
+	for _, name := range []string{"backup_repository_info", "backup_seconds_since_last_success", "backup_group_info"} {
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name != name {
+					continue
+				}
+				switch d := m.Data.(type) {
+				case metricdata.Gauge[int64]:
+					assert.Empty(t, d.DataPoints, "%s must not outlive the last group", name)
+				case metricdata.Gauge[float64]:
+					assert.Empty(t, d.DataPoints, "%s must not outlive the last group", name)
+				}
+			}
+		}
+	}
+}
+
+// The endpoint goes to the journal, which more people can read than the config.
+// The OTLP spec allows an authenticated collector to be addressed with userinfo
+// in the URL or a token in the query string, so printing the configured value
+// whole hands that credential to every journal reader.
+func TestTheLoggedEndpointCarriesNoCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name, endpoint, want string
+	}{
+		{name: "userinfo is replaced", endpoint: "https://user:password@collector.example/v1/metrics",
+			want: "https://redacted@collector.example/v1/metrics"},
+		{name: "a query token is replaced", endpoint: "https://collector.example/v1/metrics?token=s3cret",
+			want: "https://collector.example/v1/metrics?redacted"},
+		{name: "both at once", endpoint: "https://u:p@collector.example/v1?sig=abc",
+			want: "https://redacted@collector.example/v1?redacted"},
+		{name: "an ordinary endpoint is unchanged", endpoint: "http://localhost:4318",
+			want: "http://localhost:4318"},
+		{name: "a host:port form is unchanged", endpoint: "collector:4317", want: "collector:4317"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, EffectiveEndpoint(config.MetricsSettings{Endpoint: tc.endpoint}))
+		})
+	}
+
+	t.Run("the environment fallback is redacted too", func(t *testing.T) {
+		t.Setenv(envEndpoint, "https://user:password@collector.example/v1/metrics")
+		got := EffectiveEndpoint(config.MetricsSettings{})
+		assert.NotContains(t, got, "password")
+		assert.Contains(t, got, "collector.example")
+	})
+
+	t.Run("an unparsable value is not guessed at", func(t *testing.T) {
+		assert.NotContains(t, EffectiveEndpoint(config.MetricsSettings{Endpoint: "https://u:p@ho st/x?tok=1"}),
+			"tok=1")
+	})
 }
