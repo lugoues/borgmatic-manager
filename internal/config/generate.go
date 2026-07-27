@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -726,10 +725,15 @@ func patternMatchesFormat(pattern string, segs []formatSegment) bool {
 			// pattern wants. Report a collision rather than guess.
 			return true
 		}
-		next := map[int]bool{}
-		for _, alt := range seg.alts {
-			for state := range consume(pattern, states, alt) {
-				next[state] = true
+		var next map[int]bool
+		if seg.digits > 0 {
+			next = consumeDigits(pattern, states, seg.digits)
+		} else {
+			next = map[int]bool{}
+			for _, alt := range seg.alts {
+				for state := range consume(pattern, states, alt) {
+					next[state] = true
+				}
 			}
 		}
 		if len(next) == 0 {
@@ -753,6 +757,28 @@ func consume(pattern string, states map[int]bool, text string) map[int]bool {
 			case '*':
 				next[state] = true // the star keeps consuming
 			case text[i]:
+				next[state+1] = true
+			}
+		}
+		cur = starClosure(pattern, next)
+	}
+	return cur
+}
+
+// consumeDigits advances every state through exactly n decimal digits, whichever
+// digits those turn out to be.
+func consumeDigits(pattern string, states map[int]bool, n int) map[int]bool {
+	cur := states
+	for i := 0; i < n && len(cur) > 0; i++ {
+		next := map[int]bool{}
+		for state := range cur {
+			if state >= len(pattern) {
+				continue
+			}
+			switch c := pattern[state]; {
+			case c == '*':
+				next[state] = true // the star keeps consuming
+			case c >= '0' && c <= '9':
 				next[state+1] = true
 			}
 		}
@@ -829,11 +855,17 @@ func archiveFormatSegments(format string) []formatSegment {
 	return out
 }
 
-// formatSegment is one position in a format: a finite set of alternatives, or
-// anything at all when the value cannot be characterized.
+// formatSegment is one position in a format: a finite set of alternatives, a run
+// of digits of known length, or anything at all when the value cannot be
+// characterized.
 type formatSegment struct {
 	alts []string
-	any  bool
+	// digits, when positive, means exactly that many decimal digits, whatever
+	// they are. It is how the open-ended directives are modelled: a year has no
+	// bounded set of values, and enumerating a window around today would call
+	// two groups disjoint because a retained archive predates the window.
+	digits int
+	any    bool
 }
 
 func placeholderSegments(token string) []formatSegment {
@@ -882,6 +914,13 @@ func strftimeSegments(spec string) []formatSegment {
 			continue
 		}
 		flush()
+		if n, ok := strftimeDigitRuns[spec[i]]; ok {
+			// Open-ended: any run of that many digits. A repository outlives any
+			// window of years that could be enumerated here, and its retained
+			// archives still carry the year they were written in.
+			out = append(out, formatSegment{digits: n})
+			continue
+		}
 		if domain, ok := strftimeDomains[spec[i]]; ok {
 			out = append(out, formatSegment{alts: domain})
 			continue
@@ -891,6 +930,11 @@ func strftimeSegments(spec string) []formatSegment {
 	flush()
 	return out
 }
+
+// strftimeDigitRuns are the directives whose values are unbounded, given as the
+// number of digits they render. Modelled as a digit run rather than a value set,
+// since no enumeration of years is complete.
+var strftimeDigitRuns = map[byte]int{'Y': 4, 'y': 2, 'j': 3}
 
 // strftimeDomains is every value each supported directive can render. A
 // directive that is absent renders as "anything", which collides rather than
@@ -903,23 +947,12 @@ var strftimeDomains = func() map[byte][]string {
 		}
 		return out
 	}
-	// Years are open-ended in principle. A window around now covers a group
-	// named after a year, which is the case that matters, without pretending to
-	// cover every year a repository might outlive.
-	year := time.Now().Year()
-	years := make([]string, 0, 4)
-	yearsShort := make([]string, 0, 4)
-	for y := year - 1; y <= year+2; y++ {
-		years = append(years, fmt.Sprintf("%04d", y))
-		yearsShort = append(yearsShort, fmt.Sprintf("%02d", y%100))
-	}
 	months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 	longMonths := []string{"January", "February", "March", "April", "May", "June",
 		"July", "August", "September", "October", "November", "December"}
 	days := []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
 	longDays := []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
 	return map[byte][]string{
-		'Y': years, 'y': yearsShort,
 		'm': pad(1, 12), 'd': pad(1, 31),
 		'H': pad(0, 23), 'I': pad(1, 12),
 		'M': pad(0, 59), 'S': pad(0, 59),
