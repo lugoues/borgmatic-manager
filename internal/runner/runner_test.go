@@ -1029,7 +1029,9 @@ func TestProbeIsScopedToThisGroupsArchives(t *testing.T) {
 	for i, a := range args {
 		if a == "--match-archives" {
 			require.Less(t, i+1, len(args))
-			assert.Equal(t, "host-g-*", args[i+1])
+			assert.Equal(t, "sh:host-g-*", args[i+1],
+				"pinned to shell syntax, or a format beginning with re: or pp: "+
+					"changes how borg reads the pattern the check modelled as a glob")
 		}
 	}
 }
@@ -2181,4 +2183,28 @@ func TestARepointedLabelledEnvironmentPathIsRecordedByDestination(t *testing.T) 
 	o := rec.outcomes["g"]
 	assert.Equal(t, map[string]string{"offsite": "/srv/borg/new"}, o.ConfiguredRepositoryPaths,
 		"the reconciliation compares destinations, so it must be given one")
+}
+
+// os/exec does not invoke a shell, so "--repository ${BORG_REPO}" selects
+// nothing: the probe has to be given the destination the expression resolves to,
+// as the outcome and identity paths already are.
+func TestTheProbeIsGivenTheResolvedRepositoryPath(t *testing.T) {
+	t.Setenv("BORG_REPO", "/srv/borg/resolved")
+	runStart := time.Now().Add(-time.Minute)
+	fresh := runStart.Add(10 * time.Second)
+
+	pf := &probeFake{out: map[string]string{"/srv/borg/resolved": listJSON(fresh)}}
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", nil, 0)
+	r.execCommand = pf.exec
+	run := &runState{logger: r.logger, group: "g"}
+
+	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+		[]config.RepoRef{{Path: "${BORG_REPO}", Label: "offsite"}}, nil,
+		archiveScope{pattern: "host-g-*"}, run, runStart)
+
+	require.Len(t, out, 1)
+	assert.Equal(t, state.ResultOK, out[0].Result,
+		"the probe must reach the repository borg actually writes to")
+	assert.Equal(t, []string{"/srv/borg/resolved"}, pf.probed())
 }
