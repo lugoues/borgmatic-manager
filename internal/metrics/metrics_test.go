@@ -1136,6 +1136,49 @@ func TestARepointedLabelStopsExportingTheOldDestination(t *testing.T) {
 				"the old destination's freshness must not be reported under the new one")
 		}
 	}
+
+	// The inventory series stays, though: the repository is configured and has
+	// never completed, which is exactly what the documented join reports. Dropping
+	// it hid the repointed destination behind a sibling's info series.
+	info := findMetric(t, rm, "backup_repository_info").Data.(metricdata.Gauge[int64])
+	require.Len(t, info.DataPoints, 1)
+	assert.Equal(t, "offsite", attr(info.DataPoints[0].Attributes, "repository"))
+}
+
+// The shape the suppression has to survive: one destination repointed, a sibling
+// still reporting normally. The group-level fallback cannot cover the repointed
+// one, because the sibling's info series satisfies any group-level join.
+func TestARepointedRepositoryStaysVisibleBesideAHealthySibling(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"web": {Repositories: map[string]state.RepoRecord{
+			"local":   {Path: "/mnt/local", LastSuccess: now.Add(-time.Hour)},
+			"offsite": {Path: "/mnt/old", LastSuccess: now.Add(-time.Hour)},
+		}},
+	}})
+	e.now = func() time.Time { return now }
+
+	bs := models.NewBackupState()
+	bs.AddVolume("web", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+	e.ObserveRepositories(map[string]map[string]string{
+		"web": {"local": "/mnt/local", "offsite": "/mnt/new"},
+	})
+
+	rm := collect(t, reader)
+
+	info := findMetric(t, rm, "backup_repository_info").Data.(metricdata.Gauge[int64])
+	var reported []string
+	for _, dp := range info.DataPoints {
+		reported = append(reported, attr(dp.Attributes, "repository"))
+	}
+	sort.Strings(reported)
+	assert.Equal(t, []string{"local", "offsite"}, reported,
+		"both are configured, so both are joinable")
+
+	stale := findMetric(t, rm, "backup_seconds_since_last_success").Data.(metricdata.Gauge[float64])
+	require.Len(t, stale.DataPoints, 1, "only the destination whose history is its own")
+	assert.Equal(t, "local", attr(stale.DataPoints[0].Attributes, "repository"))
 }
 
 // When the protocol came from the environment, cfg.Protocol is empty, and
@@ -1164,4 +1207,29 @@ func TestRedactErrorText(t *testing.T) {
 	assert.NotContains(t, got, "s3cret")
 	assert.NotContains(t, got, "pw")
 	assert.Contains(t, got, "invalid URL escape", "the reason survives")
+}
+
+// An endpoint whose scheme is malformed still carries its query. A pattern
+// anchored on a spelled-out scheme walked straight past it, so the setup error
+// logged the token in full.
+func TestRedactionRecognizesMalformedSchemes(t *testing.T) {
+	for _, tc := range []struct{ name, in, secret string }{
+		{name: "malformed scheme, quoted", in: `parse "ht!tp://collector/path?token=s3cret": bad`, secret: "s3cret"},
+		{name: "malformed scheme, bare", in: `dial ht!tp://collector/path?token=s3cret failed`, secret: "s3cret"},
+		{name: "unknown scheme", in: `parse "gopher://collector/x?token=s3cret": bad`, secret: "s3cret"},
+		{name: "userinfo with a bad scheme", in: `parse "ht!tp://u:pw@collector/x": bad`, secret: "pw"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.NotContains(t, redactURLsIn(tc.in), tc.secret)
+		})
+	}
+
+	t.Run("ordinary text is untouched", func(t *testing.T) {
+		assert.Equal(t, "context deadline exceeded", redactURLsIn("context deadline exceeded"))
+	})
+	t.Run("a well-formed endpoint still reads normally", func(t *testing.T) {
+		got := redactURLsIn(`Post "https://collector.example/v1/metrics": refused`)
+		assert.Contains(t, got, "collector.example/v1/metrics")
+		assert.Contains(t, got, "refused")
+	})
 }
