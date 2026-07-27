@@ -53,6 +53,12 @@ type GroupRunMeta struct {
 	// RunID is minted fresh each generation and stamped onto dump helper
 	// containers so the runner reaps only this run's orphans.
 	RunID string
+	// AmbiguousArchivePattern is set when another group sharing a repository has
+	// a name this one prefixes, so their archive patterns overlap: this group's
+	// "*-app-*" also matches "*-app-prod-*". The pattern is still correct for
+	// retention (borgmatic's own concern) but it cannot answer "did this group
+	// write an archive here", so it must not be used to confirm a success.
+	AmbiguousArchivePattern bool
 	// ArchivePattern matches the archive names this group's config produces,
 	// with borg's date placeholders replaced by wildcards. Groups are allowed to
 	// share a repository, so "the newest archive here" is not the same question
@@ -314,7 +320,13 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		kept = append(kept, e)
 	}
 
-	warnPrefixCollisions(repoGroups, g.logger)
+	for _, name := range prefixCollidingGroups(repoGroups, g.logger) {
+		for i := range kept {
+			if kept[i].name == name {
+				kept[i].meta.AmbiguousArchivePattern = true
+			}
+		}
+	}
 
 	return kept, refusals, nil
 }
@@ -602,7 +614,28 @@ func volumeNamedPath(hostPath, volumeName string) string {
 
 // warnPrefixCollisions flags shared-repo groups where one name prefixes another:
 // their match_archives patterns overlap, so retention can cross group boundaries.
-func warnPrefixCollisions(repoGroups map[string][]string, logger *slog.Logger) {
+// prefixCollidingGroups warns about shared-repo groups whose names prefix one
+// another and returns every group involved, both the prefix and the longer name.
+//
+// Both are affected, not just one. "app"'s pattern matches "app-prod"'s
+// archives, so app can be falsely confirmed by its sibling's backup; and
+// "app-prod" shares the repository with a group whose retention can prune across
+// the boundary, so neither name's archives are reliably its own.
+func prefixCollidingGroups(repoGroups map[string][]string, logger *slog.Logger) []string {
+	var affected []string
+	add := func(name string) {
+		for _, n := range affected {
+			if n == name {
+				return
+			}
+		}
+		affected = append(affected, name)
+	}
+	warnPrefixCollisions(repoGroups, logger, func(a, b string) { add(a); add(b) })
+	return affected
+}
+
+func warnPrefixCollisions(repoGroups map[string][]string, logger *slog.Logger, onCollision func(a, b string)) {
 	for repo, groups := range repoGroups {
 		if len(groups) < 2 {
 			continue
@@ -613,6 +646,9 @@ func warnPrefixCollisions(repoGroups map[string][]string, logger *slog.Logger) {
 				if strings.HasPrefix(b, a+"-") {
 					logger.Warn("group names where one prefixes another share a repository; their archive name patterns overlap and retention can cross group boundaries, rename a group or split repositories",
 						"repository", repo, "groups", a+", "+b)
+					if onCollision != nil {
+						onCollision(a, b)
+					}
 				}
 			}
 		}

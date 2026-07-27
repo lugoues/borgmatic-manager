@@ -750,3 +750,34 @@ func TestArchiveMatchPatternReplacesBorgPlaceholders(t *testing.T) {
 		})
 	}
 }
+
+// Generation warns about groups whose names prefix one another sharing a
+// repository and keeps both, so the overlap has to be reported to the runner:
+// "app"'s pattern matches "app-prod"'s archives, and a probe using it cannot
+// tell whose backup it found.
+func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	state.AddVolume("app-prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	state.AddVolume("other", models.VolumeInfo{Name: "v3", HostPath: "/mnt/v3"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/repo"}},
+			"archive_name_format": "{hostname}-{group}-{now}",
+		},
+	}
+
+	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	meta, err := g.Generate(state)
+	require.NoError(t, err)
+
+	assert.True(t, meta["app"].AmbiguousArchivePattern,
+		"the prefix matches the longer group's archives")
+	assert.True(t, meta["app-prod"].AmbiguousArchivePattern,
+		"and it shares a repository with a group whose retention crosses into its own")
+	assert.False(t, meta["other"].AmbiguousArchivePattern,
+		"a group no other name prefixes keeps a usable pattern")
+	assert.NotEmpty(t, meta["app"].ArchivePattern,
+		"the pattern is still produced; it is retention that still needs it")
+}

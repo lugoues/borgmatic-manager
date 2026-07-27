@@ -887,7 +887,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.")
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local}, nil, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local}, nil, archiveScope{}, run, runStart)
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultFailed, out[0].Result)
 		assert.Empty(t, pf.probed(), "the implicated repo must not be probed")
@@ -899,7 +899,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.")
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, archiveScope{}, run, runStart)
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultOK, out[0].Result)
 		assert.Equal(t, []string{offA.Path}, pf.probed())
@@ -910,7 +910,7 @@ func TestPerRepoFailure(t *testing.T) {
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, archiveScope{}, run, runStart)
 		assert.Nil(t, out, "no fresh archive and not implicated: neither advanced nor failed")
 	})
 
@@ -919,7 +919,7 @@ func TestPerRepoFailure(t *testing.T) {
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, nil, archiveScope{}, run, runStart)
 		assert.Nil(t, out)
 	})
 
@@ -932,7 +932,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.") // local failed
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local, offA, offB}, nil, "", run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local, offA, offB}, nil, archiveScope{}, run, runStart)
 		byID := map[string]state.RepoOutcome{}
 		for _, o := range out {
 			byID[o.ID] = o
@@ -951,7 +951,7 @@ func TestPerRepoFailure(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		out := r.perRepoFailure(ctx, "/cfg.yaml", []config.RepoRef{offA}, nil, "", run, runStart)
+		out := r.perRepoFailure(ctx, "/cfg.yaml", []config.RepoRef{offA}, nil, archiveScope{}, run, runStart)
 		assert.Nil(t, out)
 		assert.Empty(t, pf.probed(), "no borgmatic work is started during shutdown")
 	})
@@ -960,7 +960,7 @@ func TestPerRepoFailure(t *testing.T) {
 		pf := &probeFake{}
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
-		assert.Nil(t, r.perRepoFailure(context.Background(), "/cfg.yaml", nil, nil, "", run, runStart))
+		assert.Nil(t, r.perRepoFailure(context.Background(), "/cfg.yaml", nil, nil, archiveScope{}, run, runStart))
 	})
 }
 
@@ -1019,7 +1019,7 @@ func TestProbeIsScopedToThisGroupsArchives(t *testing.T) {
 	run.recordErrorText("something else went wrong")
 
 	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
-		[]config.RepoRef{offsite}, nil, "host-g-*", run, runStart)
+		[]config.RepoRef{offsite}, nil, archiveScope{pattern: "host-g-*"}, run, runStart)
 	require.Len(t, out, 1)
 	assert.Equal(t, state.ResultOK, out[0].Result)
 
@@ -1047,7 +1047,7 @@ func TestProbeOmitsTheFilterWhenThereIsNoPattern(t *testing.T) {
 	run := &runState{logger: r.logger, group: "g"}
 	run.recordErrorText("something else went wrong")
 
-	_ = r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, nil, "", run, runStart)
+	_ = r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, nil, archiveScope{}, run, runStart)
 	assert.NotContains(t, pf.argsOfLastProbe(), "--match-archives")
 }
 
@@ -1103,7 +1103,7 @@ func TestProbesRunConcurrentlySoLocksAreNotHeldPerRepository(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_ = r.perRepoFailure(context.Background(), "/cfg.yaml", repos, nil, "", run, runStart)
+		_ = r.perRepoFailure(context.Background(), "/cfg.yaml", repos, nil, archiveScope{}, run, runStart)
 		close(done)
 	}()
 	select {
@@ -1367,7 +1367,7 @@ func TestALaterActionFailureKeepsTheCreateMeasurements(t *testing.T) {
 		out := r.perRepoFailure(context.Background(), "/cfg.yaml",
 			[]config.RepoRef{local, offsite},
 			[]createResult{result(local.Path, 1234, 5000), result(offsite.Path, 7, 90)},
-			"", run, runStart)
+			archiveScope{}, run, runStart)
 
 		require.Len(t, out, 2)
 		assert.Equal(t, state.ResultOK, out[0].Result)
@@ -1389,7 +1389,7 @@ func TestALaterActionFailureKeepsTheCreateMeasurements(t *testing.T) {
 		run.recordErrorText("Error running prune for /mnt/local")
 
 		out := r.perRepoFailure(context.Background(), "/cfg.yaml",
-			[]config.RepoRef{local}, []createResult{result(local.Path, 5, 60)}, "", run, runStart)
+			[]config.RepoRef{local}, []createResult{result(local.Path, 5, 60)}, archiveScope{}, run, runStart)
 
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultOK, out[0].Result)
@@ -1406,7 +1406,7 @@ func TestALaterActionFailureKeepsTheCreateMeasurements(t *testing.T) {
 		out := r.perRepoFailure(context.Background(), "/cfg.yaml",
 			[]config.RepoRef{local, offsite},
 			[]createResult{result(local.Path, 3, 40)},
-			"", run, runStart)
+			archiveScope{}, run, runStart)
 
 		require.Len(t, out, 2)
 		assert.Equal(t, int64(3), out[0].Files, "the measured one keeps its stats")
@@ -1475,7 +1475,7 @@ func TestANormalizedFailureIsRecordedAgainstTheRightRepository(t *testing.T) {
 	run.recordErrorText("Error: Repository /mnt/offsite does not exist.")
 
 	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
-		[]config.RepoRef{offsite}, nil, "", run, runStart)
+		[]config.RepoRef{offsite}, nil, archiveScope{}, run, runStart)
 
 	require.Len(t, out, 1, "the implicated destination must be recorded, not dropped")
 	assert.Equal(t, state.ResultFailed, out[0].Result)
@@ -1531,4 +1531,93 @@ func TestRecordedOutcomesCarryTheCreateAndMeasurementSignals(t *testing.T) {
 		assert.Empty(t, o.Repositories)
 	})
 
+}
+
+// A config that fails schema validation still names its destinations: the
+// manager wrote it. Recording the failure without them counts the run once under
+// an empty repository, dropping it out of every repository-filtered dashboard,
+// and leaves the inventory unable to reconcile a destination added or removed in
+// the same edit that broke the config.
+func TestAValidationFailureIsAttributedToTheConfiguredRepositories(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.validateScript = "echo 'schema error' >&2; exit 1"
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "badgroup", config.GroupRunMeta{
+		Repositories: []config.RepoRef{
+			{Path: "/mnt/local", Label: "local"},
+			{Path: "ssh://borg@a/./r"},
+		},
+	})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["badgroup"]
+	assert.Equal(t, "config-invalid", o.Result)
+	assert.Equal(t, []string{"local", "ssh://borg@a/./r"}, o.ConfiguredRepositories,
+		"the destinations are known even when the config is not valid")
+	assert.False(t, o.CreateAttempted, "nothing ran, so nothing was backed up")
+}
+
+// Groups named "app" and "app-prod" sharing a repository have overlapping
+// archive patterns: "*-app-*" matches "*-app-prod-*" too. Generation warns and
+// keeps both, so the probe must not treat "an archive matching my pattern
+// exists" as "my backup reached this repository": a sibling's archive written in
+// the same whole second would confirm a success this group never had.
+func TestAnOverlappingArchivePatternCannotConfirmSuccess(t *testing.T) {
+	runStart := time.Now().Add(-time.Minute)
+	fresh := runStart.Add(10 * time.Second)
+	offsite := config.RepoRef{Path: "/mnt/offsite", Label: "offsite"}
+
+	newRunner := func(pf *probeFake) *Runner {
+		r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+			"/usr/bin/borgmatic-fake", nil, 0)
+		r.execCommand = pf.exec
+		return r
+	}
+
+	t.Run("an ambiguous pattern leaves the destination unjudged", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{offsite.Path: listJSON(fresh)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "app"}
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, nil,
+			archiveScope{pattern: "*-app-*", ambiguous: true}, run, runStart)
+
+		assert.Nil(t, out, "a probe that cannot tell the groups apart confirms nothing")
+		assert.Empty(t, pf.probed(), "and is not worth running")
+	})
+
+	t.Run("the same pattern confirms when no sibling shares the repository", func(t *testing.T) {
+		pf := &probeFake{out: map[string]string{offsite.Path: listJSON(fresh)}}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "app"}
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, nil,
+			archiveScope{pattern: "*-app-*"}, run, runStart)
+
+		require.Len(t, out, 1)
+		assert.Equal(t, state.ResultOK, out[0].Result)
+	})
+
+	// A destination borgmatic measured needs no probe, so ambiguity cannot cost
+	// it its stats.
+	t.Run("a measured destination is unaffected", func(t *testing.T) {
+		var res createResult
+		res.Repository.Location = offsite.Path
+		res.Archive.Stats.NFiles = 11
+		pf := &probeFake{}
+		r := newRunner(pf)
+		run := &runState{logger: r.logger, group: "app"}
+
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite},
+			[]createResult{res}, archiveScope{pattern: "*-app-*", ambiguous: true}, run, runStart)
+
+		require.Len(t, out, 1)
+		assert.Equal(t, state.ResultOK, out[0].Result)
+		assert.Equal(t, int64(11), out[0].Files)
+	})
 }
