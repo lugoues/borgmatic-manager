@@ -414,7 +414,8 @@ func enableMetrics(ctx context.Context, e *env, store *state.ScheduleStore, r *r
 	}
 	r.SetRecorder(recorderChain{store, em})
 	logger.Info("metrics enabled",
-		"protocol", metricsProtocol(e.cfg.Manager.Metrics), "endpoint", e.cfg.Manager.Metrics.Endpoint)
+		"protocol", metrics.EffectiveProtocol(e.cfg.Manager.Metrics),
+		"endpoint", metrics.EffectiveEndpoint(e.cfg.Manager.Metrics))
 	return func() {
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -422,15 +423,6 @@ func enableMetrics(ctx context.Context, e *env, store *state.ScheduleStore, r *r
 			logger.Warn("flushing metrics on shutdown failed", "error", err)
 		}
 	}, em
-}
-
-// metricsProtocol reports the OTLP transport for the startup log; empty config
-// defaults to http.
-func metricsProtocol(m config.MetricsSettings) string {
-	if m.Protocol == "" {
-		return "http"
-	}
-	return m.Protocol
 }
 
 // reapStalePendingRuns reaps dump helpers left by a manager process that died
