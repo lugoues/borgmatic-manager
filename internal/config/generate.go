@@ -748,21 +748,97 @@ func patternMatchesFormat(pattern string, segs []formatSegment) bool {
 func consume(pattern string, states map[int]bool, text string) map[int]bool {
 	cur := states
 	for i := 0; i < len(text) && len(cur) > 0; i++ {
-		next := map[int]bool{}
-		for state := range cur {
-			if state >= len(pattern) {
-				continue
-			}
-			switch pattern[state] {
-			case '*':
-				next[state] = true // the star keeps consuming
-			case text[i]:
-				next[state+1] = true
-			}
-		}
-		cur = starClosure(pattern, next)
+		cur = step(pattern, cur, func(b byte) bool { return b == text[i] })
 	}
 	return cur
+}
+
+// step advances every state by one input byte, accepted when it satisfies both
+// the pattern element at that state and the caller's own test.
+func step(pattern string, states map[int]bool, accepts func(byte) bool) map[int]bool {
+	next := map[int]bool{}
+	for state := range states {
+		if state >= len(pattern) {
+			continue
+		}
+		if pattern[state] == '*' {
+			next[state] = true // the star keeps consuming
+			continue
+		}
+		match, after := patternElement(pattern, state)
+		// A byte only advances the state when the pattern element and the
+		// caller agree on it, which is how a digit run stays a digit run even
+		// against a "?" or a character class.
+		for b := 0; b < 256; b++ {
+			if accepts(byte(b)) && match(byte(b)) {
+				next[after] = true
+				break
+			}
+		}
+	}
+	return starClosure(pattern, next)
+}
+
+// patternElement reads the single-byte matcher at i and returns the index after
+// it.
+//
+// borg matches archive names as shell patterns, so a format carrying a literal
+// "?" or "[" produces a pattern that is not literal at all: "snap?app-*" claims
+// a sibling's "snapXapp-..." archives. Treating those as ordinary characters
+// here declared such a pair disjoint while borg's own retention would not.
+func patternElement(pattern string, i int) (func(byte) bool, int) {
+	switch pattern[i] {
+	case '?':
+		return func(byte) bool { return true }, i + 1
+	case '[':
+		if set, after, ok := parseCharClass(pattern, i); ok {
+			return set, after
+		}
+		// An unterminated "[" is a literal bracket, as shell globbing has it.
+		return func(b byte) bool { return b == '[' }, i + 1
+	default:
+		c := pattern[i]
+		return func(b byte) bool { return b == c }, i + 1
+	}
+}
+
+// parseCharClass reads a [...] set, honouring a leading "!" or "^" negation and
+// a-z style ranges. It reports false when the class is unterminated.
+func parseCharClass(pattern string, i int) (func(byte) bool, int, bool) {
+	j := i + 1
+	negated := false
+	if j < len(pattern) && (pattern[j] == '!' || pattern[j] == '^') {
+		negated = true
+		j++
+	}
+	type span struct{ lo, hi byte }
+	var spans []span
+	first := true
+	for j < len(pattern) {
+		if pattern[j] == ']' && !first {
+			set := func(b byte) bool {
+				for _, sp := range spans {
+					if b >= sp.lo && b <= sp.hi {
+						return !negated
+					}
+				}
+				return negated
+			}
+			return set, j + 1, true
+		}
+		first = false
+		lo := pattern[j]
+		hi := lo
+		if j+2 < len(pattern) && pattern[j+1] == '-' && pattern[j+2] != ']' {
+			hi = pattern[j+2]
+			j += 2
+		}
+		if lo <= hi {
+			spans = append(spans, span{lo, hi})
+		}
+		j++
+	}
+	return nil, 0, false
 }
 
 // consumeDigits advances every state through exactly n decimal digits, whichever
@@ -770,19 +846,7 @@ func consume(pattern string, states map[int]bool, text string) map[int]bool {
 func consumeDigits(pattern string, states map[int]bool, n int) map[int]bool {
 	cur := states
 	for i := 0; i < n && len(cur) > 0; i++ {
-		next := map[int]bool{}
-		for state := range cur {
-			if state >= len(pattern) {
-				continue
-			}
-			switch c := pattern[state]; {
-			case c == '*':
-				next[state] = true // the star keeps consuming
-			case c >= '0' && c <= '9':
-				next[state+1] = true
-			}
-		}
-		cur = starClosure(pattern, next)
+		cur = step(pattern, cur, func(b byte) bool { return b >= '0' && b <= '9' })
 	}
 	return cur
 }
@@ -871,9 +935,13 @@ type formatSegment struct {
 func placeholderSegments(token string) []formatSegment {
 	name, spec, hasSpec := strings.Cut(token, ":")
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "hostname", "fqdn", "reverse-hostname":
-		if h := sampleHostname(); h != "" {
-			return []formatSegment{{alts: []string{h}}}
+	case "hostname":
+		// borg renders the short hostname on some platforms and the full one on
+		// others, and this process cannot tell which without reimplementing its
+		// platform code. Both spellings are offered, so a collision through
+		// either is found and neither is asserted to be the one.
+		if alts := hostnameAlternatives(); len(alts) > 0 {
+			return []formatSegment{{alts: alts}}
 		}
 	case "user", "username":
 		if u := os.Getenv("USER"); u != "" {
@@ -885,6 +953,13 @@ func placeholderSegments(token string) []formatSegment {
 		}
 		return strftimeSegments(spec)
 	}
+	// Everything else matches anything, which reports a collision rather than
+	// missing one. That covers placeholders this code has never heard of and,
+	// deliberately, {fqdn} and {reverse-hostname}: the fully qualified name comes
+	// from resolver configuration and the reverse name from a PTR lookup, so a
+	// value derived here could differ from what borg writes, and a wrong literal
+	// is worse than none. It would declare two groups disjoint on the strength
+	// of a name neither of them uses.
 	return []formatSegment{{any: true}}
 }
 
@@ -960,6 +1035,20 @@ var strftimeDomains = func() map[byte][]string {
 		'p': {"AM", "PM"},
 	}
 }()
+
+// hostnameAlternatives lists the spellings borg's {hostname} may take on this
+// host: what the kernel reports, and its short form when that carries a domain.
+func hostnameAlternatives() []string {
+	h := sampleHostname()
+	if h == "" {
+		return nil
+	}
+	out := []string{h}
+	if short, _, found := strings.Cut(h, "."); found && short != "" {
+		out = append(out, short)
+	}
+	return out
+}
 
 // sampleHostname is a seam: the value borg will expand {hostname} to is this
 // host's, and tests need to pin it.

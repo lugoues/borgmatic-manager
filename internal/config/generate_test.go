@@ -1173,3 +1173,65 @@ func TestDefinedEnvironmentRepositoriesResolveToTheirDestinations(t *testing.T) 
 			"nothing here can tell whether they are the same repository")
 	})
 }
+
+// borg matches archive names as shell patterns, so a format carrying a literal
+// "?" or "[" produces a pattern that is not literal at all. Treating those as
+// ordinary characters declared such a pair disjoint while borg's own retention
+// would have crossed the boundary.
+func TestGlobMetacharactersInAPatternAreMatchedAsBorgMatchesThem(t *testing.T) {
+	defer config.SetSampleHostname("myhost")()
+
+	t.Run("a question mark matches any single character", func(t *testing.T) {
+		assert.True(t, config.PatternMatchesFormatForTest("snap?app-*", "snapXapp-{now}"))
+		assert.False(t, config.PatternMatchesFormatForTest("snap?app-*", "snapXYapp-{now}"),
+			"one character, not any run of them")
+	})
+
+	t.Run("a character class matches its members", func(t *testing.T) {
+		assert.True(t, config.PatternMatchesFormatForTest("snap[abc]app-*", "snapbapp-{now}"))
+		assert.False(t, config.PatternMatchesFormatForTest("snap[abc]app-*", "snapzapp-{now}"))
+	})
+
+	t.Run("ranges and negation", func(t *testing.T) {
+		assert.True(t, config.PatternMatchesFormatForTest("x-[0-9]-*", "x-7-{now}"))
+		assert.False(t, config.PatternMatchesFormatForTest("x-[0-9]-*", "x-a-{now}"))
+		assert.True(t, config.PatternMatchesFormatForTest("x-[!0-9]-*", "x-a-{now}"))
+		assert.False(t, config.PatternMatchesFormatForTest("x-[!0-9]-*", "x-7-{now}"))
+	})
+
+	t.Run("an unterminated bracket is a literal bracket", func(t *testing.T) {
+		assert.True(t, config.PatternMatchesFormatForTest("x-[abc-*", "x-[abc-{now}"))
+	})
+
+	t.Run("a metacharacter still constrains a digit run", func(t *testing.T) {
+		assert.True(t, config.PatternMatchesFormatForTest("x-????-*", "x-{now:%Y}-{now}"),
+			"four of anything covers a four-digit year")
+		assert.False(t, config.PatternMatchesFormatForTest("x-[a-z][a-z][a-z][a-z]-*", "x-{now:%Y}-{now}"),
+			"letters cannot be a year")
+	})
+
+	// Through the collision decision, which is the point.
+	assert.True(t, config.PatternsCollideForTest(
+		"snap?app-*", "snap?{group}-{now}",
+		"snapXapp-*", "snapXapp-{now}"))
+}
+
+// The fully qualified and reverse names come from resolver configuration and a
+// PTR lookup, so a value derived here could differ from what borg writes. A
+// wrong literal is worse than none: it declares two groups disjoint on the
+// strength of a name neither uses.
+func TestUnreproducibleHostPlaceholdersAreConservative(t *testing.T) {
+	defer config.SetSampleHostname("db")()
+
+	assert.Equal(t, [][]string{nil}, config.FormatAlternativesForTest("{fqdn}"))
+	assert.Equal(t, [][]string{nil}, config.FormatAlternativesForTest("{reverse-hostname}"))
+	assert.True(t, config.PatternMatchesFormatForTest("*-app-*", "{fqdn}-prod-{now}"),
+		"an fqdn that could contain anything must not be ruled out")
+
+	// {hostname} offers both spellings borg may render, so a collision through
+	// either is found and neither is asserted to be the one.
+	defer config.SetSampleHostname("db.example.com")()
+	assert.Equal(t, [][]string{{"db.example.com", "db"}}, config.FormatAlternativesForTest("{hostname}"))
+	assert.True(t, config.PatternMatchesFormatForTest("db-*", "{hostname}-{now}"))
+	assert.True(t, config.PatternMatchesFormatForTest("db.example.com-*", "{hostname}-{now}"))
+}
