@@ -1235,3 +1235,47 @@ func TestUnreproducibleHostPlaceholdersAreConservative(t *testing.T) {
 	assert.True(t, config.PatternMatchesFormatForTest("db-*", "{hostname}-{now}"))
 	assert.True(t, config.PatternMatchesFormatForTest("db.example.com-*", "{hostname}-{now}"))
 }
+
+// borg matches shell patterns over characters, so "?" covers a whole multi-byte
+// rune. Walking bytes had it swallow only the first third of an "é" and declare
+// two formats disjoint that borg would not.
+func TestGlobWildcardsMatchWholeCharacters(t *testing.T) {
+	defer config.SetSampleHostname("myhost")()
+
+	assert.True(t, config.PatternMatchesFormatForTest("snap?app-*", "snapéapp-{now}"),
+		"one character, however many bytes it takes")
+	assert.False(t, config.PatternMatchesFormatForTest("snap??app-*", "snapéapp-{now}"),
+		"and only one")
+	assert.True(t, config.PatternMatchesFormatForTest("x-?-*", "x-日-{now}"))
+
+	t.Run("a literal multi-byte character still matches itself", func(t *testing.T) {
+		assert.True(t, config.PatternMatchesFormatForTest("snapéapp-*", "snapéapp-{now}"))
+		assert.False(t, config.PatternMatchesFormatForTest("snapéapp-*", "snapèapp-{now}"))
+	})
+
+	t.Run("an ascii class does not accept a multi-byte character", func(t *testing.T) {
+		assert.False(t, config.PatternMatchesFormatForTest("snap[a-z]app-*", "snapéapp-{now}"))
+		assert.True(t, config.PatternMatchesFormatForTest("snap[!a-z]app-*", "snapéapp-{now}"),
+			"but a negated one does")
+	})
+
+	// Through the collision decision, where it decides whether retention can
+	// cross the boundary.
+	assert.True(t, config.PatternsCollideForTest(
+		"snap?app-*", "snap?{group}-{now}",
+		"snapéapp-*", "snapéapp-{now}"))
+}
+
+// borg reads a leading "re:", "sh:" or "pp:" as a syntax selector, so a format
+// beginning with one produces a pattern borg interprets as a regular expression
+// while the collision check models it as a shell glob. The two then disagree
+// about which archives belong to this group.
+func TestAFormatStartingWithAPatternSelectorStillModelsAsAGlob(t *testing.T) {
+	defer config.SetSampleHostname("myhost")()
+
+	// The check treats "re:" as literal text, which is what borg will do once
+	// the probe pins the syntax with "sh:".
+	assert.True(t, config.PatternMatchesFormatForTest("re:.*app-*", "re:.*app-{now}"))
+	assert.False(t, config.PatternMatchesFormatForTest("re:.*app-*", "re:XYapp-{now}"),
+		`the "." is a literal dot here, not a regex wildcard`)
+}
