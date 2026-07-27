@@ -546,3 +546,65 @@ func TestBuildStatusDocMarksOfflineMembersButKeepsSchedule(t *testing.T) {
 	assert.NotNil(t, g.Due, "but it is still scheduled and backed up")
 	assert.True(t, *g.Due, "and due now with no prior success")
 }
+
+// create succeeded everywhere and a later action failed, so the probes confirm
+// every destination. Reporting "partial (2/2 ok)" then contradicts itself and
+// buries the failure that actually happened: partial has to mean at least one
+// destination is known bad.
+func TestStatusDoesNotCallAnAllSuccessRunPartial(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished:  time.Now(),
+		Result:    state.ResultFailed,
+		ExitCode:  2,
+		LastError: "Command error: borg prune",
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK},
+			{ID: "offsite", Result: state.ResultOK},
+		},
+	})
+
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) })
+
+	assert.NotContains(t, out, "partial (2/2 ok)", "N-of-N ok is not a partial fan-out")
+	assert.NotContains(t, out, "group partial")
+	assert.Contains(t, out, "1 group failed", "the group-level action failure must still surface")
+	assert.Contains(t, out, "failed (exit 2)", "with the exit code, and a pointer to the error")
+}
+
+// LastStats is retained precisely so a later failure does not blank out the size
+// of the backup that did complete; the inspect table described the column as the
+// repository's last size but read it from the failed LastRun.
+func TestInspectShowsTheLastMeasuredSizeAfterAFailure(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	group := bs.Groups["demo"]
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now().Add(-time.Hour), Result: state.ResultOK,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Files: 1234, OriginalBytes: 5 << 30},
+			{ID: "offsite", Result: state.ResultOK, Files: 99, OriginalBytes: 1 << 30},
+		},
+	})
+	// A later run fails for one destination; its measured size still stands.
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed, ExitCode: 1,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultFailed},
+			{ID: "offsite", Result: state.ResultOK, Files: 99, OriginalBytes: 1 << 30},
+		},
+	})
+	rec, _ := store.Record("demo")
+
+	out := captureStdout(t, func() {
+		printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil)
+	})
+
+	assert.Contains(t, out, "1234 files",
+		"the last measured size survives a later failure in the table too")
+	assert.Contains(t, out, state.ResultFailed,
+		"while the result column still reports the failure")
+}

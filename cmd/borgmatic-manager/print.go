@@ -274,7 +274,13 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, lockDir str
 			if o.Result == state.ResultFailed {
 				// A fan-out where some destinations still backed up is partial, not
 				// a flat failure: surface it, but distinctly from 0-of-N.
-				if okN, total := runRepoHealth(o, rec); total > 1 && okN > 0 {
+				//
+				// okN < total is required, not just okN > 0. When create succeeds
+				// everywhere and a later action (prune, compact, check) fails, the
+				// probes confirm every destination and okN == total: reporting
+				// "partial (N/N ok)" then contradicts itself and buries the action
+				// failure and its error behind a status that says the opposite.
+				if okN, total := runRepoHealth(o, rec); total > 1 && okN > 0 && okN < total {
 					r.result = fmt.Sprintf("partial (%d/%d ok)", okN, total)
 					r.partial = true
 				} else {
@@ -755,13 +761,18 @@ func printRepoRows(repos map[string]state.RepoRecord, now time.Time) {
 		if !rr.LastSuccess.IsZero() {
 			lastOK = humanTime(rr.LastSuccess, now)
 		}
+		// Size comes from the last run that measured something, not the last
+		// run: LastStats is retained precisely so a later failure does not blank
+		// out the size of the backup that did complete. The result column still
+		// reflects LastRun, so the row reads "failed" with the last known size
+		// rather than "failed" with no size at all.
 		size := "-"
-		if rr.LastRun != nil && rr.LastRun.Result == state.ResultOK && (rr.LastRun.Files > 0 || rr.LastRun.OriginalBytes > 0) {
-			s := humanBytes(rr.LastRun.OriginalBytes)
-			if rr.LastRun.DeduplicatedBytes > 0 {
-				s += fmt.Sprintf(" (+%s dedup)", humanBytes(rr.LastRun.DeduplicatedBytes))
+		if st := rr.LastStats; st != nil && (st.Files > 0 || st.OriginalBytes > 0) {
+			s := humanBytes(st.OriginalBytes)
+			if st.DeduplicatedBytes > 0 {
+				s += fmt.Sprintf(" (+%s dedup)", humanBytes(st.DeduplicatedBytes))
 			}
-			size = fmt.Sprintf("%d files, %s", rr.LastRun.Files, s)
+			size = fmt.Sprintf("%d files, %s", st.Files, s)
 		}
 		display = append(display, rrow{id, result, lastOK, size})
 	}
