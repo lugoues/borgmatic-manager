@@ -1306,3 +1306,23 @@ func TestARefusalCarriesTheGroupsRepositories(t *testing.T) {
 	assert.Equal(t, "shared", refusals[0].Repositories[0].Label)
 	assert.Equal(t, "/mnt/shared", refusals[0].Repositories[0].Path)
 }
+
+// A directory component ending in ":" makes an absolute path look like a URL.
+// Returning it uncleaned gave it a different lock key from the spelling POSIX
+// says is the same path, so two groups ran concurrently against one repository
+// and skipped the shared-repository archive checks.
+func TestAnAbsolutePathIsLocalWhateverPunctuationItHolds(t *testing.T) {
+	assert.Equal(t,
+		config.CanonicalRepoKey("/srv/a:/repo"),
+		config.CanonicalRepoKey("/srv/a://repo"),
+		"a repeated separator is collapsed; both name the same path")
+
+	assert.Equal(t, "/srv/a:/repo", config.CanonicalRepoKey("/srv/a://repo"))
+	assert.Equal(t, "/srv/x/repo", config.CanonicalRepoKey("/srv/x/./repo"))
+
+	t.Run("genuine remote forms are untouched", func(t *testing.T) {
+		assert.Equal(t, "ssh://borg@host/./repo", config.CanonicalRepoKey("ssh://borg@host/./repo/"))
+		assert.Equal(t, "sftp://host/srv/repo", config.CanonicalRepoKey("sftp://host/srv/repo"))
+		assert.Equal(t, "borg@host:/srv/repo", config.CanonicalRepoKey("borg@host:/srv/repo"))
+	})
+}

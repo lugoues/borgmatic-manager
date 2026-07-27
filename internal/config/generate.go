@@ -1202,7 +1202,12 @@ func CanonicalRepoKey(path string) string {
 		}
 		path = expanded
 	}
-	if strings.Contains(path, "://") || isSCPStyle(path) {
+	// An absolute path is a filesystem path, whatever punctuation it contains. A
+	// directory component ending in ":" makes "/srv/a://repo" look like a URL,
+	// and returning it uncleaned gave it a different lock key from "/srv/a:/repo",
+	// which POSIX says is the same path: the two groups then ran concurrently
+	// against one repository and skipped the shared-repository archive checks.
+	if !strings.HasPrefix(path, "/") && (strings.Contains(path, "://") || isSCPStyle(path)) {
 		// Remote URL or user@host:path form: nothing local to clean or resolve.
 		return strings.TrimRight(path, "/")
 	}
