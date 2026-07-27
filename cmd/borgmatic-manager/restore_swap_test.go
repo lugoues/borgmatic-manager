@@ -20,6 +20,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/lugoues/borgmatic-manager/internal/runtime"
 )
 
 // liveVolume builds a volume data dir holding one file, the thing a restore
@@ -2294,6 +2296,7 @@ func TestEveryDeclaredInodeFlagIsInTheInheritableMask(t *testing.T) {
 		"FS_DIRSYNC_FL":      fsDirSyncFlag,
 		"FS_DAX_FL":          fsDaxFlag,
 		"FS_JOURNAL_DATA_FL": fsJournalDataFlag,
+		"FS_PROJINHERIT_FL":  fsProjInheritFlag,
 		"FS_CASEFOLD_FL":     fsCasefoldFlag,
 	} {
 		assert.NotZero(t, inheritableMask&flag, "%s is declared but not carried", name)
@@ -2534,4 +2537,60 @@ func TestSwapIntoPlaceClearsItsClaimWhenTheExchangeFails(t *testing.T) {
 	ours, _, err := provablyOurs(data)
 	require.NoError(t, err)
 	assert.False(t, ours, "the volume kept a claim from an exchange that never happened")
+}
+
+// A volume name is not the identity that matters: the swap moves an inode, and
+// two volumes can point at one backing directory through a symlinked _data. A
+// container holding it under the other name was reported as absent and left
+// writing into an orphan the cleanup then deleted.
+func TestVolumeHasRunningContainerMatchesAnAliasByResolvedPath(t *testing.T) {
+	root := t.TempDir()
+	backing := filepath.Join(root, "backing", "shared")
+	require.NoError(t, os.MkdirAll(backing, 0o755))
+
+	// Two volumes, one backing directory.
+	aData := filepath.Join(root, "volumes", "vol-a", "_data")
+	bData := filepath.Join(root, "volumes", "vol-b", "_data")
+	require.NoError(t, os.MkdirAll(filepath.Dir(aData), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(bData), 0o755))
+	require.NoError(t, os.Symlink(backing, aData))
+	require.NoError(t, os.Symlink(backing, bData))
+
+	rt := &fakeRuntime{containers: []runtime.ContainerInfo{{
+		Name:    "user-of-b",
+		Running: true,
+		Mounts:  []runtime.VolumeMount{{Name: "vol-b", Source: bData, Destination: "/data"}},
+	}}}
+
+	// Restoring vol-a, whose resolved target is the directory vol-b is on.
+	live, err := volumeHasRunningContainer(context.Background(), rt, "vol-a", backing)
+	require.NoError(t, err)
+	assert.True(t, live, "a container holding the same inode under another name was missed")
+}
+
+func TestVolumeHasRunningContainerIgnoresAnUnrelatedVolume(t *testing.T) {
+	root := t.TempDir()
+	mine := filepath.Join(root, "volumes", "mine", "_data")
+	theirs := filepath.Join(root, "volumes", "theirs", "_data")
+	require.NoError(t, os.MkdirAll(mine, 0o755))
+	require.NoError(t, os.MkdirAll(theirs, 0o755))
+
+	rt := &fakeRuntime{containers: []runtime.ContainerInfo{
+		{Name: "stopped", Running: false, Mounts: []runtime.VolumeMount{{Name: "mine", Source: mine}}},
+		{Name: "other", Running: true, Mounts: []runtime.VolumeMount{{Name: "theirs", Source: theirs}}},
+	}}
+
+	live, err := volumeHasRunningContainer(context.Background(), rt, "mine", mine)
+	require.NoError(t, err)
+	assert.False(t, live, "a stopped user and an unrelated volume are both irrelevant")
+}
+
+// fakeRuntime is the smallest ContainerRuntime that can answer a liveness check.
+type fakeRuntime struct {
+	runtime.ContainerRuntime
+	containers []runtime.ContainerInfo
+}
+
+func (f *fakeRuntime) ListContainers(context.Context) ([]runtime.ContainerInfo, error) {
+	return f.containers, nil
 }

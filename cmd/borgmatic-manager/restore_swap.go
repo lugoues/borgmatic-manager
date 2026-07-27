@@ -630,10 +630,12 @@ const (
 	fsDirSyncFlag     = 0x00010000 // FS_DIRSYNC_FL
 	fsNoCompressFlag  = 0x00000400 // FS_NOCOMP_FL
 	fsJournalDataFlag = 0x00004000 // FS_JOURNAL_DATA_FL
+	fsProjInheritFlag = 0x20000000 // FS_PROJINHERIT_FL
 	fsDaxFlag         = 0x02000000 // FS_DAX_FL
 	fsCasefoldFlag    = 0x40000000 // FS_CASEFOLD_FL
 	inheritableMask   = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
-		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsJournalDataFlag | fsDaxFlag | fsCasefoldFlag
+		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsJournalDataFlag | fsDaxFlag |
+		fsProjInheritFlag | fsCasefoldFlag
 )
 
 // copyInodeFlags carries the model's inheritable inode flags onto staging.

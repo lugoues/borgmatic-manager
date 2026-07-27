@@ -1200,7 +1200,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 
 	// Extracting into a volume a running container writes races those writes.
 	// A stopped or removed container is safe.
-	running, err := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+	running, err := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume, plan.targetData)
 	if err != nil {
 		return err
 	}
@@ -1345,7 +1345,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// underneath. There is no staging step here to abort at, and no wipe, so
 		// this is the only place left to notice. --force keeps its meaning.
 		if !force {
-			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume, plan.targetData)
 			if checkErr != nil {
 				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
 			}
@@ -1374,7 +1374,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// own nature rather than by the operator has given no such consent, so
 		// ask again after the probe.
 		if !force {
-			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume, plan.targetData)
 			if checkErr != nil {
 				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
 			}
@@ -1404,7 +1404,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// meantime has mounted the very inode the swap is about to move, so ask
 		// again at the last moment rather than trusting the earlier answer.
 		stillSafe := func() error {
-			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume)
+			live, checkErr := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume, plan.targetData)
 			if checkErr != nil {
 				return fmt.Errorf("rechecking whether a container took the volume during the restore: %w", checkErr)
 			}
@@ -1596,10 +1596,22 @@ func signalExtractGroup(cmd *exec.Cmd, sig syscall.Signal) {
 	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
 
-// volumeHasRunningContainer reports whether any currently-running container
-// mounts the named volume. A stopped or removed container does not count: its
-// data is at rest and safe to extract into.
-func volumeHasRunningContainer(ctx context.Context, rt runtime.ContainerRuntime, volume string) (bool, error) {
+// volumeHasRunningContainer reports whether any currently-running container is
+// using the volume this restore is about to change.
+//
+// Matched by resolved path as well as by name, because a name is not the
+// identity that matters here. Two volumes can point at one backing directory
+// through a symlinked _data, and the swap moves an *inode*: a container holding
+// it under a different volume name is left writing into an orphan the cleanup
+// then deletes, while the name check reported the volume as safe.
+//
+// A mount whose source cannot be resolved is skipped rather than treated as a
+// match. It is some other container's mount, this is not the place to fail a
+// restore over it, and the name comparison still applies.
+//
+// This sees volume mounts only, so a container bind-mounting the host path
+// directly is still invisible here; that is tracked separately in #18.
+func volumeHasRunningContainer(ctx context.Context, rt runtime.ContainerRuntime, volume, targetData string) (bool, error) {
 	containers, err := rt.ListContainers(ctx)
 	if err != nil {
 		return false, err
@@ -1610,6 +1622,16 @@ func volumeHasRunningContainer(ctx context.Context, rt runtime.ContainerRuntime,
 		}
 		for _, m := range c.Mounts {
 			if m.Name == volume {
+				return true, nil
+			}
+			if m.Source == "" || targetData == "" {
+				continue
+			}
+			resolved, resErr := resolveVolumeData(m.Source)
+			if resErr != nil {
+				continue
+			}
+			if resolved == targetData {
 				return true, nil
 			}
 		}
