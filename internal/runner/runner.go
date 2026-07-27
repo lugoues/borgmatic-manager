@@ -493,13 +493,13 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 	// External SIGKILL (OOM killer, kill -9) counts as failed: "terminated"
 	// would hide the group from status's failed-groups alert.
 	case exitCode == sigkillExit:
-		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, archivePattern, run, start))
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, results, archivePattern, run, start))
 		r.logger.Error("borgmatic killed (SIGKILL), likely the OOM killer or an external kill -9", "group", groupName,
 			"exit_code", exitCode, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s was killed (exit %d); not a manager timeout, check for OOM", groupName, exitCode)
 
 	default:
-		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, archivePattern, run, start))
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, results, archivePattern, run, start))
 		if run.repoMissing.Load() {
 			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
 				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
@@ -648,6 +648,14 @@ func matchResults(configured []config.RepoRef, results []createResult) map[int]c
 }
 
 // applyStats copies a create result's archive stats onto a repo outcome.
+// hasResult reports whether borgmatic measured this repository, keeping the
+// probe skip and the outcome switch reading from one condition rather than two
+// that could drift apart.
+func hasResult(measured map[int]createResult, i int) bool {
+	_, ok := measured[i]
+	return ok
+}
+
 func applyStats(ro *state.RepoOutcome, res createResult) {
 	ro.Files = res.Archive.Stats.NFiles
 	ro.OriginalBytes = res.Archive.Stats.OriginalSize
@@ -693,11 +701,28 @@ func (r *Runner) perRepoSuccess(configured []config.RepoRef, results []createRes
 // confirmed by probing for a fresh archive. A repo that can be neither implicated
 // nor confirmed is left out (nil), so its persisted last-success is untouched
 // rather than falsely advanced or failed.
-func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configured []config.RepoRef, archivePattern string, run *runState, runStart time.Time) []state.RepoOutcome {
+func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configured []config.RepoRef,
+	results []createResult, archivePattern string, run *runState, runStart time.Time,
+) []state.RepoOutcome {
 	if len(configured) == 0 {
 		return nil
 	}
 	errText := run.errorMessages()
+
+	// A create result is direct evidence: borgmatic reported the archive it
+	// wrote, with its measurements. A run can still fail afterwards, when a
+	// later action such as prune, compact or check exits nonzero, and rebuilding
+	// every repository from confirmation probes then throws away measurements
+	// that were in hand. The probe can only answer "an archive exists", so those
+	// repositories were recorded ok with no stats at all, leaving the per-
+	// repository size, file count and duration stale, or absent entirely if this
+	// was the first backup.
+	//
+	// Evidence beats inference: a repository with a create result is not probed,
+	// and not treated as implicated by an error naming it either. Error matching
+	// is a substring test against the message text, and a prune failure names the
+	// same path the successful create just reported.
+	measured := matchResults(configured, results)
 
 	// Probed together rather than one after another. Every one of this group's
 	// repository locks is still held here, and another group sharing one of them
@@ -709,6 +734,9 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	confirmed := make([]bool, len(configured))
 	var wg sync.WaitGroup
 	for i, ref := range configured {
+		if _, ok := measured[i]; ok {
+			continue // borgmatic already reported its archive; nothing to probe
+		}
 		if ref.Path == "" || mentionedInErrors(ref.Path, errText) {
 			continue // named in an error: it failed, and probing it is pointless
 		}
@@ -724,6 +752,9 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	for i, ref := range configured {
 		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultFailed}
 		switch {
+		case hasResult(measured, i):
+			ro.Result = state.ResultOK
+			applyStats(&ro, measured[i])
 		case ref.Path != "" && mentionedInErrors(ref.Path, errText):
 			// This destination is named in an error: it failed.
 		case confirmed[i]:
