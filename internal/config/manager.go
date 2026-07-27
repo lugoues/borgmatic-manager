@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -128,6 +129,43 @@ func RedactEndpoint(endpoint string) string {
 	return u.String()
 }
 
+// rejectMisplacedManagerOptions fails a config that puts a manager option at the
+// document root instead of under "manager".
+//
+// The root is decoded leniently on purpose, because a config may carry
+// anchor-holder keys that mean nothing to this program. That leniency is what
+// makes the mistake silent: "metrics:" written beside "manager:" instead of
+// inside it is dropped without a word, and the service starts with metrics off
+// while the operator has every reason to think they enabled them. The strict
+// check on the manager section cannot see it, because the key is not in there.
+//
+// The names come from the struct, so a new manager option is covered without
+// anyone remembering to add it here.
+func rejectMisplacedManagerOptions(root map[string]interface{}) error {
+	for key := range root {
+		if key == "manager" || !managerOptionNames[key] {
+			continue
+		}
+		return fmt.Errorf("manager option %q is at the top level of the manager config; "+
+			"it belongs under \"manager:\" and is otherwise ignored", key)
+	}
+	return nil
+}
+
+// managerOptionNames is every yaml key ManagerSettings accepts, read from the
+// struct so the two cannot drift apart.
+var managerOptionNames = func() map[string]bool {
+	out := map[string]bool{}
+	t := reflect.TypeOf(ManagerSettings{})
+	for i := range t.NumField() {
+		tag, _, _ := strings.Cut(t.Field(i).Tag.Get("yaml"), ",")
+		if tag != "" && tag != "-" {
+			out[tag] = true
+		}
+	}
+	return out
+}()
+
 // GroupOverride is one groups/{group}.yaml overlay: the same manager+borgmatic
 // shape as manager.yaml, scoped to a single group.
 type GroupOverride struct {
@@ -236,6 +274,9 @@ func LoadConfig(managerPath string, groupsDir string) (*ManagerConfig, map[strin
 	// setting. borgmatic options are validated by borgmatic's own config check.
 	if strictErr := strictCheckManagerSection(managerMap["manager"]); strictErr != nil {
 		return nil, nil, strictErr
+	}
+	if misplacedErr := rejectMisplacedManagerOptions(managerMap); misplacedErr != nil {
+		return nil, nil, misplacedErr
 	}
 	if validateErr := cfg.Manager.Metrics.Validate(); validateErr != nil {
 		return nil, nil, fmt.Errorf("invalid manager config: %w", validateErr)

@@ -1056,9 +1056,18 @@ const UnknownRepoKey = "unknown"
 // identifiable" rather than as an identity two paths can share.
 func CanonicalRepoKey(path string) string {
 	if strings.Contains(path, "${") {
-		// Env placeholders resolve at borgmatic runtime; two spellings could
-		// be the same repo. Serialize conservatively under one key.
-		return UnknownRepoKey
+		// borgmatic resolves these from the environment this process hands it, so
+		// a variable defined here already names the destination. Collapsing those
+		// to one key serializes unrelated backups against each other and, when
+		// their formats omit {group}, refuses groups that never shared anything.
+		//
+		// A variable this process cannot resolve keeps the conservative key: two
+		// spellings might be the same repository and nothing here can tell.
+		expanded := os.ExpandEnv(path)
+		if expanded == "" || strings.Contains(expanded, "${") || expanded == path {
+			return UnknownRepoKey
+		}
+		path = expanded
 	}
 	if strings.Contains(path, "://") || isSCPStyle(path) {
 		// Remote URL or user@host:path form: nothing local to clean or resolve.

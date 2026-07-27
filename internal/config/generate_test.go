@@ -1148,3 +1148,28 @@ func TestYearsOutsideAnyWindowStillCollide(t *testing.T) {
 		"x-2020-*", "x-{group}-{now}",
 		"x-*-prod-*", "x-{now:%Y}-prod-{now}"))
 }
+
+// Two groups pointing at different environment-backed destinations do not share
+// a repository. Collapsing both to the unknown key serialized unrelated backups
+// against each other and, when their formats omitted {group}, refused groups
+// that never shared anything.
+func TestDefinedEnvironmentRepositoriesResolveToTheirDestinations(t *testing.T) {
+	t.Setenv("LOCAL_REPO", "/mnt/local")
+	t.Setenv("OFFSITE_REPO", "/mnt/offsite")
+
+	local := config.CanonicalRepoKey("${LOCAL_REPO}")
+	offsite := config.CanonicalRepoKey("${OFFSITE_REPO}")
+	assert.NotEqual(t, local, offsite, "different destinations are different repositories")
+	assert.NotEqual(t, config.UnknownRepoKey, local)
+	assert.Equal(t, config.CanonicalRepoKey("/mnt/local"), local,
+		"and the resolved key is the one the literal path would have")
+
+	t.Run("an undefined variable stays conservative", func(t *testing.T) {
+		assert.Equal(t, config.UnknownRepoKey, config.CanonicalRepoKey("${NOT_DEFINED_ANYWHERE}"))
+	})
+
+	t.Run("two undefined variables still collide", func(t *testing.T) {
+		assert.Equal(t, config.CanonicalRepoKey("${NOT_A}"), config.CanonicalRepoKey("${NOT_B}"),
+			"nothing here can tell whether they are the same repository")
+	})
+}

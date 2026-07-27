@@ -112,3 +112,37 @@ func TestValidationErrorsCarryNoCredential(t *testing.T) {
 			Endpoint: "https://user:password@collector.example/v1/metrics"}.Validate())
 	})
 }
+
+// The document root is decoded leniently so a config may carry anchor-holder
+// keys, and that leniency is what makes the mistake silent: "metrics:" written
+// beside "manager:" instead of inside it is dropped without a word, and the
+// service starts with metrics off while the operator has every reason to think
+// they enabled them.
+func TestManagerOptionsAtTheTopLevelAreRejected(t *testing.T) {
+	dir := t.TempDir()
+	write := func(t *testing.T, body string) error {
+		t.Helper()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "manager.yaml"), []byte(body), 0o600))
+		_, _, err := config.LoadConfig(filepath.Join(dir, "manager.yaml"), filepath.Join(dir, "groups"))
+		return err
+	}
+
+	t.Run("a misplaced metrics block fails fast", func(t *testing.T) {
+		err := write(t, "manager:\n  period: 1h\nmetrics:\n  enabled: true\n")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "metrics")
+		assert.Contains(t, err.Error(), "manager:")
+	})
+
+	t.Run("other manager options too", func(t *testing.T) {
+		require.Error(t, write(t, "manager:\n  period: 1h\nrun_timeout: 2h\n"))
+	})
+
+	t.Run("the correct placement is accepted", func(t *testing.T) {
+		require.NoError(t, write(t, "manager:\n  period: 1h\n  metrics:\n    enabled: false\n"))
+	})
+
+	t.Run("an unrecognized top-level key is still allowed", func(t *testing.T) {
+		require.NoError(t, write(t, "x-anchors:\n  a: &a 1\nmanager:\n  period: 1h\n"))
+	})
+}
