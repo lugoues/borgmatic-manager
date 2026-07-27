@@ -118,9 +118,20 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 
 // countDataPoints totals the series pushed, so the confirmation log shows the
 // export was non-empty.
-// urlInText matches a URL embedded in prose, stopping at the characters a
-// message is likely to put after one.
-var urlInText = regexp.MustCompile(`https?://[^\s"'` + "`" + `,;)\]}>]+`)
+// urlInText matches a URL in a message, quoted or bare, in one alternation.
+//
+// The quoted form comes first so a URL the transport wrapped in quotes is
+// bounded by its closing quote, which is the shape Go's net/http errors use:
+// Post "https://host/path?query": ... The bare form ends only at whitespace,
+// deliberately: a query string may legally contain "," ";" "'" and ")", and
+// stopping at those left the tail of a token in the message, so the log read as
+// redacted while still carrying the secret. Swallowing a trailing full stop from
+// prose is the cheaper mistake.
+//
+// One alternation rather than two passes, because a second pass re-matches what
+// the first already redacted and eats the closing quote with it, taking the rest
+// of the message's punctuation along.
+var urlInText = regexp.MustCompile(`"https?://[^"]*"|https?://\S+`)
 
 // redactURLsIn strips credentials from any URL inside a message.
 //
@@ -130,7 +141,12 @@ var urlInText = regexp.MustCompile(`https?://[^\s"'` + "`" + `,;)\]}>]+`)
 // export interval, which is the loudest possible way to leak it. Redacting the
 // startup log alone covered the one line nobody was worried about.
 func redactURLsIn(msg string) string {
-	return urlInText.ReplaceAllStringFunc(msg, config.RedactEndpoint)
+	return urlInText.ReplaceAllStringFunc(msg, func(match string) string {
+		if strings.HasPrefix(match, `"`) {
+			return `"` + config.RedactEndpoint(strings.Trim(match, `"`)) + `"`
+		}
+		return config.RedactEndpoint(match)
+	})
 }
 
 // countDataPoints counts the exported time series, not the instruments. The two
@@ -365,6 +381,21 @@ func (e *Emitter) observe(o metric.Observer,
 				continue
 			}
 		}
+		// A schedule file written before per-repository records existed has a
+		// group last-success and no repositories at all. The scheduler honours
+		// that success and may skip the group for a whole period, so without
+		// standing in for it the documented join reports every upgraded group as
+		// never attempted until its next backup happens to run.
+		//
+		// The empty repository label is this codebase's existing way of saying
+		// "the group, with no destination attributable", which is exactly what a
+		// legacy record knows. It disappears the first time the group runs.
+		if len(rec.Repositories) == 0 && !rec.LastSuccess.IsZero() {
+			legacyAttrs := metric.WithAttributes(
+				attribute.String("group", group), attribute.String("repository", ""))
+			o.ObserveInt64(repoInfo, 1, legacyAttrs)
+			o.ObserveFloat64(staleness, now.Sub(rec.LastSuccess).Seconds(), legacyAttrs)
+		}
 		for id, rr := range rec.Repositories {
 			// A repository removed from a group the group still has. The record
 			// survives until the next run reconciles it, and that run may be a
@@ -391,7 +422,7 @@ func (e *Emitter) observe(o metric.Observer,
 					attribute.String("group", group), attribute.String("repository", id), attribute.String("kind", "compressed")))
 				o.ObserveInt64(lastSize, lr.DeduplicatedBytes, metric.WithAttributes(
 					attribute.String("group", group), attribute.String("repository", id), attribute.String("kind", "deduplicated")))
-				o.ObserveFloat64(lastDuration, float64(lr.DurationSeconds), repoAttrs)
+				o.ObserveFloat64(lastDuration, lr.DurationSeconds, repoAttrs)
 				o.ObserveInt64(lastFiles, lr.Files, repoAttrs)
 			}
 			// One series per repository the group has attempted, so an alert can
