@@ -315,6 +315,47 @@ borgmatic:
 Backup completion/warning counts are also in the JSON logs
 (`journalctl -u borgmatic-manager`).
 
+### OpenTelemetry metrics
+
+The daemon can export metrics over OTLP. Off by default; a broken exporter
+warns once at startup and never fails a backup.
+
+```yaml
+manager:
+  metrics:
+    enabled: true
+    endpoint: http://localhost:4318   # or OTEL_EXPORTER_OTLP_ENDPOINT
+    protocol: http                    # or "grpc"
+```
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `backup_runs_total` | counter | `group`, `repository`, `result` | One increment per repository per run. A fan-out with one failed destination records both an `ok` and a `failed`. |
+| `backup_group_info` | gauge | `group` | Always 1, one per configured group. |
+| `backup_last_size_bytes` | gauge | `group`, `repository`, `kind` | Last successful archive size; `kind` is `original`, `compressed` or `deduplicated`. |
+| `backup_last_files` | gauge | `group`, `repository` | File count in the last successful archive. |
+| `backup_last_duration_seconds` | gauge | `group`, `repository` | Duration of the last successful backup. |
+| `backup_seconds_since_last_success` | gauge | `group`, `repository` | Staleness. Absent until a repository has succeeded once. |
+| `backup_offline_volumes` | gauge | `group` | Volumes discovered but not currently present. |
+
+`backup_group_info` exists because every other series here appears only after a
+run. Alert on the *join*, not on a series being missing:
+
+```promql
+# groups that exist but have no recent success, including ones that have
+# never succeeded at all
+backup_group_info == 1
+  unless on(group)
+    (backup_seconds_since_last_success < 86400)
+```
+
+The `last_*` gauges deliberately reflect the last **successful** backup: a
+failed run carries no stats, and reporting its zeros would read as the dataset
+shrinking to nothing.
+
+Metrics are emitted by one-shot `run` as well as by the daemon, so a manual
+backup is a recorded data point rather than a gap.
+
 ## Rootless Podman
 
 Two deployment modes. **Recommended: rootless containers, root manager** —

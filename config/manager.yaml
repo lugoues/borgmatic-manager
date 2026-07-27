@@ -20,6 +20,16 @@ manager:
   # Bound a single group's borgmatic run (Go duration). 0 = no timeout.
   # run_timeout: "0"
 
+  # --- OpenTelemetry metrics (daemon only) -------------------------------
+  # Off by default. When enabled the daemon exports per-repository backup
+  # metrics over OTLP. Endpoint and protocol also read the standard
+  # OTEL_EXPORTER_OTLP_* environment variables; these fields win when set.
+  # A broken exporter never fails a backup.
+  # metrics:
+  #   enabled: true
+  #   endpoint: http://localhost:4318
+  #   protocol: http          # or "grpc"
+
 # Default borgmatic settings applied to all groups.
 # Anything valid in borgmatic's schema can go here, it is deep-merged with
 # per-group overrides from groups/{group-name}.yaml and discovered data.
