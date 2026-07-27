@@ -1560,7 +1560,10 @@ func TestAValidationFailureIsAttributedToTheConfiguredRepositories(t *testing.T)
 	assert.Equal(t, "config-invalid", o.Result)
 	assert.Equal(t, []string{"local", "ssh://borg@a/./r"}, o.ConfiguredRepositories,
 		"the destinations are known even when the config is not valid")
-	assert.False(t, o.CreateAttempted, "nothing ran, so nothing was backed up")
+	assert.True(t, o.CreateAttempted,
+		"the run intended to back up; the validation failing says nothing about that, "+
+			"and without it the run drops out of the per-repository counter entirely")
+	assert.Empty(t, o.Repositories, "but nothing ran, so no destination was judged")
 }
 
 // Groups named "app" and "app-prod" sharing a repository have overlapping
@@ -1889,4 +1892,91 @@ func TestAValidationTimeoutIsNotAConfigError(t *testing.T) {
 	assert.Equal(t, []string{"local"}, o.ConfiguredRepositories)
 	assert.Empty(t, o.Repositories,
 		"an unfinished validation confirms nothing about any destination")
+}
+
+// An error naming one repository must not implicate another whose path is a
+// prefix of it. With "/mnt/repo" and "/mnt/repo@old" configured, treating "@" as
+// a delimiter made an error about the second implicate the first, so a
+// destination that had backed up was recorded as failed alongside it.
+func TestPathTokensDoNotEndAtLegalFilenamePunctuation(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, message string
+		want                bool
+	}{
+		{name: "an at-sign continues the name", path: "/mnt/repo",
+			message: "Error: Repository /mnt/repo@old does not exist.", want: false},
+		{name: "the repository actually named is matched", path: "/mnt/repo@old",
+			message: "Error: Repository /mnt/repo@old does not exist.", want: true},
+		{name: "a plus continues the name", path: "/mnt/repo",
+			message: "Error: Repository /mnt/repo+2 does not exist.", want: false},
+		{name: "an equals continues the name", path: "/mnt/repo",
+			message: "Error: Repository /mnt/repo=b does not exist.", want: false},
+		{name: "a percent continues the name", path: "/mnt/repo",
+			message: "Error: Repository /mnt/repo%20b does not exist.", want: false},
+		// The colon stays a delimiter: borg writes "Repository /mnt/repo: ..."
+		// and reading it as part of the path would stop the repository being
+		// recognized at all.
+		{name: "a colon still ends the name", path: "/mnt/repo",
+			message: "Error: Repository /mnt/repo: does not exist.", want: true},
+		{name: "whitespace still ends the name", path: "/mnt/repo",
+			message: "Error: Repository /mnt/repo failed.", want: true},
+		{name: "a quote still ends the name", path: "/mnt/repo",
+			message: `Error: Repository "/mnt/repo" failed.`, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, mentionedInErrors(tc.path, []string{tc.message}))
+		})
+	}
+}
+
+// A repository whose path comes from the environment is identified by what it
+// resolves to. Keying its state on the literal expression means repointing the
+// variable inherits the old destination's freshness: failures do not clear
+// LastSuccess, so a repository that has never produced an archive reports as
+// recently backed up.
+func TestEnvironmentBackedRepositoriesAreKeyedByDestination(t *testing.T) {
+	t.Setenv("BORG_REPO", "/srv/borg/old")
+	old := refID(config.RepoRef{Path: "${BORG_REPO}"})
+	assert.Equal(t, "/srv/borg/old", old)
+
+	t.Setenv("BORG_REPO", "/srv/borg/new")
+	assert.NotEqual(t, old, refID(config.RepoRef{Path: "${BORG_REPO}"}),
+		"repointing the variable is a different destination and must not reuse its record")
+
+	t.Run("a label still wins", func(t *testing.T) {
+		assert.Equal(t, "offsite", refID(config.RepoRef{Path: "${BORG_REPO}", Label: "offsite"}))
+	})
+	t.Run("an ordinary path is unchanged", func(t *testing.T) {
+		assert.Equal(t, "/mnt/local", refID(config.RepoRef{Path: "/mnt/local"}))
+	})
+	t.Run("an unset variable keeps the literal", func(t *testing.T) {
+		t.Setenv("BORG_REPO", "")
+		assert.Equal(t, "${BORG_REPO}", refID(config.RepoRef{Path: "${BORG_REPO}"}))
+	})
+}
+
+// create runs first. A run that continues for hours afterwards on actions that
+// write nothing must not stamp the archive as having been made when the run
+// ended: staleness would understate the archive's age by exactly the hang.
+func TestRepositorySuccessIsStampedWhenTheArchiveWasWritten(t *testing.T) {
+	var res createResult
+	res.Repository.Location = "/repo"
+	res.Archive.Name = "a"
+	res.Archive.End = "2026-07-27T12:00:00.000000"
+	res.Archive.Stats.NFiles = 3
+
+	out := measuredOutcomes([]config.RepoRef{{Path: "/repo", Label: "local"}}, []createResult{res})
+	require.Len(t, out, 1)
+	assert.Equal(t,
+		time.Date(2026, 7, 27, 12, 0, 0, 0, time.Local),
+		out[0].CompletedAt)
+
+	t.Run("an absent or unparsable end time falls back rather than guessing", func(t *testing.T) {
+		var bare createResult
+		bare.Repository.Location = "/repo"
+		bare.Archive.Stats.NFiles = 3
+		out := measuredOutcomes([]config.RepoRef{{Path: "/repo"}}, []createResult{bare})
+		require.Len(t, out, 1)
+		assert.True(t, out[0].CompletedAt.IsZero())
+	})
 }

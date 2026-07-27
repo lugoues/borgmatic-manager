@@ -77,6 +77,12 @@ type RepoOutcome struct {
 	CompressedBytes   int64  `json:"compressed_bytes,omitempty"`
 	DeduplicatedBytes int64  `json:"deduplicated_bytes,omitempty"`
 	DurationSeconds   int64  `json:"duration_seconds,omitempty"`
+	// CompletedAt is when borg finished writing this archive, which is not when
+	// the run finished. A create that succeeds and a check that then hangs until
+	// a 24-hour timeout would otherwise stamp the repository as fresh at the
+	// moment of the timeout, understating the archive's age by a day and
+	// delaying the staleness alert by exactly as long as the hang lasted.
+	CompletedAt time.Time `json:"completed_at,omitempty"`
 	// Measured records that borgmatic reported this archive, as opposed to the
 	// outcome being inferred from a confirmation probe. It is not the same
 	// question as "are any of the numbers above nonzero": an empty archive that
@@ -379,7 +385,13 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 			roCopy := ro
 			rr.LastRun = &roCopy
 			if ro.Result == ResultOK {
+				// When the archive's own completion time is known, use it: the
+				// run may have continued for hours afterwards on actions that
+				// wrote nothing.
 				rr.LastSuccess = outcome.Finished
+				if !ro.CompletedAt.IsZero() {
+					rr.LastSuccess = ro.CompletedAt
+				}
 				if ro.measuredStats() {
 					statsCopy := ro
 					rr.LastStats = &statsCopy
