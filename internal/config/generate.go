@@ -326,14 +326,27 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		kept = append(kept, e)
 	}
 
+	// Pass 3: which groups can still tell their archives apart from each other.
+	//
+	// Recomputed over kept rather than reusing repoGroups, which was built before
+	// the refusals above. A refused group never runs, so it writes nothing to
+	// contaminate a survivor's repository, and counting it here would do real
+	// damage: it has no pattern or sample, which patternsCollide reads as "cannot
+	// be distinguished" and reports as a collision. Every group merely sharing a
+	// repository with a refused one would then lose success confirmation there,
+	// and warn about a conflict with a group that is not running.
+	keptRepoGroups := make(map[string][]string, len(repoGroups))
 	patterns := make(map[string]string, len(kept))
 	samples := make(map[string]string, len(kept))
 	for _, e := range kept {
 		patterns[e.name] = e.meta.ArchivePattern
 		format, _ := e.final["archive_name_format"].(string)
 		samples[e.name] = archiveSampleName(format)
+		for _, repo := range e.meta.Repos {
+			keptRepoGroups[repo] = append(keptRepoGroups[repo], e.name)
+		}
 	}
-	for name, repos := range overlappingPatternRepos(repoGroups, patterns, samples, g.logger) {
+	for name, repos := range overlappingPatternRepos(keptRepoGroups, patterns, samples, g.logger) {
 		for i := range kept {
 			if kept[i].name == name {
 				kept[i].meta.AmbiguousRepos = repos
