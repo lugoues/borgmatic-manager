@@ -569,3 +569,39 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+// The counter's label set is a contract with whatever selects on it. The runner
+// records a group-specific status for a config that never validated, and
+// exporting that raw means an alert on result="failed" misses precisely the runs
+// that never got off the ground.
+func TestTheCounterUsesItsDocumentedResultLabels(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	e.RecordRun("web", state.RunOutcome{
+		Result:                 "config-invalid",
+		ConfiguredRepositories: []string{"local"},
+	})
+	e.RecordRun("api", state.RunOutcome{
+		Result:       state.ResultTerminated,
+		Repositories: []state.RepoOutcome{{ID: "local", Result: "something-new"}},
+	})
+	e.RecordRun("db", state.RunOutcome{
+		Result:          state.ResultOK,
+		CreateAttempted: true,
+		Repositories:    []state.RepoOutcome{{ID: "local", Result: state.ResultOK}},
+	})
+
+	sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
+	byGroup := map[string]string{}
+	for _, dp := range sum.DataPoints {
+		byGroup[attr(dp.Attributes, "group")] = attr(dp.Attributes, "result")
+	}
+	assert.Equal(t, state.ResultFailed, byGroup["web"],
+		"a config that never validated did not succeed, and must be findable as a failure")
+	assert.Equal(t, state.ResultFailed, byGroup["api"],
+		"an unrecognized status is reported as a failure rather than as a label nobody selects on")
+	assert.Equal(t, state.ResultOK, byGroup["db"], "the documented values pass through untouched")
+
+	// The detail is not lost, it just lives where the detail belongs.
+	assert.Equal(t, state.ResultTerminated, counterResult(state.ResultTerminated))
+	assert.Equal(t, state.ResultUnknown, counterResult(state.ResultUnknown))
+}
