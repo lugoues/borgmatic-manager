@@ -96,6 +96,11 @@ type RepoOutcome struct {
 // so per-repository staleness survives a run where that repo failed but others
 // did not (the group-level LastSuccess would not advance in that case).
 type RepoRecord struct {
+	// Path is the destination this record's history belongs to. A labelled
+	// repository keeps its key when it is repointed, so without this the new
+	// destination inherits the old one's last success and reports as recently
+	// backed up having never produced an archive.
+	Path        string       `json:"path,omitempty"`
 	LastSuccess time.Time    `json:"last_success"`
 	LastRun     *RepoOutcome `json:"last_run,omitempty"`
 	// LastStats is the most recent outcome that actually carried archive
@@ -382,6 +387,17 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 				rec.Repositories = map[string]RepoRecord{}
 			}
 			rr := rec.Repositories[ro.ID]
+			// A record whose destination has changed is a record of something
+			// else. Its history is dropped rather than inherited, so a repointed
+			// label starts from nothing known rather than from the previous
+			// destination's freshness. An empty stored path is a record written
+			// before this field existed: adopted, not reset.
+			if ro.Path != "" && rr.Path != "" && rr.Path != ro.Path {
+				rr = RepoRecord{}
+			}
+			if ro.Path != "" {
+				rr.Path = ro.Path
+			}
 			roCopy := ro
 			rr.LastRun = &roCopy
 			if ro.Result == ResultOK {

@@ -903,10 +903,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	// Resolved once per repository rather than per lookup: mentionedInErrors is
 	// asked about every repository twice (to decide whether to probe, then to
 	// build the outcome), and resolving a spelling can hit the filesystem.
-	implicated := make([]bool, len(configured))
-	for i, ref := range configured {
-		implicated[i] = ref.Path != "" && mentionedInErrors(ref.Path, errText)
-	}
+	implicated := implicatedRepos(configured, errText)
 
 	// Probed together rather than one after another. Every one of this group's
 	// repository locks is still held here, and another group sharing one of them
@@ -968,6 +965,75 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 // mentionedInErrors reports whether repoPath appears as a path token in any
 // error message, boundary-checked so "/data" does not match "/data2" or
 // "/srv/data".
+// implicatedRepos decides, for every configured repository at once, which ones
+// the error messages name.
+//
+// Deciding each repository independently is what made "/mnt/repo" implicated by
+// a message about "/mnt/repo old": the space ends the shorter path's token, so
+// its match looked genuine. At a given position in a message only one
+// repository can be the one named, and it is the longest one that matches
+// there, so the decision has to be made across the set rather than one path at
+// a time.
+//
+// The healthy destination is not merely mislabelled when this goes wrong: an
+// implicated repository is never probed, so its successful archive goes
+// unconfirmed too.
+func implicatedRepos(configured []config.RepoRef, errText []string) []bool {
+	out := make([]bool, len(configured))
+
+	// Every spelling of every repository, longest first, so the first match at a
+	// position is the most specific one.
+	type candidate struct {
+		index    int
+		spelling string
+	}
+	var candidates []candidate
+	for i, ref := range configured {
+		for _, spelling := range repoSpellings(ref.Path) {
+			candidates = append(candidates, candidate{index: i, spelling: spelling})
+		}
+	}
+	sort.SliceStable(candidates, func(a, b int) bool {
+		return len(candidates[a].spelling) > len(candidates[b].spelling)
+	})
+
+	for _, msg := range errText {
+		claimed := make([]bool, len(msg)+1)
+		for _, cand := range candidates {
+			for _, start := range tokenOccurrences(msg, cand.spelling) {
+				if claimed[start] {
+					continue // a longer repository already owns this position
+				}
+				claimed[start] = true
+				out[cand.index] = true
+			}
+		}
+	}
+	return out
+}
+
+// tokenOccurrences lists the offsets where path appears in msg as a whole token.
+func tokenOccurrences(msg, path string) []int {
+	if path == "" {
+		return nil
+	}
+	var out []int
+	for idx := 0; ; {
+		i := strings.Index(msg[idx:], path)
+		if i < 0 {
+			return out
+		}
+		start := idx + i
+		end := start + len(path)
+		beforeOK := start == 0 || !isNameByte(msg[start-1])
+		afterOK := end >= len(msg) || !isNameByte(msg[end])
+		if beforeOK && afterOK {
+			out = append(out, start)
+		}
+		idx = start + 1
+	}
+}
+
 // mentionedInErrors reports whether any error message names this repository.
 //
 // borg reports the location it resolved, not the string the config held, so the
