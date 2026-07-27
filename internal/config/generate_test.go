@@ -733,3 +733,20 @@ func TestGenerateExtractsRepositoryRefsWithLabels(t *testing.T) {
 	assert.Equal(t, config.RepoRef{Path: "ssh://borg@host/./r", Label: "offsite"}, refs[1])
 	assert.Equal(t, config.RepoRef{Path: "/bare/path"}, refs[2])
 }
+
+// Groups may share a repository, so "the newest archive here" is not the same
+// question as "the newest archive this group wrote". The pattern is what makes
+// the difference askable.
+func TestArchiveMatchPatternReplacesBorgPlaceholders(t *testing.T) {
+	for name, tc := range map[string]struct{ format, want string }{
+		"the default shape":   {"{hostname}-myapp-{now:%Y-%m-%d_%H:%M:%S}", "*-myapp-*"},
+		"group already named": {"myapp-{now}", "myapp-*"},
+		"no placeholders":     {"fixed-name", "fixed-name"},
+		"leading placeholder": {"{fqdn}-db", "*-db"},
+		"adjacent":            {"{a}{b}-x", "**-x"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, config.ArchiveMatchPattern(tc.format))
+		})
+	}
+}

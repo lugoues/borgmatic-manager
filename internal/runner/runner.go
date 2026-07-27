@@ -321,7 +321,8 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	waitErr := cmd.Wait()
 	close(done)
 
-	return r.interpretResult(ctx, groupName, configPath, meta.Repositories, waitErr, run, start, time.Since(start), timedOut.Load())
+	return r.interpretResult(ctx, groupName, configPath, meta.Repositories, meta.ArchivePattern,
+		waitErr, run, start, time.Since(start), timedOut.Load())
 }
 
 // validateTimeout bounds 'borgmatic config validate', which runs while holding
@@ -405,7 +406,7 @@ func (r *Runner) recordValidationFailure(groupName string) {
 
 // interpretResult turns exit state into logs and an error. borgmatic exits 0
 // even with warnings (output-only), 1 on error, 143 on SIGTERM.
-func (r *Runner) interpretResult(ctx context.Context, groupName, configPath string, repos []config.RepoRef, waitErr error, run *runState, start time.Time, duration time.Duration, timedOut bool) error {
+func (r *Runner) interpretResult(ctx context.Context, groupName, configPath string, repos []config.RepoRef, archivePattern string, waitErr error, run *runState, start time.Time, duration time.Duration, timedOut bool) error {
 	warnings := run.warnings.Load()
 	exitCode := 0
 	if waitErr != nil {
@@ -475,13 +476,13 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 	// External SIGKILL (OOM killer, kill -9) counts as failed: "terminated"
 	// would hide the group from status's failed-groups alert.
 	case exitCode == sigkillExit:
-		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, run, start))
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, archivePattern, run, start))
 		r.logger.Error("borgmatic killed (SIGKILL), likely the OOM killer or an external kill -9", "group", groupName,
 			"exit_code", exitCode, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s was killed (exit %d); not a manager timeout, check for OOM", groupName, exitCode)
 
 	default:
-		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, run, start))
+		record(state.ResultFailed, r.perRepoFailure(ctx, configPath, repos, archivePattern, run, start))
 		if run.repoMissing.Load() {
 			if _, hinted := r.bootstrapHinted.LoadOrStore(groupName, struct{}{}); !hinted {
 				r.logger.Error("repository does not exist, initialize it once, then backups proceed on the next cycle",
@@ -600,19 +601,40 @@ func perRepoSuccess(configured []config.RepoRef, results []createResult) []state
 // confirmed by probing for a fresh archive. A repo that can be neither implicated
 // nor confirmed is left out (nil), so its persisted last-success is untouched
 // rather than falsely advanced or failed.
-func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configured []config.RepoRef, run *runState, runStart time.Time) []state.RepoOutcome {
+func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configured []config.RepoRef, archivePattern string, run *runState, runStart time.Time) []state.RepoOutcome {
 	if len(configured) == 0 {
 		return nil
 	}
 	errText := run.errorMessages()
+
+	// Probed together rather than one after another. Every one of this group's
+	// repository locks is still held here, and another group sharing one of them
+	// is skipped for the whole time: serially that is probeTimeout per
+	// repository, so a group with several unreachable destinations could hold
+	// them for minutes. Concurrently the worst case is one probeTimeout no
+	// matter how many there are, and each probe touches a different repository
+	// so they do not contend.
+	confirmed := make([]bool, len(configured))
+	var wg sync.WaitGroup
+	for i, ref := range configured {
+		if ref.Path == "" || mentionedInErrors(ref.Path, errText) {
+			continue // named in an error: it failed, and probing it is pointless
+		}
+		wg.Add(1)
+		go func(i int, path string) {
+			defer wg.Done()
+			confirmed[i] = r.confirmRepoSucceeded(ctx, configPath, path, archivePattern, runStart)
+		}(i, ref.Path)
+	}
+	wg.Wait()
+
 	out := make([]state.RepoOutcome, 0, len(configured))
-	for _, ref := range configured {
+	for i, ref := range configured {
 		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultFailed}
 		switch {
 		case ref.Path != "" && mentionedInErrors(ref.Path, errText):
-			// This destination is named in an error: it failed. No probe, and
-			// crucially no probe against a likely-unreachable repo.
-		case r.confirmRepoSucceeded(ctx, configPath, ref.Path, runStart):
+			// This destination is named in an error: it failed.
+		case confirmed[i]:
 			ro.Result = state.ResultOK
 		default:
 			// Neither implicated nor confirmed (probe skipped on shutdown, or
@@ -675,6 +697,10 @@ func isNameByte(b byte) bool {
 	}
 }
 
+// borgmaticListAction is borgmatic's archive-listing action, used by the
+// per-repository confirmation probe.
+const borgmaticListAction = "list"
+
 // probeTimeout bounds a single per-repository confirmation list: an unreachable
 // destination must not stall the failure path.
 const probeTimeout = 60 * time.Second
@@ -688,11 +714,11 @@ const probeSkew = 5 * time.Second
 // --json is suppressed by a group failure. Any uncertainty (shutdown in
 // progress, unreachable repo, probe error, no fresh archive) returns false: the
 // caller then leaves the repo's stored state untouched rather than crediting it.
-func (r *Runner) confirmRepoSucceeded(ctx context.Context, configPath, repoPath string, runStart time.Time) bool {
+func (r *Runner) confirmRepoSucceeded(ctx context.Context, configPath, repoPath, archivePattern string, runStart time.Time) bool {
 	if repoPath == "" || ctx.Err() != nil {
 		return false
 	}
-	out, ok := r.runProbe(ctx, configPath, repoPath)
+	out, ok := r.runProbe(ctx, configPath, repoPath, archivePattern)
 	if !ok {
 		return false
 	}
@@ -702,9 +728,16 @@ func (r *Runner) confirmRepoSucceeded(ctx context.Context, configPath, repoPath 
 // runProbe runs 'borgmatic list --repository <path> --last 1 --json', enforcing
 // probeTimeout itself (the exec seam does not bind ctx), and returns the raw
 // stdout. ok is false on any start/timeout/exit error.
-func (r *Runner) runProbe(ctx context.Context, configPath, repoPath string) ([]byte, bool) {
-	cmd := r.execCommand(ctx, r.borgmaticPath,
-		"--config", configPath, "list", "--repository", repoPath, "--json", "--last", "1")
+func (r *Runner) runProbe(ctx context.Context, configPath, repoPath, archivePattern string) ([]byte, bool) {
+	args := []string{"--config", configPath, borgmaticListAction, "--repository", repoPath, "--json", "--last", "1"}
+	if archivePattern != "" {
+		// Scoped to this group's own archives. Groups may share a repository,
+		// so the newest archive in it can belong to someone else: without this
+		// another group's fresh archive confirms this group's failed run as a
+		// success, advancing its last-success and silencing the alert.
+		args = append(args, "--match-archives", archivePattern)
+	}
+	cmd := r.execCommand(ctx, r.borgmaticPath, args...)
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
