@@ -342,3 +342,32 @@ func TestServiceNameCanBeOverriddenFromTheEnvironment(t *testing.T) {
 		assert.Equal(t, "v9.9.9", v.AsString())
 	})
 }
+
+// A partly attributed failure: one destination is named in an error, another
+// can be neither implicated nor confirmed. The run reached both. Counting only
+// the judged one drops the ambiguous destination out of attempt-rate and
+// failure dashboards, which is the opposite of what an unexplained repository
+// deserves.
+func TestUnattributedRepositoriesStillCountAsAnAttempt(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	e.RecordRun("web", state.RunOutcome{
+		Result:                 state.ResultFailed,
+		ConfiguredRepositories: []string{"local", "offsite", "archive"},
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK},
+			{ID: "offsite", Result: state.ResultFailed},
+			// "archive" was neither implicated nor confirmed.
+		},
+	})
+
+	sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
+	got := map[string]int64{}
+	for _, dp := range sum.DataPoints {
+		got[attr(dp.Attributes, "repository")+"/"+attr(dp.Attributes, "result")] = dp.Value
+	}
+	assert.Equal(t, map[string]int64{
+		"local/" + state.ResultOK:        1,
+		"offsite/" + state.ResultFailed:  1,
+		"archive/" + state.ResultUnknown: 1,
+	}, got, "every configured destination the run reached counts exactly once")
+}

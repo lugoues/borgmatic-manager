@@ -297,9 +297,24 @@ func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 			attribute.String("group", group), attribute.String("repository", ""), attribute.String("result", o.Result)))
 		return
 	}
+	judged := make(map[string]bool, len(o.Repositories))
 	for _, ro := range o.Repositories {
+		judged[ro.ID] = true
 		e.runsTotal.Add(ctx, 1, metric.WithAttributes(
 			attribute.String("group", group), attribute.String("repository", ro.ID), attribute.String("result", ro.Result)))
+	}
+	// A partly attributed failure: one destination is named in an error while
+	// another can be neither implicated nor confirmed. The run reached both, so
+	// counting only the judged ones drops the ambiguous destination out of
+	// attempt-rate and failure dashboards entirely, which is the opposite of what
+	// an unexplained repository deserves. State deliberately leaves such a
+	// repository untouched; the counter still records that an attempt happened.
+	for _, id := range o.ConfiguredRepositories {
+		if !judged[id] {
+			e.runsTotal.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("group", group), attribute.String("repository", id),
+				attribute.String("result", state.ResultUnknown)))
+		}
 	}
 }
 
