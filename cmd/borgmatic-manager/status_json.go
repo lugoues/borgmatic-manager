@@ -146,6 +146,16 @@ func currentRepositories(persisted map[string]state.RepoRecord, configured map[s
 		}
 		out[id] = rr
 	}
+	// A destination the group configures but has never backed up has no record,
+	// and repository settings do not make the group due, so none may appear for
+	// a whole period. Showing only what has history hides the destination most
+	// likely to need attention: the one that has never run.
+	for id, path := range configured {
+		if _, known := out[id]; known {
+			continue
+		}
+		out[id] = state.RepoRecord{Path: path}
+	}
 	if len(out) == 0 {
 		return nil
 	}
