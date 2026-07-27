@@ -1041,18 +1041,36 @@ func implicatedRepos(configured []config.RepoRef, errText []string) []bool {
 	})
 
 	for _, msg := range errText {
-		claimed := make([]bool, len(msg)+1)
+		claimed := make([]bool, len(msg))
 		for _, cand := range candidates {
 			for _, start := range tokenOccurrences(msg, cand.spelling) {
-				if claimed[start] {
-					continue // a longer repository already owns this position
+				end := start + len(cand.spelling)
+				// The whole range, not just its first byte. Two destinations can
+				// overlap at different offsets rather than sharing a start:
+				// "host:/mnt/repo" contains "/mnt/repo" five bytes in, so
+				// reserving only the start marked both of them failed and left
+				// the healthy one unprobed.
+				if overlapsClaimed(claimed, start, end) {
+					continue // a longer repository already owns this text
 				}
-				claimed[start] = true
+				for i := start; i < end; i++ {
+					claimed[i] = true
+				}
 				out[cand.index] = true
 			}
 		}
 	}
 	return out
+}
+
+// overlapsClaimed reports whether any byte of the range is already spoken for.
+func overlapsClaimed(claimed []bool, start, end int) bool {
+	for i := start; i < end && i < len(claimed); i++ {
+		if claimed[i] {
+			return true
+		}
+	}
+	return false
 }
 
 // tokenOccurrences lists the offsets where path appears in msg as a whole token.
