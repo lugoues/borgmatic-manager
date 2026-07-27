@@ -6,6 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -2281,25 +2284,57 @@ func TestAnUnstageableParentStillSendsAMirrorRestoreInPlace(t *testing.T) {
 	assert.Contains(t, reason, "cannot be created")
 }
 
-// The mask is the whole contract of copyInodeFlags, and a constant declared
-// beside it but left out of the expression compiles silently: unused constants
-// are legal in Go. FS_DAX_FL was added to the block and missing from the mask
-// for two rounds because of exactly that.
-func TestEveryDeclaredInodeFlagIsInTheInheritableMask(t *testing.T) {
-	for name, flag := range map[string]int{
-		"FS_NOCOW_FL":        fsNoCoWFlag,
-		"FS_COMPR_FL":        fsCompressFlag,
-		"FS_NOCOMP_FL":       fsNoCompressFlag,
-		"FS_NOATIME_FL":      fsNoAtimeFlag,
-		"FS_NODUMP_FL":       fsNoDumpFlag,
-		"FS_SYNC_FL":         fsSyncFlag,
-		"FS_DIRSYNC_FL":      fsDirSyncFlag,
-		"FS_DAX_FL":          fsDaxFlag,
-		"FS_JOURNAL_DATA_FL": fsJournalDataFlag,
-		"FS_PROJINHERIT_FL":  fsProjInheritFlag,
-		"FS_CASEFOLD_FL":     fsCasefoldFlag,
-	} {
-		assert.NotZero(t, inheritableMask&flag, "%s is declared but not carried", name)
+// Every fs*Flag constant declared beside the mask must be in it.
+//
+// The list is read out of the source rather than repeated here, because a
+// hand-written list cannot catch the failure this exists to catch: a constant
+// nobody remembered to add is missing from the checklist for exactly the same
+// reason it is missing from the mask. That is not hypothetical. FS_DAX_FL was
+// declared and left out of the mask for two rounds, and when I added
+// FS_TOPDIR_FL the edit that was supposed to extend the old hand-written list
+// silently did not apply, so the test kept passing with the flag uncarried.
+//
+// Unused constants are legal in Go, so nothing else notices.
+func TestEveryDeclaredInodeFlagIsCarried(t *testing.T) {
+	const src = "restore_swap.go"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, src, nil, 0)
+	require.NoError(t, err)
+
+	declared := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for _, name := range spec.Names {
+			if strings.HasPrefix(name.Name, "fs") && strings.HasSuffix(name.Name, "Flag") {
+				declared[name.Name] = true
+			}
+		}
+		return true
+	})
+	require.NotEmpty(t, declared, "no flag constants found; has the naming changed?")
+
+	// The mask's own expression, read the same way.
+	carried := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok || len(spec.Names) == 0 || spec.Names[0].Name != "carriedMask" {
+			return true
+		}
+		ast.Inspect(spec.Values[0], func(inner ast.Node) bool {
+			if id, isID := inner.(*ast.Ident); isID {
+				carried[id.Name] = true
+			}
+			return true
+		})
+		return false
+	})
+	require.NotEmpty(t, carried, "carriedMask not found")
+
+	for name := range declared {
+		assert.True(t, carried[name], "%s is declared beside the mask but not in it", name)
 	}
 }
 
@@ -2739,4 +2774,26 @@ func TestCreateStagingDirClaimsThePlaceholderImmediately(t *testing.T) {
 		t.Skip("this filesystem cannot hold the marker")
 	}
 	assert.True(t, ours, "the placeholder is not claimed, so cleanup would decline to remove it")
+}
+
+// A killed restore can leave a staging tree the size of the volume. If the
+// staging probe runs first it fails on space the manager is itself holding, and
+// every retry aborts without reaching the cleanup that would free it. Merge and
+// in-place restores never reach that cleanup at all.
+func TestClearingLeftoversFreesSpaceTheProbeWouldOtherwiseTripOn(t *testing.T) {
+	data := liveVolume(t)
+	stale := data + stagingPrefix + "9100"
+	require.NoError(t, os.Mkdir(stale, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(stale, "big.bin"), []byte("volume-sized"), 0o644))
+	if !markAsOurs(stale) {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+
+	// The order that matters: cleanup first, then the probe finds room.
+	require.NoError(t, clearStagingLeftovers(data, quietLogger()))
+	assert.NoDirExists(t, stale, "the manager's own leftover was not reclaimed")
+
+	ok, err := canCreateSibling(data)
+	require.NoError(t, err)
+	assert.True(t, ok)
 }

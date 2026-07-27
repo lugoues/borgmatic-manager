@@ -612,12 +612,21 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 	return staging, nil
 }
 
-// inheritableInodeFlags are the FS_IOC_GETFLAGS bits a directory passes on to
-// what is created inside it, so they have to be on staging *before* borg writes
-// anything: setting nodatacow afterwards does not convert files that already
-// exist. btrfs +C on a database volume is the case that matters, where losing
-// it silently restores copy-on-write behaviour the operator deliberately turned
-// off.
+// carriedInodeFlags are the FS_IOC_GETFLAGS bits the replacement directory has
+// to reproduce, because the promoted directory *becomes* the volume and any of
+// these the volume had describe how it and its contents behave.
+//
+// Most are inherited by what is created inside the directory, which is why they
+// are applied before borg writes anything: setting nodatacow afterwards does not
+// convert files that already exist. btrfs +C on a database volume is the case
+// that matters, where losing it silently restores copy-on-write behaviour the
+// operator deliberately turned off. A few, like the top-directory allocator
+// hint, describe only the directory itself; they are carried for the same reason
+// but the timing is incidental rather than load-bearing.
+//
+// Deliberately excluded: immutable and append-only. Those also describe the
+// directory, but reproducing them on one that is about to be extracted into
+// would stop the extract.
 //
 // Defined here because golang.org/x/sys/unix exports the ioctls but not the
 // flag bits. Values are from linux/fs.h and are stable ABI.
@@ -633,9 +642,10 @@ const (
 	fsProjInheritFlag = 0x20000000 // FS_PROJINHERIT_FL
 	fsDaxFlag         = 0x02000000 // FS_DAX_FL
 	fsCasefoldFlag    = 0x40000000 // FS_CASEFOLD_FL
-	inheritableMask   = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
+	fsTopDirFlag      = 0x00020000 // FS_TOPDIR_FL
+	carriedMask       = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
 		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsJournalDataFlag | fsDaxFlag |
-		fsProjInheritFlag | fsCasefoldFlag
+		fsProjInheritFlag | fsCasefoldFlag | fsTopDirFlag
 )
 
 // copyInodeFlags carries the model's inheritable inode flags onto staging.
@@ -660,14 +670,14 @@ func copyInodeFlags(model, staging string, logger *slog.Logger) error {
 	// and only replacing the masked bits can take it back off. That also means
 	// there is no shortcut for a target with none of them set, which is exactly
 	// the case where an inherited flag would otherwise survive unnoticed.
-	if setErr := setInodeFlagsExactly(staging, flags&inheritableMask); setErr != nil {
+	if setErr := setInodeFlagsExactly(staging, flags&carriedMask); setErr != nil {
 		// Not fatal. The data lands correctly either way, and refusing to
 		// restore a volume over a storage-behaviour flag is the worse outcome;
 		// but it changes how every restored file is stored, so it is said out
 		// loud rather than dropped.
 		logger.Warn("could not apply the volume's inode flags to the directory replacing it, so the restored "+
 			"files will not inherit them (btrfs +C in particular cannot be applied after the files exist)",
-			"path", staging, "flags", fmt.Sprintf("%#x", flags&inheritableMask), "error", setErr)
+			"path", staging, "flags", fmt.Sprintf("%#x", flags&carriedMask), "error", setErr)
 	}
 	return nil
 }
@@ -705,7 +715,7 @@ var setInodeFlagsExactly = func(path string, want int) error {
 	if err != nil {
 		return err
 	}
-	desired := (current &^ inheritableMask) | (want & inheritableMask)
+	desired := (current &^ carriedMask) | (want & carriedMask)
 	if desired == current {
 		return nil
 	}
