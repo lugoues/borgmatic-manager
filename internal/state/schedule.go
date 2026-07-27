@@ -37,6 +37,12 @@ type RunOutcome struct {
 	// the outcome alone cannot say whether a missing one was skipped or removed.
 	// Empty leaves the persisted set untouched.
 	ConfiguredRepositories []string `json:"-"`
+	// ConfiguredRepositoryPaths maps those ids to the destination each one
+	// currently points at, so a repository the run could not judge is still
+	// reconciled: a repointed label is otherwise only noticed on a run that
+	// produced an outcome for it, and the first run after the change is exactly
+	// the one likely to fail.
+	ConfiguredRepositoryPaths map[string]string `json:"-"`
 	// CreateAttempted records whether this run tried to write an archive at all.
 	// A maintenance-only cycle (prune, compact, check, with no create) exits
 	// zero having backed nothing up, and counting that as a successful backup
@@ -437,8 +443,18 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 				if rec.Repositories == nil {
 					rec.Repositories = map[string]RepoRecord{}
 				}
-				if _, known := rec.Repositories[id]; !known {
-					rec.Repositories[id] = RepoRecord{}
+				rr, known := rec.Repositories[id]
+				path := outcome.ConfiguredRepositoryPaths[id]
+				switch {
+				case !known:
+					rec.Repositories[id] = RepoRecord{Path: path}
+				case path != "" && rr.Path != "" && rr.Path != path:
+					// Repointed, and this run never judged it. The history
+					// belongs to the destination it was taken from.
+					rec.Repositories[id] = RepoRecord{Path: path}
+				case path != "" && rr.Path == "":
+					rr.Path = path
+					rec.Repositories[id] = rr
 				}
 			}
 			for id := range rec.Repositories {
