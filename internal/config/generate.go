@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -337,11 +338,11 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 	// and warn about a conflict with a group that is not running.
 	keptRepoGroups := make(map[string][]string, len(repoGroups))
 	patterns := make(map[string]string, len(kept))
-	samples := make(map[string]string, len(kept))
+	samples := make(map[string][]string, len(kept))
 	for _, e := range kept {
 		patterns[e.name] = e.meta.ArchivePattern
 		format, _ := e.final["archive_name_format"].(string)
-		samples[e.name] = archiveSampleName(format)
+		samples[e.name] = archiveSampleNames(format)
 		for _, repo := range e.meta.Repos {
 			keptRepoGroups[repo] = append(keptRepoGroups[repo], e.name)
 		}
@@ -661,7 +662,7 @@ func volumeNamedPath(hostPath, volumeName string) string {
 // "x-app--other-y", so every pair of groups would look like a collision. What
 // matters is narrower: whether one group's pattern matches a name the other
 // group's format would actually generate.
-func overlappingPatternRepos(repoGroups map[string][]string, patterns, samples map[string]string, logger *slog.Logger) map[string][]string {
+func overlappingPatternRepos(repoGroups map[string][]string, patterns map[string]string, samples map[string][]string, logger *slog.Logger) map[string][]string {
 	affected := map[string][]string{}
 	add := func(name, repo string) {
 		for _, r := range affected[name] {
@@ -698,15 +699,25 @@ func overlappingPatternRepos(repoGroups map[string][]string, patterns, samples m
 	return affected
 }
 
-// patternsCollide reports whether either group's pattern claims the other's
-// archives. An empty pattern or sample means the group's config names no archive
-// format, so nothing distinguishes its archives from anyone else's: treated as a
-// collision, which is the safe direction.
-func patternsCollide(patternA, sampleA, patternB, sampleB string) bool {
-	if patternA == "" || patternB == "" || sampleA == "" || sampleB == "" {
+// patternsCollide reports whether either group's pattern claims any archive name
+// the other group's format can produce. An empty pattern or no samples means the
+// group's config names no archive format, so nothing distinguishes its archives
+// from anyone else's: treated as a collision, which is the safe direction.
+func patternsCollide(patternA string, samplesA []string, patternB string, samplesB []string) bool {
+	if patternA == "" || patternB == "" || len(samplesA) == 0 || len(samplesB) == 0 {
 		return true
 	}
-	return globMatches(patternA, sampleB) || globMatches(patternB, sampleA)
+	for _, sample := range samplesB {
+		if sample == "" || globMatches(patternA, sample) {
+			return true
+		}
+	}
+	for _, sample := range samplesA {
+		if sample == "" || globMatches(patternB, sample) {
+			return true
+		}
+	}
+	return false
 }
 
 // globMatches reports whether pattern, in which "*" matches any run of
@@ -737,11 +748,41 @@ func globMatches(pattern, name string) bool {
 	return walk(0, 0)
 }
 
-// archiveSampleName renders one archive name a format would produce, standing in
-// for borg's runtime placeholders. The stand-in carries no separators of its
-// own, so it cannot manufacture a match against another group's literal text or
-// hide one.
-func archiveSampleName(format string) string {
+// archiveSampleNames renders the archive names a format produces, one per
+// representative instant.
+//
+// One sample is not enough once a format can contain a formatted timestamp. A
+// group named "07" has the pattern "*-07-*", and a sibling whose format includes
+// {now:%m} writes "x-07-prod-..." every July: whether those collide depends on
+// the date, so a single rendering answers only for the date it used. Rendering
+// across the year answers for the year, and a collision that exists on any date
+// is a collision.
+//
+// Placeholders whose values this host already knows are rendered as those
+// values, because a stand-in can hide a real collision. With the default format
+// and a hostname like "db-app-node", groups "app" and "prod" produce
+// "db-app-node-app-..." and "db-app-node-prod-...", and the second matches the
+// first group's "*-app-*" pattern through the hostname alone.
+func archiveSampleNames(format string) []string {
+	out := make([]string, 0, len(sampleInstants))
+	for _, at := range sampleInstants {
+		out = append(out, archiveSampleNameAt(format, at))
+	}
+	return out
+}
+
+// sampleInstants spread across every month, and across days, hours, minutes and
+// seconds, so a formatted placeholder that renders a short value (a month or a
+// day number) is seen at each value it can take.
+var sampleInstants = func() []time.Time {
+	out := make([]time.Time, 0, 12)
+	for m := 1; m <= 12; m++ {
+		out = append(out, time.Date(2026, time.Month(m), m+1, (m*2)%24, m*4%60, m*5%60, 0, time.Local))
+	}
+	return out
+}()
+
+func archiveSampleNameAt(format string, at time.Time) string {
 	var b strings.Builder
 	depth := 0
 	var token strings.Builder
@@ -755,7 +796,7 @@ func archiveSampleName(format string) string {
 		case r == '}' && depth > 0:
 			depth--
 			if depth == 0 {
-				b.WriteString(samplePlaceholderValue(token.String()))
+				b.WriteString(samplePlaceholderValue(token.String(), at))
 			}
 		case depth > 0:
 			token.WriteRune(r)
@@ -766,20 +807,12 @@ func archiveSampleName(format string) string {
 	return b.String()
 }
 
-// samplePlaceholderValue renders one of borg's runtime placeholders.
-//
-// The ones whose value this host already knows are rendered as that value,
-// because a stand-in can hide a real collision. With the default format and a
-// hostname like "db-app-node", groups "app" and "prod" produce the archives
-// "db-app-node-app-..." and "db-app-node-prod-...", and the second matches the
-// first group's "*-app-*" pattern through the hostname alone. Substituting
-// digits for the hostname makes those two look disjoint when they are not.
-//
-// Timestamps stay a digits-only stand-in: their value differs every run, so no
-// single rendering is the right one, and digits introduce no separator that
-// could manufacture a match or hide one.
-func samplePlaceholderValue(token string) string {
-	name, _, _ := strings.Cut(token, ":")
+// samplePlaceholderValue renders one of borg's runtime placeholders at a given
+// instant. A placeholder this host cannot resolve falls back to a digits-only
+// stand-in, which introduces no separator that could manufacture a match or hide
+// one.
+func samplePlaceholderValue(token string, at time.Time) string {
+	name, spec, hasSpec := strings.Cut(token, ":")
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "hostname", "fqdn", "reverse-hostname":
 		if h := sampleHostname(); h != "" {
@@ -789,9 +822,57 @@ func samplePlaceholderValue(token string) string {
 		if u := os.Getenv("USER"); u != "" {
 			return u
 		}
+	case "now", "utcnow":
+		when := at
+		if strings.EqualFold(strings.TrimSpace(name), "utcnow") {
+			when = at.UTC()
+		}
+		if !hasSpec {
+			return when.Format("2006-01-02T15:04:05")
+		}
+		if layout, ok := strftimeLayout(spec); ok {
+			return when.Format(layout)
+		}
 	}
 	return samplePlaceholder
 }
+
+// strftimeLayout converts the strftime directives borg passes to Python into a
+// Go layout. An unsupported directive gives up entirely rather than rendering
+// part of the value, since a half-rendered timestamp is neither the real text
+// nor a neutral stand-in.
+func strftimeLayout(spec string) (string, bool) {
+	var b strings.Builder
+	for i := 0; i < len(spec); i++ {
+		if spec[i] != '%' {
+			b.WriteByte(spec[i])
+			continue
+		}
+		i++
+		if i >= len(spec) {
+			return "", false
+		}
+		layout, ok := strftimeDirectives[spec[i]]
+		if !ok {
+			return "", false
+		}
+		b.WriteString(layout)
+	}
+	return b.String(), true
+}
+
+var strftimeDirectives = map[byte]string{
+	'Y': "2006", 'y': "06", 'm': "01", 'd': "02",
+	'H': "15", 'M': "04", 'S': "05",
+	'b': "Jan", 'B': "January", 'a': "Mon", 'A': "Monday",
+	'p': "PM", 'I': "03", 'Z': "MST", 'z': "-0700",
+	'%': "%",
+}
+
+// samplePlaceholder stands in for a placeholder whose value is unknowable here.
+// Digits only, so it introduces no separator that could manufacture a match
+// against another group's literal text or hide one.
+const samplePlaceholder = "20260102150405"
 
 // sampleHostname is a seam: the value borg will expand {hostname} to is this
 // host's, and tests need to pin it.
@@ -802,11 +883,6 @@ var sampleHostname = func() string {
 	}
 	return h
 }
-
-// samplePlaceholder stands in for a runtime placeholder when rendering a sample
-// archive name. Digits only, so it introduces no separator that could
-// manufacture a match against another group's literal text or hide one.
-const samplePlaceholder = "20260102150405"
 
 // warnIfMissing warns when none of the candidate host binaries are on PATH;
 // a missing dump client is a guaranteed runtime failure.
