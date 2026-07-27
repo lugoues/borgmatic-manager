@@ -643,9 +643,10 @@ const (
 	fsDaxFlag         = 0x02000000 // FS_DAX_FL
 	fsCasefoldFlag    = 0x40000000 // FS_CASEFOLD_FL
 	fsTopDirFlag      = 0x00020000 // FS_TOPDIR_FL
+	fsNoTailFlag      = 0x00008000 // FS_NOTAIL_FL
 	carriedMask       = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
 		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsJournalDataFlag | fsDaxFlag |
-		fsProjInheritFlag | fsCasefoldFlag | fsTopDirFlag
+		fsProjInheritFlag | fsCasefoldFlag | fsTopDirFlag | fsNoTailFlag
 )
 
 // copyInodeFlags carries the model's inheritable inode flags onto staging.
@@ -772,6 +773,10 @@ var projectQuotaID = func(path string) (uint64, bool) {
 	return id, true
 }
 
+// chownFn is the seam for the ownership capability, so a test can present a
+// volume owned by another uid without needing to create one.
+var chownFn = os.Chown
+
 // canCreateSibling reports whether a staging directory can be created beside
 // targetData.
 //
@@ -794,8 +799,27 @@ func canCreateSibling(targetData string) (bool, error) {
 		}
 		return false, fmt.Errorf("checking whether a staging directory can be created beside %s: %w", targetData, err)
 	}
-	if rmErr := os.Remove(probe); rmErr != nil {
-		return false, fmt.Errorf("removing the staging probe %s: %w", probe, rmErr)
+	defer func() { _ = os.Remove(probe) }()
+
+	// Creating a sibling is not enough: the replacement has to be able to carry
+	// the volume's ownership, and a manager that can write the volume through an
+	// ACL, group access or world-write without owning it cannot chown. Failing
+	// there aborts the restore after the probe has already said yes, and the
+	// previous in-place mirror could have restored such a volume, so the
+	// capability belongs in the probe rather than in the middle of a restore.
+	info, err := os.Stat(targetData)
+	if err != nil {
+		return false, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return true, nil
+	}
+	if chErr := chownFn(probe, int(st.Uid), int(st.Gid)); chErr != nil {
+		if errors.Is(chErr, os.ErrPermission) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking whether the staging directory can carry the volume's ownership: %w", chErr)
 	}
 	return true, nil
 }
@@ -1209,7 +1233,18 @@ func matchSubvolumeReadOnly(targetData, staging string, logger *slog.Logger) err
 		return err
 	}
 	readOnly, known := btrfsSubvolumeReadOnly(targetData)
-	if !known || !readOnly {
+	if !known {
+		// Not knowing is not the same as knowing it is writable. If the target
+		// really is read-only, promoting a writable replacement removes a
+		// deliberate protection, and the operator would otherwise get neither
+		// the protection nor the warning that it was lost.
+		logger.Warn("this volume is a btrfs subvolume but its read-only property could not be read, so the "+
+			"restore cannot tell whether to reproduce it; if the volume was read-only, set it again with "+
+			"\"btrfs property set -ts <path> ro true\"",
+			"path", targetData)
+		return nil
+	}
+	if !readOnly {
 		return nil
 	}
 	if setErr := setBtrfsSubvolumeReadOnly(staging, true); setErr != nil {

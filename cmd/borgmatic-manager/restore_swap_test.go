@@ -820,7 +820,7 @@ func TestExtractSignalHelper(t *testing.T) {
 	fmt.Println(pidFileMarker + pidFile)
 
 	err = runBorgmaticExtract(context.Background(), fake,
-		"config.yaml", "archive", "vol/_data", filepath.Join(dir, "dest"))
+		"config.yaml", "archive", "vol/_data", filepath.Join(dir, "dest"), dir, quietLogger())
 	if err != nil {
 		fmt.Println("extract returned:", err)
 		os.Exit(3)
@@ -987,7 +987,7 @@ func TestControllingTerminalHelper(t *testing.T) {
 			"else echo EXTRACT-HAS-TTY=false; fi\n"), 0o755))
 
 	_ = runBorgmaticExtract(context.Background(), fake, "config.yaml", "archive", "vol/_data",
-		filepath.Join(dir, "dest"))
+		filepath.Join(dir, "dest"), dir, quietLogger())
 	fmt.Print("CHILD-DONE\r\n")
 	os.Exit(0)
 }
@@ -2796,4 +2796,120 @@ func TestClearingLeftoversFreesSpaceTheProbeWouldOtherwiseTripOn(t *testing.T) {
 	ok, err := canCreateSibling(data)
 	require.NoError(t, err)
 	assert.True(t, ok)
+}
+
+// Pdeathsig reaches borgmatic but not the borg beneath it, and the per-volume
+// lock dies with the manager, so a SIGKILLed manager can leave borg writing
+// with nothing excluding the next restore. The record is what closes that.
+func TestOrphanedExtractIsDetectedAcrossAManagerThatDied(t *testing.T) {
+	locks := t.TempDir()
+	data := "/var/lib/docker/volumes/myvol/_data"
+
+	require.NoError(t, checkNoOrphanedExtract(locks, data), "no record means nothing to report")
+
+	// A live process group stands in for an extract that outlived its manager.
+	// #nosec G204 -- a fixed command
+	orphan := exec.Command("sleep", "60")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	require.NoError(t, orphan.Start())
+	t.Cleanup(func() { _ = syscall.Kill(-orphan.Process.Pid, syscall.SIGKILL); _, _ = orphan.Process.Wait() })
+
+	require.NoError(t, recordExtractSession(locks, data, orphan.Process.Pid))
+	err := checkNoOrphanedExtract(locks, data)
+	require.Error(t, err, "a running extract from a dead manager must stop the next restore")
+	assert.Contains(t, err.Error(), "still running")
+	assert.Contains(t, err.Error(), "nothing was changed")
+
+	// Once it is gone the record says nothing and must not block anything.
+	require.NoError(t, syscall.Kill(-orphan.Process.Pid, syscall.SIGKILL))
+	_, _ = orphan.Process.Wait()
+	assert.Eventually(t, func() bool {
+		return checkNoOrphanedExtract(locks, data) == nil
+	}, helperGrace, 20*time.Millisecond, "a stale record must be cleared rather than block forever")
+	assert.NoFileExists(t, extractSessionPath(locks, data), "and removed rather than left to accumulate")
+}
+
+// A completed extract must leave no record behind, or the next restore refuses
+// on an extract that finished.
+func TestAFinishedExtractLeavesNoSessionRecord(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "borgmatic")
+	require.NoError(t, os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	require.NoError(t, runBorgmaticExtract(context.Background(), fake, "config.yaml", "archive", "vol/_data",
+		filepath.Join(dir, "dest"), dir, quietLogger()))
+	assert.NoFileExists(t, extractSessionPath(dir, filepath.Join(dir, "dest")))
+	require.NoError(t, checkNoOrphanedExtract(dir, filepath.Join(dir, "dest")))
+}
+
+// Creating a sibling is not the whole capability: the replacement has to carry
+// the volume's ownership. A manager that can write the volume through an ACL or
+// group access without owning it cannot chown, and failing there aborts the
+// restore after the probe has already said yes.
+func TestCanCreateSiblingRequiresOwnershipToBeReproducible(t *testing.T) {
+	data := liveVolume(t)
+
+	real := chownFn
+	chownFn = func(string, int, int) error { return os.ErrPermission }
+	defer func() { chownFn = real }()
+
+	ok, err := canCreateSibling(data)
+	require.NoError(t, err, "not being allowed to chown is an answer, not a failure")
+	assert.False(t, ok, "it must send the restore in place rather than abort it later")
+	assert.Empty(t, stagingDirsFor(t, data), "and the probe must not survive itself")
+}
+
+// The guards in runRestoreVolume are an ordering, not a set: each one exists to
+// run before something the next one would otherwise damage. Asserted against
+// the source because the function needs a live container runtime to drive, and
+// an ordering that only holds by accident is the shape several findings on this
+// change have taken.
+func TestRunRestoreVolumeGuardsRunInOrder(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	require.NoError(t, err)
+
+	var seen []string
+	interesting := map[string]bool{
+		"lockVolumeRestore": true, "checkNoOrphanedExtract": true,
+		"clearStagingLeftovers": true, "checkVolumeDataDir": true,
+		"resolveInPlaceReason": true, "snapshotVolume": true,
+	}
+	ast.Inspect(file, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "runRestoreVolume" {
+			return true
+		}
+		ast.Inspect(fn.Body, func(inner ast.Node) bool {
+			call, isCall := inner.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			if id, isID := call.Fun.(*ast.Ident); isID && interesting[id.Name] {
+				seen = append(seen, id.Name)
+			}
+			return true
+		})
+		return false
+	})
+
+	at := func(name string) int {
+		for i, s := range seen {
+			if s == name {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, name := range []string{"lockVolumeRestore", "checkNoOrphanedExtract", "clearStagingLeftovers", "snapshotVolume"} {
+		require.GreaterOrEqual(t, at(name), 0, "%s is not called at all", name)
+	}
+	assert.Less(t, at("lockVolumeRestore"), at("checkNoOrphanedExtract"),
+		"the orphan check is only meaningful once this restore holds the lock")
+	assert.Less(t, at("checkNoOrphanedExtract"), at("clearStagingLeftovers"),
+		"nothing may be deleted while a previous extract might still be writing it")
+	assert.Less(t, at("clearStagingLeftovers"), at("resolveInPlaceReason"),
+		"the staging probe must not fail on space this tool is itself holding")
+	assert.Less(t, at("resolveInPlaceReason"), at("snapshotVolume"),
+		"a restore that will be refused must be refused before a snapshot is taken")
 }
