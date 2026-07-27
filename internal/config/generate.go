@@ -764,23 +764,52 @@ func globMatches(pattern, name string) bool {
 // "db-app-node-app-..." and "db-app-node-prod-...", and the second matches the
 // first group's "*-app-*" pattern through the hostname alone.
 func archiveSampleNames(format string) []string {
+	// Deduplicated: a format with no time placeholder renders identically at
+	// every instant, and the collision check is quadratic in the number of
+	// samples it is handed.
+	seen := make(map[string]bool, len(sampleInstants))
 	out := make([]string, 0, len(sampleInstants))
 	for _, at := range sampleInstants {
-		out = append(out, archiveSampleNameAt(format, at))
+		name := archiveSampleNameAt(format, at)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
 	}
 	return out
 }
 
-// sampleInstants spread across every month, and across days, hours, minutes and
-// seconds, so a formatted placeholder that renders a short value (a month or a
-// day number) is seen at each value it can take.
-var sampleInstants = func() []time.Time {
-	out := make([]time.Time, 0, 12)
-	for m := 1; m <= 12; m++ {
-		out = append(out, time.Date(2026, time.Month(m), m+1, (m*2)%24, m*4%60, m*5%60, 0, time.Local))
+// sampleInstants covers every value each supported directive can render, so a
+// collision that exists on one day of the year is found on any other.
+//
+// Not a cross-product, which is unreachable, but full coverage of each
+// directive's own domain: every month, every day, every hour, minute and second,
+// and the current and next year (a group can be named after a year as easily as
+// after a month). A collision needing two directives at specific values
+// simultaneously is still possible in principle and is not covered; the ones
+// seen in practice come from a single short value, a month or a day, landing
+// beside the separators another group's name sits between.
+var sampleInstants = buildSampleInstants(time.Now())
+
+func buildSampleInstants(now time.Time) []time.Time {
+	years := []int{now.Year(), now.Year() + 1}
+	// January has 31 days, so every day value is renderable there without
+	// time.Date rolling a short month over into the next one and skipping it.
+	var out []time.Time
+	for _, y := range years {
+		for day := 1; day <= 31; day++ {
+			out = append(out, time.Date(y, time.January, day, (day*7)%24, (day*13)%60, (day*17)%60, 0, time.Local))
+		}
+		for m := 1; m <= 12; m++ {
+			out = append(out, time.Date(y, time.Month(m), 15, (m*2)%24, (m*5)%60, (m*3)%60, 0, time.Local))
+		}
+		for v := 0; v < 60; v++ {
+			out = append(out, time.Date(y, time.January, 15, v%24, v, v, 0, time.Local))
+		}
 	}
 	return out
-}()
+}
 
 func archiveSampleNameAt(format string, at time.Time) string {
 	var b strings.Builder
@@ -973,8 +1002,8 @@ func CanonicalRepoKey(path string) string {
 		// be the same repo. Serialize conservatively under one key.
 		return UnknownRepoKey
 	}
-	if strings.Contains(path, "://") || strings.Contains(path, "@") {
-		// Remote URL or user@host:path form.
+	if strings.Contains(path, "://") || isSCPStyle(path) {
+		// Remote URL or user@host:path form: nothing local to clean or resolve.
 		return strings.TrimRight(path, "/")
 	}
 	cleaned := filepath.Clean(path)
@@ -982,6 +1011,35 @@ func CanonicalRepoKey(path string) string {
 		return resolved
 	}
 	return cleaned
+}
+
+// isSCPStyle reports whether a path is borg's user@host:path remote form.
+//
+// An at-sign alone is not the test. A local directory may contain one, and
+// treating "/srv/backups@local/repo" as remote skipped the cleaning and symlink
+// resolution that make two spellings of it compare equal: two groups writing to
+// it as ".../repo" and "..././repo" got different keys, so they could run
+// against one Borg repository concurrently and skipped the shared-repository
+// archive safety checks entirely.
+//
+// The real shape has a colon separating host from path, with the at-sign before
+// it and no path separator before either. An absolute path is never remote.
+func isSCPStyle(path string) bool {
+	colon := strings.Index(path, ":")
+	if colon < 0 {
+		return false // no host separator: a path, however many at-signs it holds
+	}
+	// Everything before the colon is the host part, and a host contains no path
+	// separator. This is also what makes an absolute path local: it starts with
+	// one, so its host part always holds a separator.
+	host := path[:colon]
+	if host == "" || strings.Contains(host, "/") {
+		return false
+	}
+	// user@host:path, or host:path with no user at all, which borg also accepts.
+	// An empty user or host is neither.
+	at := strings.Index(host, "@")
+	return at != 0 && !strings.HasSuffix(host, "@")
 }
 
 // archiveMatchPattern turns an archive_name_format into a borg match pattern by
