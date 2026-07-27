@@ -1194,6 +1194,19 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if recErr := recoverInterruptedSwap(plan.targetData, logger); recErr != nil {
 		return recErr
 	}
+	// Reclaim this tool's own leftovers before anything asks the filesystem for
+	// room. A killed restore can leave a staging tree the size of the volume, and
+	// the staging probe then fails with ENOSPC or EDQUOT on space the manager is
+	// itself holding, so every retry aborts without ever reaching the cleanup
+	// that would free it. Merge and in-place restores never reach that cleanup
+	// at all, so they kept it indefinitely.
+	//
+	// Under the restore lock, and only removes directories provably this tool's,
+	// so there is nothing here that a later stage would have removed more safely.
+	if clearErr := clearStagingLeftovers(plan.targetData, logger); clearErr != nil {
+		return clearErr
+	}
+
 	if dirErr := checkVolumeDataDir(plan.targetData, plan.targetVolume); dirErr != nil {
 		return dirErr
 	}
