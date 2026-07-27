@@ -175,6 +175,13 @@ func (e *Emitter) register(m metric.Meter) error {
 	if err != nil {
 		return fmt.Errorf("creating backup_seconds_since_last_success: %w", err)
 	}
+	groupInfo, err := m.Int64ObservableGauge("backup_group_info",
+		metric.WithDescription("Always 1, once per known backup group. Without it a group that has never "+
+			"reported is indistinguishable from one that no longer exists, because every other series here "+
+			"only appears after a run."))
+	if err != nil {
+		return err
+	}
 	offlineVolumes, err := m.Int64ObservableGauge("backup_offline_volumes",
 		metric.WithDescription("Number of a group's volumes whose container is currently offline."))
 	if err != nil {
@@ -183,10 +190,10 @@ func (e *Emitter) register(m metric.Meter) error {
 
 	_, err = m.RegisterCallback(
 		func(_ context.Context, o metric.Observer) error {
-			e.observe(o, lastSize, lastFiles, offlineVolumes, lastDuration, staleness)
+			e.observe(o, lastSize, lastFiles, offlineVolumes, groupInfo, lastDuration, staleness)
 			return nil
 		},
-		lastSize, lastDuration, lastFiles, staleness, offlineVolumes,
+		lastSize, lastDuration, lastFiles, staleness, offlineVolumes, groupInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("registering metrics callback: %w", err)
@@ -197,7 +204,7 @@ func (e *Emitter) register(m metric.Meter) error {
 // observe pulls current state and reports every gauge. Called by the SDK at
 // each collection.
 func (e *Emitter) observe(o metric.Observer,
-	lastSize, lastFiles, offlineVolumes metric.Int64Observable,
+	lastSize, lastFiles, offlineVolumes, groupInfo metric.Int64Observable,
 	lastDuration, staleness metric.Float64Observable,
 ) {
 	now := e.now()
@@ -229,6 +236,12 @@ func (e *Emitter) observe(o metric.Observer,
 
 	e.mu.Lock()
 	for group := range e.allGroups {
+		// One series per configured group, whether or not it has ever run. Every
+		// other metric here springs into existence only after a backup, so
+		// without this a group that has never succeeded looks exactly like one
+		// that was deleted, and an alert on "no recent backup" cannot fire for
+		// the group that most needs it.
+		o.ObserveInt64(groupInfo, 1, metric.WithAttributes(attribute.String("group", group)))
 		o.ObserveInt64(offlineVolumes, int64(e.offline[group]),
 			metric.WithAttributes(attribute.String("group", group)))
 	}

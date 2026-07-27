@@ -154,3 +154,24 @@ func TestNewExporterProtocol(t *testing.T) {
 	_, err := newExporter(ctx, config.MetricsSettings{Protocol: "carrier-pigeon"})
 	require.Error(t, err, "an unknown protocol is rejected")
 }
+
+// Every other series here appears only after a run, so without this a group
+// that has never succeeded is indistinguishable from one that was deleted, and
+// an alert on "no recent backup" cannot fire for the group that most needs it.
+func TestGroupInfoIsEmittedForAGroupThatHasNeverRun(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{}})
+
+	// A configured group with no volumes and no runs: the shape a freshly
+	// labelled service has before its first backup.
+	bs := models.NewBackupState()
+	bs.AddVolume("never-run", models.VolumeInfo{Name: "data", HostPath: "/mnt/data"})
+	e.ObserveInventory(bs, nil)
+
+	rm := collect(t, reader)
+	m := findMetric(t, rm, "backup_group_info")
+	gauge, ok := m.Data.(metricdata.Gauge[int64])
+	require.True(t, ok, "backup_group_info must be an int64 gauge")
+	require.Len(t, gauge.DataPoints, 1, "one series per configured group, run or not")
+	assert.Equal(t, int64(1), gauge.DataPoints[0].Value)
+	assert.Equal(t, "never-run", attr(gauge.DataPoints[0].Attributes, "group"))
+}
