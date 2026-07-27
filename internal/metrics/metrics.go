@@ -417,10 +417,14 @@ func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 	// the counter by another route, and a manager configured that way would show
 	// a steady stream of successful backups it never took.
 	//
-	// A maintenance cycle that fails still counts: a check that keeps failing is
-	// exactly what an operator wants alerted on, and reporting it is not a claim
-	// that anything was backed up.
-	if !o.CreateAttempted && o.Result == state.ResultOK {
+	// A maintenance cycle backs nothing up whether it succeeds or fails, so it
+	// belongs in neither direction of the per-repository backup counter: its
+	// successes would claim backups that never happened, and its failures would
+	// weigh against a backup success rate computed from this counter while
+	// duplicating what the group counter already records. A failing check is
+	// still alertable, on backup_group_runs_total, which is where the README
+	// points maintenance alerts.
+	if !o.CreateAttempted {
 		return
 	}
 
