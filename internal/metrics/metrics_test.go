@@ -966,3 +966,89 @@ func TestARemovedRepositoryStopsBeingExportedBeforeTheNextRun(t *testing.T) {
 	e.ObserveRepositories(map[string][]string{"other": {"x"}})
 	assert.Equal(t, []string{"local", "offsite"}, repos())
 }
+
+// A schedule file written before per-repository records existed has a group
+// last-success and no repositories. The scheduler honours that success and may
+// skip the group for a whole period, so without standing in for it the
+// documented join reports every upgraded group as never attempted until its
+// next backup happens to run.
+func TestALegacyRecordReportsItsGroupSuccessUntilTheNextRun(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"upgraded": {LastSuccess: now.Add(-30 * time.Minute)}, // no Repositories
+		"fresh": {Repositories: map[string]state.RepoRecord{
+			"local": {LastSuccess: now.Add(-time.Hour)},
+		}},
+	}})
+	e.now = func() time.Time { return now }
+
+	bs := models.NewBackupState()
+	bs.AddVolume("upgraded", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	bs.AddVolume("fresh", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	e.ObserveInventory(bs, nil)
+
+	rm := collect(t, reader)
+	info := findMetric(t, rm, "backup_repository_info").Data.(metricdata.Gauge[int64])
+	byGroup := map[string]string{}
+	for _, dp := range info.DataPoints {
+		byGroup[attr(dp.Attributes, "group")] = attr(dp.Attributes, "repository")
+	}
+	assert.Contains(t, byGroup, "upgraded",
+		"the join must not report an upgraded group as never attempted")
+	assert.Empty(t, byGroup["upgraded"], "with no destination attributable, which is what it knows")
+	assert.Equal(t, "local", byGroup["fresh"])
+
+	stale := findMetric(t, rm, "backup_seconds_since_last_success").Data.(metricdata.Gauge[float64])
+	var upgradedStaleness float64
+	for _, dp := range stale.DataPoints {
+		if attr(dp.Attributes, "group") == "upgraded" {
+			upgradedStaleness = dp.Value
+		}
+	}
+	assert.InDelta(t, (30 * time.Minute).Seconds(), upgradedStaleness, 2,
+		"and its freshness comes from the success it does have")
+
+	t.Run("a group that has never succeeded gets no stand-in", func(t *testing.T) {
+		e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{"new": {}}})
+		bs := models.NewBackupState()
+		bs.AddVolume("new", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+		e.ObserveInventory(bs, nil)
+		rm := collect(t, reader)
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				assert.NotEqual(t, "backup_repository_info", m.Name,
+					"nothing has been attempted, and the alert should say so")
+			}
+		}
+	})
+}
+
+// A query string may legally contain "," ";" "'" and ")", so a pattern that
+// stops at them leaves the tail of the token in the message: the log then reads
+// as redacted while carrying the secret.
+func TestTheWholeQueryIsRedactedNotJustItsFirstField(t *testing.T) {
+	for _, tc := range []struct{ name, in, secret string }{
+		{name: "comma in the query", in: `Post "https://c.example/v1?token=abc,secret": refused`, secret: "secret"},
+		{name: "semicolon", in: `Post "https://c.example/v1?a=1;token=xyz": refused`, secret: "xyz"},
+		{name: "parenthesis", in: `Post "https://c.example/v1?token=a)b": refused`, secret: "a)b"},
+		{name: "unquoted url", in: `dial https://u:pw@c.example/v1?token=abc,secret failed`, secret: "secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactURLsIn(tc.in)
+			assert.NotContains(t, got, tc.secret)
+			assert.Contains(t, got, "c.example", "the collector is still identifiable")
+		})
+	}
+
+	// The quoted form is handled first so the closing quote bounds the URL
+	// exactly. Left to the greedy pattern, the quote and everything up to the
+	// next space is swallowed into the URL and lost from the message, which
+	// takes the reason for the failure with it.
+	t.Run("a quoted url keeps the message around it intact", func(t *testing.T) {
+		got := redactURLsIn(`Post "https://c.example/v1?token=abc,secret": dial tcp: connection refused`)
+		assert.NotContains(t, got, "secret")
+		assert.Contains(t, got, `"`, "the quotes survive")
+		assert.Contains(t, got, "connection refused", "and so does the reason")
+		assert.Contains(t, got, `": dial tcp`, "the text between the URL and the reason is not eaten")
+	})
+}
