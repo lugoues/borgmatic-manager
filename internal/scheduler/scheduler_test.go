@@ -621,3 +621,50 @@ func TestDueGating_GroupFilePeriodOverride(t *testing.T) {
 		t.Fatalf("file override must make the group due at 30m, got %d calls", got)
 	}
 }
+
+// The observer feeds the metrics inventory, so when it runs decides what a
+// group's series says about a cycle it did not survive. It is invoked after
+// reconciliation and before generation and the run: a group that is discovered
+// is exported even if its backup then fails or never starts. The doc comment
+// claimed the end of the cycle, which would mean the opposite.
+func TestCycleObserverRunsAfterReconcileAndBeforeTheRun(t *testing.T) {
+	runner := newMockGroupRunner()
+	cfg := &config.ManagerConfig{Manager: config.ManagerSettings{Period: "1h"}}
+
+	bs := models.NewBackupState()
+	bs.AddVolume("test-group", models.VolumeInfo{Name: "vol1", HostPath: "/mnt/vol1"})
+
+	var order []string
+	s := NewScheduler(runner, nil, slog.Default(), cfg, nil, nil)
+	s.discoverFunc = func(context.Context) (*models.BackupState, error) {
+		order = append(order, "discover")
+		return bs, nil
+	}
+	s.generateFunc = func(st *models.BackupState) (map[string]config.GroupRunMeta, error) {
+		order = append(order, "generate")
+		return metaFor(st), nil
+	}
+	s.SetCycleObserver(func(observed *models.BackupState, _ *state.Offline) {
+		order = append(order, "observe")
+		if observed == nil {
+			t.Error("the observer must receive the merged inventory, not nil")
+		}
+	})
+
+	if err := s.RunCycle(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{"discover", "observe", "generate"}
+	if len(order) != len(want) {
+		t.Fatalf("expected %v, got %v", want, order)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, order)
+		}
+	}
+	if calls := runner.getCalls(); len(calls) != 1 {
+		t.Fatalf("expected the run to follow the observer, got %v", calls)
+	}
+}

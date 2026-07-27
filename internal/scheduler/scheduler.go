@@ -90,8 +90,11 @@ func (s *Scheduler) SetGroupCache(cache *state.GroupCache) {
 	s.cache = cache
 }
 
-// SetCycleObserver registers a callback invoked at the end of each cycle with
-// the merged inventory. Optional; nil (the default) disables it.
+// SetCycleObserver registers a callback invoked once per cycle with the merged
+// inventory, after reconciliation and before config generation and the run.
+// Observing before the run is deliberate: the inventory is what this cycle is
+// about to act on, so a group that is discovered is visible even if its backup
+// then fails or never starts. Optional; nil (the default) disables it.
 func (s *Scheduler) SetCycleObserver(f func(*models.BackupState, *state.Offline)) {
 	s.cycleObserver = f
 }
