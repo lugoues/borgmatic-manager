@@ -1813,3 +1813,51 @@ func TestFailureAttributionExpandsEnvironmentBackedPaths(t *testing.T) {
 			"expanding to nothing must not match everything")
 	})
 }
+
+// Two environment-backed repositories are the case the lone-leftover rule
+// cannot reach: two unmatched destinations and two unclaimed results is
+// ambiguous by construction, so both were recorded successful with no stats,
+// and the size, file count and duration gauges never appeared for a group whose
+// backups were all working.
+func TestTwoEnvironmentBackedRepositoriesAreBothMatched(t *testing.T) {
+	t.Setenv("BORG_REPO", "/srv/borg/primary")
+	t.Setenv("BORG_REPO_2", "/srv/borg/secondary")
+
+	res := func(loc string, files int64) createResult {
+		var r createResult
+		r.Repository.Location = loc
+		r.Archive.Stats.NFiles = files
+		return r
+	}
+
+	matched := matchResults(
+		[]config.RepoRef{{Path: "${BORG_REPO}"}, {Path: "${BORG_REPO_2}"}},
+		// Reported in the opposite order, so a positional pairing would swap them.
+		[]createResult{res("/srv/borg/secondary", 7), res("/srv/borg/primary", 42)},
+	)
+
+	require.Contains(t, matched, 0)
+	require.Contains(t, matched, 1)
+	assert.Equal(t, int64(42), matched[0].Archive.Stats.NFiles,
+		"each repository takes its own result, not whichever arrived first")
+	assert.Equal(t, int64(7), matched[1].Archive.Stats.NFiles)
+}
+
+// The safety property that made these unmatched in the first place must survive:
+// two paths that cannot be resolved are still not the same repository.
+func TestUnresolvableRepositoriesRemainDistinct(t *testing.T) {
+	res := func(loc string) createResult {
+		var r createResult
+		r.Repository.Location = loc
+		return r
+	}
+	// Neither variable is set, so neither expands to anything usable.
+	matched := matchResults(
+		[]config.RepoRef{{Path: "${NOT_SET_A}"}, {Path: "${NOT_SET_B}"}},
+		[]createResult{res("/one"), res("/two")},
+	)
+	assert.Empty(t, matched, "guessing between two unresolvable paths is worse than reporting none")
+
+	assert.Equal(t, config.UnknownRepoKey, repoIdentity("${NOT_SET_A}"))
+	assert.NotEqual(t, config.UnknownRepoKey, repoIdentity("/plain/path"))
+}

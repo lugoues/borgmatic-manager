@@ -576,6 +576,30 @@ func refID(ref config.RepoRef) string {
 	return ref.Path
 }
 
+// repoIdentity is how the runner decides that two spellings name the same
+// repository: canonicalized, and expanded through the environment first.
+//
+// borgmatic resolves ${BORG_REPO} and friends from the environment this process
+// hands it, so expanding here recovers the location borg reports. Without it, a
+// group whose repositories are all environment-backed has no identity to match
+// on: the canonical pass skips them, the lone-leftover rule cannot pair two
+// against two, and every destination is recorded successful with no stats at
+// all, so the size, file count and duration gauges never appear.
+//
+// config.CanonicalRepoKey deliberately does not expand, because it also answers
+// "which repositories must not run concurrently", where every unresolvable path
+// has to keep colliding with every other so the lock stays conservative.
+// Expanding is right for matching and wrong for locking.
+func repoIdentity(path string) string {
+	if key := config.CanonicalRepoKey(path); key != config.UnknownRepoKey {
+		return key
+	}
+	if expanded := os.ExpandEnv(path); expanded != "" && expanded != path {
+		return config.CanonicalRepoKey(expanded)
+	}
+	return config.UnknownRepoKey
+}
+
 // archiveScope is how the probe identifies this group's archives, and whether it
 // can be trusted to.
 //
@@ -665,7 +689,7 @@ func matchResults(configured []config.RepoRef, results []createResult) map[int]c
 		if _, done := out[i]; done || ref.Path == "" {
 			continue
 		}
-		key := config.CanonicalRepoKey(ref.Path)
+		key := repoIdentity(ref.Path)
 		if key == config.UnknownRepoKey {
 			continue // resolved at borgmatic runtime; nothing to compare against
 		}
@@ -673,7 +697,7 @@ func matchResults(configured []config.RepoRef, results []createResult) map[int]c
 			if claimed[j] || res.Repository.Location == "" {
 				continue
 			}
-			if config.CanonicalRepoKey(res.Repository.Location) == key {
+			if repoIdentity(res.Repository.Location) == key {
 				claim(i, j)
 				break
 			}
@@ -947,7 +971,7 @@ func repoSpellings(repoPath string) []string {
 	if expanded := os.ExpandEnv(repoPath); expanded != repoPath {
 		add(expanded)
 		add(strings.TrimRight(expanded, "/"))
-		add(config.CanonicalRepoKey(expanded))
+		add(repoIdentity(repoPath))
 	}
 	return out
 }
