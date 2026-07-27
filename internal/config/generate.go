@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 
@@ -744,18 +745,45 @@ func patternMatchesFormat(pattern string, segs []formatSegment) bool {
 	return states[len(pattern)]
 }
 
-// consume advances every state through the literal text.
+// consume advances every state through the literal text, one character at a
+// time.
+//
+// Characters, not bytes: borg matches shell patterns over characters, so "?"
+// covers a whole multi-byte rune. Walking bytes had it swallow only the first
+// third of an "é" and declare two formats disjoint that borg would not.
 func consume(pattern string, states map[int]bool, text string) map[int]bool {
 	cur := states
-	for i := 0; i < len(text) && len(cur) > 0; i++ {
-		cur = step(pattern, cur, func(b byte) bool { return b == text[i] })
+	for _, r := range text {
+		if len(cur) == 0 {
+			return cur
+		}
+		cur = stepRune(pattern, cur, r)
 	}
 	return cur
 }
 
-// step advances every state by one input byte, accepted when it satisfies both
-// the pattern element at that state and the caller's own test.
-func step(pattern string, states map[int]bool, accepts func(byte) bool) map[int]bool {
+// stepRune advances every state by one known input character.
+func stepRune(pattern string, states map[int]bool, r rune) map[int]bool {
+	return step(pattern, states, func(accepts func(rune) bool) bool { return accepts(r) })
+}
+
+// stepDigit advances every state by one decimal digit, whichever digit fits.
+// The element decides which digits it will take, which is how a year stays a
+// four-digit run even when the pattern spells it "????" or "[0-9][0-9]20".
+func stepDigit(pattern string, states map[int]bool) map[int]bool {
+	return step(pattern, states, func(accepts func(rune) bool) bool {
+		for d := '0'; d <= '9'; d++ {
+			if accepts(d) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// step advances every state by one input character. offer is given the element's
+// own test and reports whether any character the caller can supply satisfies it.
+func step(pattern string, states map[int]bool, offer func(accepts func(rune) bool) bool) map[int]bool {
 	next := map[int]bool{}
 	for state := range states {
 		if state >= len(pattern) {
@@ -765,60 +793,59 @@ func step(pattern string, states map[int]bool, accepts func(byte) bool) map[int]
 			next[state] = true // the star keeps consuming
 			continue
 		}
-		match, after := patternElement(pattern, state)
-		// A byte only advances the state when the pattern element and the
-		// caller agree on it, which is how a digit run stays a digit run even
-		// against a "?" or a character class.
-		for b := 0; b < 256; b++ {
-			if accepts(byte(b)) && match(byte(b)) {
-				next[after] = true
-				break
-			}
+		accepts, after := patternElement(pattern, state)
+		if offer(accepts) {
+			next[after] = true
 		}
 	}
 	return starClosure(pattern, next)
 }
 
-// patternElement reads the single-byte matcher at i and returns the index after
-// it.
+// patternElement reads the matcher at i and returns the index after it. The
+// returned function takes the caller's own test and reports whether any
+// character satisfies both.
 //
 // borg matches archive names as shell patterns, so a format carrying a literal
 // "?" or "[" produces a pattern that is not literal at all: "snap?app-*" claims
 // a sibling's "snapXapp-..." archives. Treating those as ordinary characters
-// here declared such a pair disjoint while borg's own retention would not.
-func patternElement(pattern string, i int) (func(byte) bool, int) {
+// declared such a pair disjoint while borg's own retention would not.
+func patternElement(pattern string, i int) (func(rune) bool, int) {
 	switch pattern[i] {
 	case '?':
-		return func(byte) bool { return true }, i + 1
+		return func(rune) bool { return true }, i + 1
 	case '[':
 		if set, after, ok := parseCharClass(pattern, i); ok {
 			return set, after
 		}
 		// An unterminated "[" is a literal bracket, as shell globbing has it.
-		return func(b byte) bool { return b == '[' }, i + 1
+		return isRune('['), i + 1
 	default:
-		c := pattern[i]
-		return func(b byte) bool { return b == c }, i + 1
+		r, width := utf8.DecodeRuneInString(pattern[i:])
+		return isRune(r), i + width
 	}
+}
+
+func isRune(want rune) func(rune) bool {
+	return func(r rune) bool { return r == want }
 }
 
 // parseCharClass reads a [...] set, honouring a leading "!" or "^" negation and
 // a-z style ranges. It reports false when the class is unterminated.
-func parseCharClass(pattern string, i int) (func(byte) bool, int, bool) {
+func parseCharClass(pattern string, i int) (func(rune) bool, int, bool) {
 	j := i + 1
 	negated := false
 	if j < len(pattern) && (pattern[j] == '!' || pattern[j] == '^') {
 		negated = true
 		j++
 	}
-	type span struct{ lo, hi byte }
+	type span struct{ lo, hi rune }
 	var spans []span
 	first := true
 	for j < len(pattern) {
 		if pattern[j] == ']' && !first {
-			set := func(b byte) bool {
+			set := func(r rune) bool {
 				for _, sp := range spans {
-					if b >= sp.lo && b <= sp.hi {
+					if r >= sp.lo && r <= sp.hi {
 						return !negated
 					}
 				}
@@ -827,16 +854,18 @@ func parseCharClass(pattern string, i int) (func(byte) bool, int, bool) {
 			return set, j + 1, true
 		}
 		first = false
-		lo := pattern[j]
+		lo, width := utf8.DecodeRuneInString(pattern[j:])
 		hi := lo
-		if j+2 < len(pattern) && pattern[j+1] == '-' && pattern[j+2] != ']' {
-			hi = pattern[j+2]
-			j += 2
+		next := j + width
+		if next < len(pattern) && pattern[next] == '-' && next+1 < len(pattern) && pattern[next+1] != ']' {
+			r, w := utf8.DecodeRuneInString(pattern[next+1:])
+			hi = r
+			next = next + 1 + w
 		}
 		if lo <= hi {
 			spans = append(spans, span{lo, hi})
 		}
-		j++
+		j = next
 	}
 	return nil, 0, false
 }
@@ -846,7 +875,7 @@ func parseCharClass(pattern string, i int) (func(byte) bool, int, bool) {
 func consumeDigits(pattern string, states map[int]bool, n int) map[int]bool {
 	cur := states
 	for i := 0; i < n && len(cur) > 0; i++ {
-		cur = step(pattern, cur, func(b byte) bool { return b >= '0' && b <= '9' })
+		cur = stepDigit(pattern, cur)
 	}
 	return cur
 }
