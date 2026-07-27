@@ -1137,3 +1137,31 @@ func TestARepointedLabelStopsExportingTheOldDestination(t *testing.T) {
 		}
 	}
 }
+
+// When the protocol came from the environment, cfg.Protocol is empty, and
+// reporting it sends an operator to a blank config field instead of the variable
+// that caused the failure.
+func TestAnInvalidEnvironmentProtocolIsNamedInTheError(t *testing.T) {
+	t.Setenv(envProtocol, "carrier-pigeon")
+	_, err := newExporter(context.Background(), config.MetricsSettings{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "carrier-pigeon", "the value that was rejected")
+	assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_PROTOCOL", "and where to change it")
+	assert.NotContains(t, err.Error(), `protocol ""`, "not a blank config field")
+
+	t.Run("a bad config value is still named", func(t *testing.T) {
+		_, err := newExporter(context.Background(), config.MetricsSettings{Protocol: "smoke-signal"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "smoke-signal")
+	})
+}
+
+// An endpoint from the environment bypasses validation entirely, so exporter
+// construction is where its credential first meets a log line.
+func TestRedactErrorText(t *testing.T) {
+	assert.Empty(t, RedactErrorText(nil))
+	got := RedactErrorText(errors.New(`parse "https://u:pw@collector/%zz?token=s3cret": invalid URL escape`))
+	assert.NotContains(t, got, "s3cret")
+	assert.NotContains(t, got, "pw")
+	assert.Contains(t, got, "invalid URL escape", "the reason survives")
+}

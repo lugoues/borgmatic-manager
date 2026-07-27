@@ -134,6 +134,15 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 // of the message's punctuation along.
 var urlInText = regexp.MustCompile(`"https?://[^"]*"|https?://\S+`)
 
+// RedactErrorText strips credentials from any URL inside an error message, for
+// callers that log an error this package returned before it reached a decorator.
+func RedactErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return redactURLsIn(err.Error())
+}
+
 // redactURLsIn strips credentials from any URL inside a message.
 //
 // The transport builds its own error text, and for an HTTP exporter that text
@@ -416,7 +425,7 @@ func (e *Emitter) observe(o metric.Observer,
 				// The id survives a repoint but the history does not belong to
 				// the new destination. Until a run reconciles the record, its
 				// stored path is what says which one these numbers describe.
-				if path != "" && rr.Path != "" && rr.Path != path {
+				if path != "" && rr.Path != "" && !state.SameDestination(rr.Path, path) {
 					continue
 				}
 			}
@@ -645,7 +654,11 @@ const (
 // empty endpoint lets the exporter fall back to OTEL_EXPORTER_OTLP_ENDPOINT and
 // then the OTLP default host and port.
 func newExporter(ctx context.Context, cfg config.MetricsSettings) (sdkmetric.Exporter, error) {
-	switch resolveProtocol(cfg.Protocol) {
+	// The resolved value, not the configured one: when the protocol came from
+	// the environment, cfg.Protocol is empty and reporting it sends an operator
+	// to a blank config field instead of the variable that caused the failure.
+	protocol := resolveProtocol(cfg.Protocol)
+	switch protocol {
 	case protocolGRPC:
 		var opts []otlpmetricgrpc.Option
 		if cfg.Endpoint != "" {
@@ -659,7 +672,8 @@ func newExporter(ctx context.Context, cfg config.MetricsSettings) (sdkmetric.Exp
 		}
 		return otlpmetrichttp.New(ctx, opts...)
 	default:
-		return nil, fmt.Errorf("unknown metrics protocol %q (want \"http\" or \"grpc\")", cfg.Protocol)
+		return nil, fmt.Errorf("unknown metrics protocol %q (want \"http\" or \"grpc\"); "+
+			"set it in metrics.protocol or in OTEL_EXPORTER_OTLP_METRICS_PROTOCOL / OTEL_EXPORTER_OTLP_PROTOCOL", protocol)
 	}
 }
 

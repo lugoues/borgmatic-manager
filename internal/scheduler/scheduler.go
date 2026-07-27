@@ -80,6 +80,9 @@ type Scheduler struct {
 	discoverFunc func(ctx context.Context) (*models.BackupState, error)
 	generateFunc func(state *models.BackupState) (map[string]config.GroupRunMeta, error)
 
+	// lastRefusals holds the most recent generation's refused groups, so their
+	// repository inventory can be observed alongside the survivors'.
+	lastRefusals []config.Refusal
 	// repoObserver, when set, receives each cycle's per-group repository ids
 	// after generation, which is the first point they are known.
 	repoObserver func(map[string]map[string]string)
@@ -125,14 +128,26 @@ func (s *Scheduler) SetRepositoryObserver(f func(map[string]map[string]string)) 
 // reconcile it. Reporting ids alone leaves the old destination's success time
 // and statistics exported under a label that now means somewhere else, for up to
 // a whole backup period.
-func RepositoryInventory(meta map[string]config.GroupRunMeta) map[string]map[string]string {
+func RepositoryInventory(meta map[string]config.GroupRunMeta, refusals ...[]config.Refusal) map[string]map[string]string {
 	out := make(map[string]map[string]string, len(meta))
-	for name, m := range meta {
-		repos := make(map[string]string, len(m.Repositories))
-		for _, ref := range m.Repositories {
+	add := func(name string, refs []config.RepoRef) {
+		repos := make(map[string]string, len(refs))
+		for _, ref := range refs {
 			repos[repoID(ref)] = resolvedRepoPath(ref)
 		}
 		out[name] = repos
+	}
+	for name, m := range meta {
+		add(name, m.Repositories)
+	}
+	// Refused groups too. Generation drops them from meta, so leaving them out
+	// makes their inventory look unknown rather than current, and a repository
+	// removed or repointed in the same edit that broke the config keeps its
+	// series exported forever: the group never runs, so nothing reconciles it.
+	for _, list := range refusals {
+		for _, r := range list {
+			add(r.Group, r.Repositories)
+		}
 	}
 	return out
 }
@@ -197,7 +212,12 @@ func NewScheduler(
 		return discovery.Discover(ctx, s.rt, s.logger)
 	}
 	s.generateFunc = func(state *models.BackupState) (map[string]config.GroupRunMeta, error) {
-		return s.generator.Generate(state)
+		meta, refusals, err := s.generator.Generate(state)
+		// Kept for the repository observer: a refused group is dropped from meta
+		// but still configures destinations, and nothing else will ever report
+		// them because it never runs.
+		s.lastRefusals = refusals
+		return meta, err
 	}
 
 	return s
@@ -436,7 +456,7 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 	}
 
 	if s.repoObserver != nil {
-		s.repoObserver(RepositoryInventory(meta))
+		s.repoObserver(RepositoryInventory(meta, s.lastRefusals))
 	}
 
 	s.RunAllGroups(ctx, backupState, meta)

@@ -116,18 +116,29 @@ func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]GroupOverride, o
 type Refusal struct {
 	Group  string
 	Reason string
+	// Repositories are the destinations the group configures, kept even though
+	// it will not run. A consumer reconciling per-repository state against the
+	// current configuration needs to know what a refused group configures: it
+	// never runs, so nothing else will ever tell it, and reading the refusal as
+	// "this group configures nothing" is as wrong as reading it as "unknown".
+	Repositories []RepoRef
 }
 
-// Generate writes a borgmatic config per group and returns scheduling metadata.
-// The output directory is reconciled: configs for removed groups are deleted.
-func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta, error) {
+// Generate writes a borgmatic config per group and returns scheduling metadata
+// along with the groups it refused. The output directory is reconciled: configs
+// for removed groups are deleted.
+//
+// The refusals are returned rather than only logged because a refused group
+// still configures repositories, and a caller reconciling per-repository state
+// has no other way to learn them: the group never runs.
+func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta, []Refusal, error) {
 	if err := os.MkdirAll(g.outputDir, 0o700); err != nil {
-		return nil, fmt.Errorf("creating output directory: %w", err)
+		return nil, nil, fmt.Errorf("creating output directory: %w", err)
 	}
 
-	entries, _, err := g.plan(state, sortedGroupNames(state), newRunID)
+	entries, refusals, err := g.plan(state, sortedGroupNames(state), newRunID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Pass 3: write the surviving configs.
@@ -136,14 +147,14 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 	for _, e := range entries {
 		yamlData, err := yaml.Marshal(e.final)
 		if err != nil {
-			return nil, fmt.Errorf("marshaling config for group %s: %w", e.name, err)
+			return nil, nil, fmt.Errorf("marshaling config for group %s: %w", e.name, err)
 		}
 		output := append([]byte(headerComment), yamlData...)
 
 		// 0600: generated configs carry credentials.
 		outPath := filepath.Join(g.outputDir, e.name+".yaml")
 		if err := writeFileAtomic(outPath, output, 0o600); err != nil {
-			return nil, fmt.Errorf("writing config for group %s: %w", e.name, err)
+			return nil, nil, fmt.Errorf("writing config for group %s: %w", e.name, err)
 		}
 
 		meta[e.name] = e.meta
@@ -151,10 +162,10 @@ func (g *Generator) Generate(state *models.BackupState) (map[string]GroupRunMeta
 	}
 
 	if err := g.reconcile(written); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return meta, nil
+	return meta, refusals, nil
 }
 
 // Plan runs generation's build and safety passes without writing anything,
@@ -321,7 +332,11 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			format, _ := e.final["archive_name_format"].(string)
 			g.logger.Error("archive_name_format must contain the literal {group} token when groups share a repository, retention for one group would otherwise prune the others' archives; skipping group",
 				"group", e.name, "archive_name_format", format)
-			refusals = append(refusals, Refusal{Group: e.name, Reason: "archive_name_format must contain the {group} token when groups share a repository"})
+			refusals = append(refusals, Refusal{
+				Group:        e.name,
+				Reason:       "archive_name_format must contain the {group} token when groups share a repository",
+				Repositories: e.meta.Repositories,
+			})
 			continue
 		}
 		kept = append(kept, e)

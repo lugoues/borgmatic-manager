@@ -696,3 +696,29 @@ func TestRepositoryInventoryCarriesDestinations(t *testing.T) {
 	assert.Empty(t, got["empty"])
 	assert.Contains(t, got, "empty", "a group that configures none is still reported")
 }
+
+// A refused group is dropped from meta but still configures destinations, and
+// nothing else will ever report them because it never runs. Leaving it out makes
+// its inventory look unknown rather than current, so a repository removed or
+// repointed in the same edit that broke the config keeps its series forever.
+func TestRepositoryInventoryIncludesRefusedGroups(t *testing.T) {
+	got := RepositoryInventory(
+		map[string]config.GroupRunMeta{
+			"good": {Repositories: []config.RepoRef{{Path: "/mnt/local", Label: "local"}}},
+		},
+		[]config.Refusal{{
+			Group:        "refused",
+			Reason:       "archive_name_format must contain the {group} token when groups share a repository",
+			Repositories: []config.RepoRef{{Path: "/mnt/shared", Label: "shared"}},
+		}},
+	)
+
+	assert.Equal(t, map[string]string{"local": "/mnt/local"}, got["good"])
+	assert.Equal(t, map[string]string{"shared": "/mnt/shared"}, got["refused"],
+		"a refused group configures destinations even though it will not run")
+
+	t.Run("no refusals is still valid", func(t *testing.T) {
+		got := RepositoryInventory(map[string]config.GroupRunMeta{"good": {}})
+		assert.Contains(t, got, "good")
+	})
+}

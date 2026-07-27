@@ -205,7 +205,15 @@ func runInspect(ctx context.Context, group string) error {
 	rec, haveRec := stateStore(e, logger).Record(group)
 	configYAML, configNote := renderGroupConfig(backupState, e, logger, group)
 
-	printInspect(group, g, rec, haveRec, configYAML, configNote, period, e.cfg.GroupPeriods[group], offline)
+	// What this group configures now, so the record's repository section is
+	// inventory rather than history. A planning failure leaves it nil, which
+	// passes the record through unfiltered.
+	var configured map[string]string
+	if planned, _, planErr := e.newGenerator(e.configsDir, logger).Plan(backupState); planErr == nil {
+		configured = scheduler.RepositoryInventory(planned)[group]
+	}
+
+	printInspect(group, g, rec, haveRec, configYAML, configNote, configured, period, e.cfg.GroupPeriods[group], offline)
 	return nil
 }
 
@@ -410,7 +418,9 @@ func enableMetrics(ctx context.Context, e *env, store *state.ScheduleStore, r *r
 	}
 	em, err := metrics.New(ctx, e.cfg.Manager.Metrics, version, store, logger)
 	if err != nil {
-		logger.Warn("metrics disabled: exporter setup failed", "error", err)
+		// The endpoint may have come from the environment, which bypasses
+		// validation entirely, so this error can carry a URL nobody redacted.
+		logger.Warn("metrics disabled: exporter setup failed", "error", metrics.RedactErrorText(err))
 		return noop, nil
 	}
 	r.SetRecorder(recorderChain{store, em})
@@ -698,7 +708,7 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	}
 	defer func() { _ = os.RemoveAll(configsDir) }()
 
-	meta, err := e.newGenerator(configsDir, logger).Generate(backupState)
+	meta, refusalsFromGen, err := e.newGenerator(configsDir, logger).Generate(backupState)
 	if err != nil {
 		return err
 	}
@@ -732,7 +742,7 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		// every group from persisted state, so without this a repository removed
 		// from a group this run never touched is exported as though it were
 		// still configured.
-		emitter.ObserveRepositories(scheduler.RepositoryInventory(meta))
+		emitter.ObserveRepositories(scheduler.RepositoryInventory(meta, refusalsFromGen))
 	}
 
 	now := time.Now()
@@ -924,7 +934,7 @@ func runGenerate(output string) error {
 	stripOfflineDatabases(backupState, offline, logger)
 
 	gen := e.newGenerator(outDir, logger)
-	meta, err := gen.Generate(backupState)
+	meta, _, err := gen.Generate(backupState)
 	if err != nil {
 		return err
 	}
@@ -975,7 +985,7 @@ func runBorgmaticPassthrough(args []string) error {
 		return err
 	}
 
-	meta, err := e.newGenerator(configsDir, logger).Generate(backupState)
+	meta, _, err := e.newGenerator(configsDir, logger).Generate(backupState)
 	if err != nil {
 		return err
 	}
@@ -1355,7 +1365,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if err != nil {
 		return err
 	}
-	if _, genErr := e.newGenerator(configsDir, logger).Generate(backupState); genErr != nil {
+	if _, _, genErr := e.newGenerator(configsDir, logger).Generate(backupState); genErr != nil {
 		return genErr
 	}
 
