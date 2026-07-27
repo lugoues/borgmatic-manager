@@ -1078,6 +1078,12 @@ func isNameByte(b byte) bool {
 		return true
 	case b == '@', b == '+', b == '=', b == '~', b == '%', b == '#', b == '^', b == '!':
 		return true
+	case b >= 0x80:
+		// A UTF-8 continuation or lead byte: part of a filename, never a
+		// delimiter a log message writes. Without this, "/mnt/repo" matched
+		// inside "/mnt/repoé" and a healthy destination was recorded as failed
+		// on the strength of an error about a different one.
+		return true
 	default:
 		return false
 	}

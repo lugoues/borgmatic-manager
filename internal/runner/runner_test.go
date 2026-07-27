@@ -1980,3 +1980,20 @@ func TestRepositorySuccessIsStampedWhenTheArchiveWasWritten(t *testing.T) {
 		assert.True(t, out[0].CompletedAt.IsZero())
 	})
 }
+
+// A UTF-8 byte is part of a filename, never a delimiter a log message writes.
+// Treating one as a boundary made "/mnt/repo" match inside "/mnt/repoé", so an
+// error about one destination recorded a healthy other one as failed and skipped
+// its confirmation.
+func TestNonASCIIBytesContinueAPathToken(t *testing.T) {
+	assert.False(t, mentionedInErrors("/mnt/repo",
+		[]string{"Error: Repository /mnt/repoé does not exist."}),
+		"an accented sibling is a different repository")
+	assert.True(t, mentionedInErrors("/mnt/repoé",
+		[]string{"Error: Repository /mnt/repoé does not exist."}))
+	assert.False(t, mentionedInErrors("/mnt/repo",
+		[]string{"Error: Repository /mnt/repo日本 does not exist."}))
+	assert.True(t, mentionedInErrors("/mnt/repo",
+		[]string{"Error: Repository /mnt/repo does not exist."}),
+		"and the plain name still matches when it is the one named")
+}
