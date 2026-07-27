@@ -332,6 +332,7 @@ manager:
 |---|---|---|---|
 | `backup_runs_total` | counter | `group`, `repository`, `result` | One increment per repository per run. A fan-out with one failed destination records both an `ok` and a `failed`. |
 | `backup_group_info` | gauge | `group` | Always 1, one per configured group. |
+| `backup_repository_info` | gauge | `group`, `repository` | Always 1, once per repository the group has attempted. Join target for staleness alerts. |
 | `backup_last_size_bytes` | gauge | `group`, `repository`, `kind` | Last successful archive size; `kind` is `original`, `compressed` or `deduplicated`. |
 | `backup_last_files` | gauge | `group`, `repository` | File count in the last successful archive. |
 | `backup_last_duration_seconds` | gauge | `group`, `repository` | Duration of the last successful backup. |
@@ -339,15 +340,28 @@ manager:
 | `backup_offline_volumes` | gauge | `group` | Volumes discovered but not currently present. |
 
 `backup_group_info` exists because every other series here appears only after a
-run. Alert on the *join*, not on a series being missing:
+run: without it a group that has never succeeded is indistinguishable from one
+that was deleted.
+
+`backup_repository_info` exists for the same reason one level down: staleness is
+only reported for a repository that has succeeded at least once. Join against
+the inventory, and join it on **`(group, repository)`**:
 
 ```promql
-# groups that exist but have no recent success, including ones that have
-# never succeeded at all
-backup_group_info == 1
-  unless on(group)
+# any destination that is stale or has never once completed
+backup_repository_info == 1
+  unless on(group, repository)
     (backup_seconds_since_last_success < 86400)
+
+# a group that has not yet attempted a backup at all, so it has no
+# repositories to join against
+backup_group_info == 1 unless on(group) backup_repository_info
 ```
+
+Joining on `group` alone is wrong for a fan-out group: one fresh repository
+satisfies the right-hand side, removes the group from the result, and reports the
+whole group healthy while a second destination is stale or has never produced an
+archive. A fan-out group is only as healthy as its worst destination.
 
 The `last_*` gauges deliberately reflect the last **successful** backup: a
 failed run carries no stats, and reporting its zeros would read as the dataset
