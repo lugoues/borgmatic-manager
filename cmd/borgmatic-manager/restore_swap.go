@@ -189,6 +189,12 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	return nil
 }
 
+// exchangeFn is the seam for the atomic exchange, so a test can present the
+// errors a filesystem would return without needing one that does.
+var exchangeFn = func(staging, targetData string) error {
+	return unix.Renameat2(unix.AT_FDCWD, staging, unix.AT_FDCWD, targetData, unix.RENAME_EXCHANGE)
+}
+
 // moveAsideFn is the seam for the fallback's first rename, so a test can look at
 // the displaced directory at the instant it exists rather than after the fact.
 // The whole point of marking before the rename is what is true in that instant.
@@ -216,17 +222,22 @@ func swapIntoPlace(staging, targetData string, logger *slog.Logger) (displaced s
 	// something an application put there. Claiming it first costs one syscall
 	// and travels with the inode through the exchange.
 	claimed := markAsOurs(targetData)
-	switch exErr := unix.Renameat2(unix.AT_FDCWD, staging, unix.AT_FDCWD, targetData, unix.RENAME_EXCHANGE); {
-	case exErr == nil:
+	exErr := exchangeFn(staging, targetData)
+	if exErr == nil {
 		// The directories traded places: the old data is now under the staging
 		// name, which is what the caller removes.
 		return staging, nil
-	case claimed:
-		// It did not happen, so the claim on the live volume means nothing and
-		// must not be left behind. Cleared on every path out of the switch that
-		// is not the exchange itself.
+	}
+	// Nothing was exchanged, so the claim on the live volume means nothing and
+	// must not be left behind. Unconditionally, before the error is classified:
+	// putting this in the switch made it the first matching case on every
+	// ordinary filesystem, which swallowed the errno test entirely and sent a
+	// genuine EIO, EACCES or EBUSY into the non-atomic two-rename window instead
+	// of returning with the volume untouched.
+	if claimed {
 		_ = removeXattr(targetData, scratchMarkerAttr)
-		fallthrough
+	}
+	switch {
 	case errors.Is(exErr, unix.ENOSYS), errors.Is(exErr, unix.EINVAL),
 		errors.Is(exErr, unix.EOPNOTSUPP), errors.Is(exErr, unix.ENOTSUP):
 		// No atomic exchange on this kernel or filesystem; use the rename pair.
@@ -611,17 +622,18 @@ func createStagingLike(model string, logger *slog.Logger) (staging string, err e
 // Defined here because golang.org/x/sys/unix exports the ioctls but not the
 // flag bits. Values are from linux/fs.h and are stable ABI.
 const (
-	fsNoCoWFlag      = 0x00800000 // FS_NOCOW_FL
-	fsCompressFlag   = 0x00000004 // FS_COMPR_FL
-	fsNoAtimeFlag    = 0x00000080 // FS_NOATIME_FL
-	fsNoDumpFlag     = 0x00000040 // FS_NODUMP_FL
-	fsSyncFlag       = 0x00000008 // FS_SYNC_FL
-	fsDirSyncFlag    = 0x00010000 // FS_DIRSYNC_FL
-	fsNoCompressFlag = 0x00000400 // FS_NOCOMP_FL
-	fsDaxFlag        = 0x02000000 // FS_DAX_FL
-	fsCasefoldFlag   = 0x40000000 // FS_CASEFOLD_FL
-	inheritableMask  = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
-		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsDaxFlag | fsCasefoldFlag
+	fsNoCoWFlag       = 0x00800000 // FS_NOCOW_FL
+	fsCompressFlag    = 0x00000004 // FS_COMPR_FL
+	fsNoAtimeFlag     = 0x00000080 // FS_NOATIME_FL
+	fsNoDumpFlag      = 0x00000040 // FS_NODUMP_FL
+	fsSyncFlag        = 0x00000008 // FS_SYNC_FL
+	fsDirSyncFlag     = 0x00010000 // FS_DIRSYNC_FL
+	fsNoCompressFlag  = 0x00000400 // FS_NOCOMP_FL
+	fsJournalDataFlag = 0x00004000 // FS_JOURNAL_DATA_FL
+	fsDaxFlag         = 0x02000000 // FS_DAX_FL
+	fsCasefoldFlag    = 0x40000000 // FS_CASEFOLD_FL
+	inheritableMask   = fsNoCoWFlag | fsCompressFlag | fsNoCompressFlag | fsNoAtimeFlag |
+		fsNoDumpFlag | fsSyncFlag | fsDirSyncFlag | fsJournalDataFlag | fsDaxFlag | fsCasefoldFlag
 )
 
 // copyInodeFlags carries the model's inheritable inode flags onto staging.

@@ -2285,15 +2285,16 @@ func TestAnUnstageableParentStillSendsAMirrorRestoreInPlace(t *testing.T) {
 // for two rounds because of exactly that.
 func TestEveryDeclaredInodeFlagIsInTheInheritableMask(t *testing.T) {
 	for name, flag := range map[string]int{
-		"FS_NOCOW_FL":    fsNoCoWFlag,
-		"FS_COMPR_FL":    fsCompressFlag,
-		"FS_NOCOMP_FL":   fsNoCompressFlag,
-		"FS_NOATIME_FL":  fsNoAtimeFlag,
-		"FS_NODUMP_FL":   fsNoDumpFlag,
-		"FS_SYNC_FL":     fsSyncFlag,
-		"FS_DIRSYNC_FL":  fsDirSyncFlag,
-		"FS_DAX_FL":      fsDaxFlag,
-		"FS_CASEFOLD_FL": fsCasefoldFlag,
+		"FS_NOCOW_FL":        fsNoCoWFlag,
+		"FS_COMPR_FL":        fsCompressFlag,
+		"FS_NOCOMP_FL":       fsNoCompressFlag,
+		"FS_NOATIME_FL":      fsNoAtimeFlag,
+		"FS_NODUMP_FL":       fsNoDumpFlag,
+		"FS_SYNC_FL":         fsSyncFlag,
+		"FS_DIRSYNC_FL":      fsDirSyncFlag,
+		"FS_DAX_FL":          fsDaxFlag,
+		"FS_JOURNAL_DATA_FL": fsJournalDataFlag,
+		"FS_CASEFOLD_FL":     fsCasefoldFlag,
 	} {
 		assert.NotZero(t, inheritableMask&flag, "%s is declared but not carried", name)
 	}
@@ -2470,4 +2471,67 @@ func TestCreateStagingLikeWarnsWhenAnInheritedLabelCannotBeCleared(t *testing.T)
 	_, err := createStagingLike(model, logger)
 	require.NoError(t, err, "a label that cannot be cleared must not fail the restore")
 	assert.Contains(t, logs.String(), "carry a label the original did not")
+}
+
+// A filesystem without an atomic exchange is one thing; a filesystem that has
+// one and failed is another. Reading every failure as the first sends a genuine
+// I/O error into the non-atomic two-rename window instead of returning with the
+// volume untouched.
+func TestSwapIntoPlaceFallsBackOnlyForAnUnsupportedExchange(t *testing.T) {
+	for name, tc := range map[string]struct {
+		exchangeErr error
+		wantFalls   bool
+	}{
+		"not implemented":     {unix.ENOSYS, true},
+		"not supported here":  {unix.EOPNOTSUPP, true},
+		"rejected as invalid": {unix.EINVAL, true},
+		"an I/O error":        {unix.EIO, false},
+		"permission denied":   {unix.EACCES, false},
+		"busy":                {unix.EBUSY, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := liveVolume(t)
+			staging, err := createStagingLike(data, quietLogger())
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
+
+			fellBack := false
+			realExchange, realMove := exchangeFn, moveAsideFn
+			exchangeFn = func(string, string) error { return tc.exchangeErr }
+			moveAsideFn = func(target, displaced string) error {
+				fellBack = true
+				return realMove(target, displaced)
+			}
+			defer func() { exchangeFn, moveAsideFn = realExchange, realMove }()
+
+			_, err = swapIntoPlace(staging, data, quietLogger())
+			assert.Equal(t, tc.wantFalls, fellBack, "whether the two-rename window was entered")
+			if tc.wantFalls {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err, "a real failure must return with the volume untouched")
+			assert.Equal(t, []string{"original.txt"}, names(t, data))
+		})
+	}
+}
+
+// A failed exchange must not leave a claim on a volume it never moved.
+func TestSwapIntoPlaceClearsItsClaimWhenTheExchangeFails(t *testing.T) {
+	data := liveVolume(t)
+	staging, err := createStagingLike(data, quietLogger())
+	require.NoError(t, err)
+	if ours, _, oErr := provablyOurs(staging); oErr == nil && !ours {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+
+	realExchange := exchangeFn
+	exchangeFn = func(string, string) error { return unix.EIO }
+	defer func() { exchangeFn = realExchange }()
+
+	_, err = swapIntoPlace(staging, data, quietLogger())
+	require.Error(t, err)
+	ours, _, err := provablyOurs(data)
+	require.NoError(t, err)
+	assert.False(t, ours, "the volume kept a claim from an exchange that never happened")
 }
