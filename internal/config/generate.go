@@ -1053,6 +1053,13 @@ func strftimeSegments(spec string) []formatSegment {
 			out = append(out, formatSegment{alts: domain})
 			continue
 		}
+		// Anything else matches anything, which reports a collision rather than
+		// missing one. That deliberately covers %b, %B, %a, %A and %p: those
+		// render text that depends on borg's LC_TIME, so under a German locale
+		// "%B" produces "Juli" and a group named "Juli" collides with a sibling
+		// that formats the month by name. Enumerating them in English declared
+		// such a pair disjoint, and deriving them from the effective locale would
+		// be guessing at another process's environment.
 		out = append(out, formatSegment{any: true})
 	}
 	flush()
@@ -1075,17 +1082,10 @@ var strftimeDomains = func() map[byte][]string {
 		}
 		return out
 	}
-	months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
-	longMonths := []string{"January", "February", "March", "April", "May", "June",
-		"July", "August", "September", "October", "November", "December"}
-	days := []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
-	longDays := []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
 	return map[byte][]string{
 		'm': pad(1, 12), 'd': pad(1, 31),
 		'H': pad(0, 23), 'I': pad(1, 12),
 		'M': pad(0, 59), 'S': pad(0, 59),
-		'b': months, 'B': longMonths, 'a': days, 'A': longDays,
-		'p': {"AM", "PM"},
 	}
 }()
 
