@@ -918,8 +918,12 @@ func TestFormatDirectiveDomains(t *testing.T) {
 	assert.Len(t, domainOf("{now:%H}"), 24)
 	assert.Len(t, domainOf("{now:%M}"), 60)
 	assert.Len(t, domainOf("{now:%S}"), 60)
-	assert.Contains(t, domainOf("{now:%b}"), "Jul")
-	assert.Contains(t, domainOf("{now:%A}"), "Wednesday")
+	// Locale-dependent directives are not enumerable from here: borg's LC_TIME
+	// decides what they render, so they match anything rather than being modelled
+	// in English only.
+	assert.Equal(t, [][]string{nil}, config.FormatAlternativesForTest("{now:%b}"))
+	assert.Equal(t, [][]string{nil}, config.FormatAlternativesForTest("{now:%A}"))
+	assert.Equal(t, [][]string{nil}, config.FormatAlternativesForTest("{now:%p}"))
 	// Years are open-ended, so they are a digit run rather than a value set: any
 	// enumeration would call two groups disjoint the moment a retained archive
 	// predates the window.
@@ -1363,4 +1367,27 @@ func TestExtractRepoRefsDistinguishesEmptyFromUnreadable(t *testing.T) {
 			assert.Len(t, refs, tc.wantRefs)
 		})
 	}
+}
+
+// Under a German locale "{now:%B}" renders "Juli", so a group named "Juli"
+// collides with a sibling that formats the month by name. Modelling those
+// directives in English only declared the two disjoint and skipped both the
+// warning and the ambiguity guard.
+func TestLocaleDependentDirectivesAreNotModelledInEnglishOnly(t *testing.T) {
+	defer config.SetSampleHostname("myhost")()
+
+	assert.True(t, config.PatternMatchesFormatForTest("Juli-*", "{now:%B}-{group}"),
+		"a month name this process cannot predict must not be ruled out")
+	assert.True(t, config.PatternMatchesFormatForTest("July-*", "{now:%B}-{group}"),
+		"nor the English one")
+	assert.True(t, config.PatternMatchesFormatForTest("Mi-*", "{now:%a}-{group}"))
+
+	// Numeric directives stay exact, so this does not blunt the whole model.
+	assert.True(t, config.PatternMatchesFormatForTest("x-07-*", "x-{now:%m}-prod-{now}"))
+	assert.False(t, config.PatternMatchesFormatForTest("x-13-*", "x-{now:%m}-prod-{now}"))
+
+	// And through the collision decision.
+	assert.True(t, config.PatternsCollideForTest(
+		"Juli-*", "{group}-{now}",
+		"*-other", "{now:%B}-{group}"))
 }
