@@ -1326,3 +1326,39 @@ func TestAnAbsolutePathIsLocalWhateverPunctuationItHolds(t *testing.T) {
 		assert.Equal(t, "borg@host:/srv/repo", config.CanonicalRepoKey("borg@host:/srv/repo"))
 	})
 }
+
+// A malformed repositories value yields no refs for the same reason an empty
+// list does. Confusing the two makes the reconciliation delete every persisted
+// record for a group whose operator was mid-edit.
+func TestExtractRepoRefsDistinguishesEmptyFromUnreadable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		value      interface{}
+		present    bool
+		wantRefs   int
+		understood bool
+	}{
+		{name: "absent", present: false, understood: true},
+		{name: "empty list", value: []interface{}{}, present: true, understood: true},
+		{name: "paths", value: []interface{}{"/mnt/a", "/mnt/b"}, present: true, wantRefs: 2, understood: true},
+		{name: "mappings", present: true, wantRefs: 1, understood: true,
+			value: []interface{}{map[string]interface{}{"path": "/mnt/a", "label": "local"}}},
+		{name: "a scalar where a list belongs", value: "/mnt/a", present: true, understood: false},
+		{name: "a mapping with no path", present: true, understood: false,
+			value: []interface{}{map[string]interface{}{"label": "local"}}},
+		{name: "a path of the wrong type", present: true, understood: false,
+			value: []interface{}{map[string]interface{}{"path": 42}}},
+		{name: "an empty string entry", value: []interface{}{""}, present: true, understood: false},
+		{name: "an entry of an unknown shape", value: []interface{}{42}, present: true, understood: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			final := map[string]interface{}{}
+			if tc.present {
+				final["repositories"] = tc.value
+			}
+			refs, understood := config.ExtractRepoRefsForTest(final)
+			assert.Equal(t, tc.understood, understood)
+			assert.Len(t, refs, tc.wantRefs)
+		})
+	}
+}

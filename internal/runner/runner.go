@@ -250,7 +250,7 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	configPath := filepath.Join(r.configDir, groupName+".yaml")
 	runID := meta.RunID
 
-	if err := r.validateConfig(ctx, groupName, configPath, meta.Repositories); err != nil {
+	if err := r.validateConfig(ctx, groupName, configPath, meta.Repositories, meta.RepositoriesKnown); err != nil {
 		return err
 	}
 
@@ -340,7 +340,7 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	waitErr := cmd.Wait()
 	close(done)
 
-	return r.interpretResult(ctx, groupName, configPath, meta.Repositories,
+	return r.interpretResult(ctx, groupName, configPath, meta.Repositories, meta.RepositoriesKnown,
 		newArchiveScope(meta),
 		waitErr, run, start, time.Since(start), timedOut.Load())
 }
@@ -352,7 +352,7 @@ const defaultValidateTimeout = 2 * time.Minute
 
 // validateConfig gates each cycle on 'borgmatic config validate', turning schema
 // drift into a precise, recorded failure instead of a broken backup run.
-func (r *Runner) validateConfig(ctx context.Context, groupName, configPath string, repos []config.RepoRef) error {
+func (r *Runner) validateConfig(ctx context.Context, groupName, configPath string, repos []config.RepoRef, known bool) error {
 	cmd := r.execCommand(ctx, r.borgmaticPath, "--config", configPath, "config", "validate")
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -398,14 +398,14 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 	// not run, rather than as config-invalid, which sends an operator to look for
 	// a schema error that may not exist.
 	if timedOut {
-		r.recordValidationTimeout(groupName, repos)
+		r.recordValidationTimeout(groupName, repos, known)
 		return fmt.Errorf("config validation for group %s timed out after %s", groupName, r.validateTimeout)
 	}
 
 	if err != nil {
 		r.logger.Error("generated config failed borgmatic validation; skipping group this cycle",
 			"group", groupName, "config", configPath, "output", strings.TrimSpace(out.String()))
-		r.recordValidationFailure(groupName, repos)
+		r.recordValidationFailure(groupName, repos, known)
 		return fmt.Errorf("config validation failed for group %s", groupName)
 	}
 	return nil
@@ -435,7 +435,7 @@ func (r *Runner) terminateGroup(cmd *exec.Cmd, exited <-chan struct{}, groupName
 // recordValidationTimeout records a validation the manager killed. The group did
 // not run and its config was never judged, so per-repository state is left
 // untouched: an unfinished validation confirms nothing about any destination.
-func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRef) {
+func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRef, known bool) {
 	if r.recorder == nil {
 		return
 	}
@@ -446,7 +446,7 @@ func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRe
 		// says nothing about that. Without it the run drops out of the
 		// per-repository counter as though it were a maintenance cycle.
 		CreateAttempted:   r.actionsInclude(actionCreate),
-		RepositoriesKnown: true,
+		RepositoriesKnown: known,
 	}
 	for _, ref := range repos {
 		id := refID(ref)
@@ -461,15 +461,18 @@ func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRe
 	r.recorder.RecordRun(groupName, outcome)
 }
 
-func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRef) {
+func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRef, known bool) {
 	if r.recorder == nil {
 		return
 	}
 	outcome := state.RunOutcome{
-		Finished:          time.Now(),
-		Result:            "config-invalid",
-		CreateAttempted:   r.actionsInclude(actionCreate),
-		RepositoriesKnown: true,
+		Finished:        time.Now(),
+		Result:          "config-invalid",
+		CreateAttempted: r.actionsInclude(actionCreate),
+		// Only when the list was understood. A config rejected because its
+		// repositories value is malformed must not be read as configuring none,
+		// or the reconciliation deletes every record the group had.
+		RepositoriesKnown: known,
 	}
 	for _, ref := range repos {
 		id := refID(ref)
@@ -486,7 +489,7 @@ func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRe
 
 // interpretResult turns exit state into logs and an error. borgmatic exits 0
 // even with warnings (output-only), 1 on error, 143 on SIGTERM.
-func (r *Runner) interpretResult(ctx context.Context, groupName, configPath string, repos []config.RepoRef, scope archiveScope, waitErr error, run *runState, start time.Time, duration time.Duration, timedOut bool) error {
+func (r *Runner) interpretResult(ctx context.Context, groupName, configPath string, repos []config.RepoRef, reposKnown bool, scope archiveScope, waitErr error, run *runState, start time.Time, duration time.Duration, timedOut bool) error {
 	warnings := run.warnings.Load()
 	exitCode := 0
 	if waitErr != nil {
@@ -529,7 +532,7 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 		}
 		outcome.Repositories = repoOutcomes
 		outcome.CreateAttempted = r.actionsInclude(actionCreate)
-		outcome.RepositoriesKnown = true
+		outcome.RepositoriesKnown = reposKnown
 		for _, ref := range repos {
 			id := refID(ref)
 			outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, id)

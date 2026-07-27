@@ -52,3 +52,9 @@ func SetSampleHostname(name string) func() {
 	sampleHostname = func() string { return name }
 	return func() { sampleHostname = prev }
 }
+
+// ExtractRepoRefsForTest exposes the repository extraction so the difference
+// between an empty list and an unreadable one can be stated directly.
+func ExtractRepoRefsForTest(final map[string]interface{}) ([]RepoRef, bool) {
+	return extractRepoRefs(final)
+}

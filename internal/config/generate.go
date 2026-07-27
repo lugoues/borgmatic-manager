@@ -66,6 +66,10 @@ type GroupRunMeta struct {
 	// probe is unaffected: nothing else writes to it, so an archive found there
 	// is this group's.
 	AmbiguousRepos []string
+	// RepositoriesKnown records that the repository list was understood in full,
+	// as opposed to being absent, malformed, or holding an entry this code could
+	// not read. An empty Repositories means nothing on its own.
+	RepositoriesKnown bool
 	// ArchivePattern matches the archive names this group's config produces,
 	// with borg's date placeholders replaced by wildcards. Groups are allowed to
 	// share a repository, so "the newest archive here" is not the same question
@@ -290,17 +294,19 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		archivePattern := archiveMatchPattern(final["archive_name_format"].(string))
 
 		snapshotHooks := hasSnapshotHooks(final)
+		repoRefs, repositoriesUnderstood := extractRepoRefs(final)
 
 		entries = append(entries, &pending{
 			name:       groupName,
 			final:      final,
 			groupToken: hasGroupToken,
 			meta: GroupRunMeta{
-				Repos:          extractRepoKeys(final),
-				Repositories:   extractRepoRefs(final),
-				SnapshotHooks:  snapshotHooks,
-				ArchivePattern: archivePattern,
-				RunID:          runID,
+				Repos:             extractRepoKeys(final),
+				Repositories:      repoRefs,
+				RepositoriesKnown: repositoriesUnderstood,
+				SnapshotHooks:     snapshotHooks,
+				ArchivePattern:    archivePattern,
+				RunID:             runID,
 			},
 		})
 	}
@@ -1151,28 +1157,44 @@ func extractRepoKeys(final map[string]interface{}) []string {
 
 // extractRepoRefs returns the configured repositories with their labels, in
 // config order, for per-repository outcome attribution.
-func extractRepoRefs(final map[string]interface{}) []RepoRef {
-	repos, ok := final["repositories"].([]interface{})
-	if !ok {
-		return nil
+// extractRepoRefs returns the configured repositories and whether the list was
+// understood in full.
+//
+// The second value is not "did we find any". A malformed value, a scalar where a
+// list belongs or an entry whose path is the wrong type, yields no refs for the
+// same reason an empty list does, and the two must not be confused: reading a
+// malformed config as "this group configures nothing" makes the reconciliation
+// delete every persisted repository record, including last-success times, for a
+// group whose operator was in the middle of configuring a repository.
+func extractRepoRefs(final map[string]interface{}) (refs []RepoRef, understood bool) {
+	raw, present := final["repositories"]
+	if !present {
+		return nil, true // no repositories configured is a thing a config can say
 	}
-	refs := make([]RepoRef, 0, len(repos))
+	repos, ok := raw.([]interface{})
+	if !ok {
+		return nil, false
+	}
+	refs = make([]RepoRef, 0, len(repos))
 	for _, r := range repos {
 		switch v := r.(type) {
 		case string:
-			if v != "" {
-				refs = append(refs, RepoRef{Path: v})
+			if v == "" {
+				return nil, false
 			}
+			refs = append(refs, RepoRef{Path: v})
 		case map[string]interface{}:
-			path, _ := v["path"].(string)
-			if path == "" {
-				continue
+			path, isString := v["path"].(string)
+			if !isString || path == "" {
+				return nil, false
 			}
 			label, _ := v["label"].(string)
 			refs = append(refs, RepoRef{Path: path, Label: label})
+		default:
+			return nil, false
 		}
 	}
-	return refs
+	return refs, true
 }
 
 // UnknownRepoKey is the lock key for a repository path the manager cannot
