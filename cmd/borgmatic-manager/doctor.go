@@ -251,7 +251,7 @@ func (r *doctorReport) checkGenerate(ctx context.Context, e *env, backupState *m
 	for _, refusal := range refusals {
 		r.warn("generate", fmt.Sprintf("group %s refused: %s", refusal.Group, refusal.Reason))
 	}
-	if _, err = gen.Generate(backupState); err != nil {
+	if _, _, err = gen.Generate(backupState); err != nil {
 		r.fail("generate", err.Error())
 		return
 	}

@@ -141,7 +141,7 @@ func currentRepositories(persisted map[string]state.RepoRecord, configured map[s
 		if !stillConfigured {
 			continue
 		}
-		if path != "" && rr.Path != "" && rr.Path != path {
+		if path != "" && rr.Path != "" && !state.SameDestination(rr.Path, path) {
 			continue // the id survived a repoint; this history is the old destination's
 		}
 		out[id] = rr

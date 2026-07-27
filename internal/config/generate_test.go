@@ -54,7 +54,7 @@ func TestGenerateBasic(t *testing.T) {
 	state.AddVolume("web", models.VolumeInfo{Name: "web_assets", HostPath: "/var/lib/docker/volumes/web_assets/_data"})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "web")
@@ -77,7 +77,7 @@ func TestGenerateSnapshotGroupsUsePlainPaths(t *testing.T) {
 	}
 
 	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "app")
@@ -91,7 +91,7 @@ func TestGenerateVolumeNameNotInPathFallsBack(t *testing.T) {
 	state.AddVolume("app", models.VolumeInfo{Name: "oddvol", HostPath: "/mnt/somewhere/else"})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "app")
@@ -108,7 +108,7 @@ func TestGeneratePinsRuntimeAndStateDirs(t *testing.T) {
 		RuntimeDir: "/run/borgmatic-manager",
 		StateDir:   "/var/lib/borgmatic-manager",
 	})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "app")
@@ -121,7 +121,7 @@ func TestGenerateFilePermissions(t *testing.T) {
 	state.AddVolume("app", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	info, err := os.Stat(filepath.Join(outDir, "app.yaml"))
@@ -135,7 +135,7 @@ func TestGenerateArchiveNameFormat(t *testing.T) {
 	state.AddVolume("myapp", models.VolumeInfo{Name: "app_vol", HostPath: "/mnt/app"})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "myapp")
@@ -155,7 +155,7 @@ func TestGenerateHelperModeDatabases(t *testing.T) {
 		RuntimeDir:   "/run/borgmatic-manager",
 		ContainerCLI: "docker",
 	})
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	runID := meta["db-group"].RunID
@@ -184,7 +184,7 @@ func TestGenerateHelperModeDatabases(t *testing.T) {
 
 	// A fresh generation mints a fresh id: reaping one run's orphans can
 	// never touch another run's helpers.
-	meta2, err := g.Generate(state)
+	meta2, _, err := g.Generate(state)
 	require.NoError(t, err)
 	assert.NotEqual(t, runID, meta2["db-group"].RunID)
 }
@@ -199,7 +199,7 @@ func TestGenerateHelperModeUsesPodmanCLI(t *testing.T) {
 		RuntimeDir:   "/run/borgmatic-manager",
 		ContainerCLI: "podman",
 	})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "g")
@@ -215,7 +215,7 @@ func TestGenerateExecModePostgres(t *testing.T) {
 	})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{ContainerCLI: "docker"})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "g")
@@ -231,7 +231,7 @@ func TestGenerateHostnameModeSkipsHelper(t *testing.T) {
 	})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{ContainerCLI: "docker"})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "db-group")
@@ -259,7 +259,7 @@ func TestGenerateLabelConfigMergesOverGroupFiles(t *testing.T) {
 	}
 
 	g, outDir := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "app")
@@ -276,7 +276,7 @@ func TestGenerateSQLiteDatabases(t *testing.T) {
 	})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "app")
@@ -302,7 +302,7 @@ func TestGenerateWarnsOnMissingHostClient(t *testing.T) {
 		return "", os.ErrNotExist
 	})
 
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 	assert.Contains(t, buf.String(), "pg_dump")
 	assert.Contains(t, buf.String(), "not found on PATH")
@@ -330,7 +330,7 @@ func TestGenerateRunMeta(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	require.Contains(t, meta, "alpha")
@@ -354,7 +354,7 @@ func TestGenerateRunMetaEnvPlaceholderSerializes(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"unknown"}, meta["app"].Repos,
 		"unresolvable repo paths must collapse to one conservative lock key")
@@ -374,7 +374,7 @@ func TestGenerateReconcilesStaleConfigs(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(outDir, "operator.yaml"), []byte("keep: me\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(outDir, "notes.txt"), []byte("keep"), 0o600))
 
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	_, err = os.Stat(filepath.Join(outDir, "current.yaml"))
@@ -407,7 +407,7 @@ func TestGenerateDeepMerge(t *testing.T) {
 	}
 
 	g, outDir := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "app")
@@ -424,7 +424,7 @@ func TestGenerateHeader(t *testing.T) {
 	state.AddVolume("test", models.VolumeInfo{Name: "vol", HostPath: "/mnt/vol"})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	data, err := os.ReadFile(filepath.Join(outDir, "test.yaml"))
@@ -441,7 +441,7 @@ func TestGenerateMultipleGroups(t *testing.T) {
 	state.AddVolume("beta", models.VolumeInfo{Name: "b_vol", HostPath: "/mnt/b"})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	_, err = os.Stat(filepath.Join(outDir, "alpha.yaml"))
@@ -456,7 +456,7 @@ func TestGenerateOmitempty(t *testing.T) {
 	state.AddVolume("minimal", models.VolumeInfo{Name: "vol", HostPath: "/mnt/vol"})
 
 	g, outDir := newTestGenerator(t, emptyConfig(), nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	data, err := os.ReadFile(filepath.Join(outDir, "minimal.yaml"))
@@ -482,7 +482,7 @@ func TestGenerateCustomArchiveFormatWithGroupToken(t *testing.T) {
 	}
 
 	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	_, err := g.Generate(state)
+	_, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	parsed := readGenerated(t, outDir, "home-assistant")
@@ -502,7 +502,7 @@ func TestGenerateCustomFormatWithoutGroupAllowedOnExclusiveRepo(t *testing.T) {
 	}
 
 	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	require.Contains(t, meta, "solo", "an exclusive repository permits any format")
@@ -528,7 +528,7 @@ func TestGenerateCustomFormatWithoutGroupRefusedOnSharedRepo(t *testing.T) {
 	g := config.NewGenerator(cfg, nil, outDir, config.GeneratorOptions{}, logger)
 	g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
 
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	assert.Empty(t, meta, "groups sharing a repo with an indistinguishable format must be refused")
@@ -560,7 +560,7 @@ func TestGenerateSubstringGroupNameRefusedOnSharedRepo(t *testing.T) {
 	g := config.NewGenerator(cfg, nil, outDir, config.GeneratorOptions{}, logger)
 	g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
 
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	assert.Empty(t, meta, "a format merely containing the group names as substrings must be refused, not accepted")
@@ -638,7 +638,7 @@ func TestGenerateGroupTokenAllowedOnSharedRepo(t *testing.T) {
 	}
 
 	g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	require.Contains(t, meta, "app")
@@ -664,7 +664,7 @@ func TestGeneratePrefixGroupNamesWarnOnSharedRepo(t *testing.T) {
 	g := config.NewGenerator(cfg, nil, t.TempDir(), config.GeneratorOptions{}, logger)
 	g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
 
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	assert.Len(t, meta, 2, "prefix collisions warn, they do not refuse")
@@ -707,7 +707,7 @@ func TestPlanAndRenderGroupDoNotMintRealRunIDs(t *testing.T) {
 	assert.Equal(t, rendered, rendered2, "rendering twice gives the same config")
 
 	// Generate still mints a real one: reaping depends on it.
-	gen, err := g.Generate(state)
+	gen, _, err := g.Generate(state)
 	require.NoError(t, err)
 	assert.NotEqual(t, config.PlaceholderRunID, gen["db-group"].RunID)
 	assert.Regexp(t, `^[0-9a-f]{16}$`, gen["db-group"].RunID)
@@ -725,7 +725,7 @@ func TestGenerateExtractsRepositoryRefsWithLabels(t *testing.T) {
 		},
 	}}
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	refs := meta["app"].Repositories
@@ -775,7 +775,7 @@ func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, err := g.Generate(state)
+	meta, _, err := g.Generate(state)
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, meta["app"].AmbiguousRepos,
@@ -808,7 +808,7 @@ func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
 			"archive_name_format": format,
 		}}
 		g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-		meta, err := g.Generate(st)
+		meta, _, err := g.Generate(st)
 		require.NoError(t, err)
 		return meta
 	}
@@ -969,7 +969,7 @@ func TestAHostnameCanCreateACollision(t *testing.T) {
 	}}
 
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, err := g.Generate(st)
+	meta, _, err := g.Generate(st)
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, meta["app"].AmbiguousRepos,
@@ -989,7 +989,7 @@ func TestAnOrdinaryHostnameLeavesGroupsDistinguishable(t *testing.T) {
 	}}
 
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, err := g.Generate(st)
+	meta, _, err := g.Generate(st)
 	require.NoError(t, err)
 
 	assert.Empty(t, meta["app"].AmbiguousRepos)
@@ -1018,7 +1018,7 @@ func TestAmbiguityNamesOnlyTheSharedRepository(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	meta, err := g.Generate(st)
+	meta, _, err := g.Generate(st)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{config.CanonicalRepoKey("/mnt/shared")}, meta["app"].AmbiguousRepos,
@@ -1051,7 +1051,7 @@ func TestARefusedGroupDoesNotMakeASurvivorAmbiguous(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	meta, err := g.Generate(st)
+	meta, _, err := g.Generate(st)
 	require.NoError(t, err)
 
 	require.NotContains(t, meta, "bad", "the group without the token is refused")
@@ -1078,7 +1078,7 @@ func TestAGroupNamedLikeADateCollidesWithAFormattedTimestamp(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	meta, err := g.Generate(st)
+	meta, _, err := g.Generate(st)
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, meta["07"].AmbiguousRepos,
@@ -1278,4 +1278,31 @@ func TestAFormatStartingWithAPatternSelectorStillModelsAsAGlob(t *testing.T) {
 	assert.True(t, config.PatternMatchesFormatForTest("re:.*app-*", "re:.*app-{now}"))
 	assert.False(t, config.PatternMatchesFormatForTest("re:.*app-*", "re:XYapp-{now}"),
 		`the "." is a literal dot here, not a regex wildcard`)
+}
+
+// A refused group's repositories travel with the refusal, because the group
+// never runs and nothing else will ever report what it configures.
+func TestARefusalCarriesTheGroupsRepositories(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("good", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("bad", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared", "label": "shared"}},
+	}}
+	overrides := map[string]map[string]interface{}{
+		"bad": {"archive_name_format": "{hostname}-fixed-{now}"},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	_, refusals, err := g.Generate(st)
+	require.NoError(t, err)
+
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "bad", refusals[0].Group)
+	require.Len(t, refusals[0].Repositories, 1)
+	assert.Equal(t, "shared", refusals[0].Repositories[0].Label)
+	assert.Equal(t, "/mnt/shared", refusals[0].Repositories[0].Path)
 }

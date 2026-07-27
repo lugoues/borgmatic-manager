@@ -599,7 +599,7 @@ func indentBlock(s string) string {
 
 // printInspect renders a detailed view of one group. configYAML is the compiled
 // config, or configNote explains why it is unavailable.
-func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord, haveRec bool, configYAML, configNote string, period, filePeriod time.Duration, off *state.Offline) {
+func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord, haveRec bool, configYAML, configNote string, configured map[string]string, period, filePeriod time.Duration, off *state.Offline) {
 	defer fmt.Println()
 	now := time.Now()
 	fmt.Println()
@@ -660,10 +660,14 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	// A fan-out to several repositories tracks each destination's freshness
 	// separately: one can fail (or its host go offline) while the others keep
 	// backing up, so a single group-level result would hide a dead destination.
-	if len(rec.Repositories) > 1 {
+	// Filtered against what the group configures now, for the same reason status
+	// is: repository settings do not enter the scheduler fingerprint, so a group
+	// that is not due keeps a removed or repointed destination in its record
+	// until it next runs, and this view would present that history as inventory.
+	if repos := currentRepositories(rec.Repositories, configured); len(repos) > 1 {
 		section("Repositories")
 		fmt.Println()
-		printRepoRows(rec.Repositories, now)
+		printRepoRows(repos, now)
 	}
 
 	// Two axes: "total" is each archive's full logical size, "new" is the data

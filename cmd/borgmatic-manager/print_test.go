@@ -130,7 +130,7 @@ func TestInspectShowsPerRepositoryBreakdown(t *testing.T) {
 	rec, _ := store.Record("demo")
 
 	out := captureStdout(t, func() {
-		printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil)
+		printInspect("demo", group, rec, true, "", "none", nil, time.Hour, 0, nil)
 	})
 
 	assert.Contains(t, out, "Repositories", "the per-destination section renders for a fan-out")
@@ -342,7 +342,7 @@ func TestInspectRendersSectionsAndTrend(t *testing.T) {
 	require.True(t, ok)
 
 	out := captureStdout(t, func() {
-		printInspect("demo", group, rec, true, "source_directories:\n  - /mnt/demo\n", "", time.Hour, 0, nil)
+		printInspect("demo", group, rec, true, "source_directories:\n  - /mnt/demo\n", "", nil, time.Hour, 0, nil)
 	})
 
 	for _, want := range []string{"Inspect demo", "Members", "Schedule", "Last run", "Size trend", "Recent runs", "Last run log", "Config"} {
@@ -402,7 +402,7 @@ func TestInspectOmitsChurnLineWithoutDedupStats(t *testing.T) {
 	rec, ok := store.Record("demo")
 	require.True(t, ok)
 
-	out := captureStdout(t, func() { printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil) })
+	out := captureStdout(t, func() { printInspect("demo", group, rec, true, "", "none", nil, time.Hour, 0, nil) })
 
 	assert.Contains(t, out, "Size trend", "the total series still renders")
 	assert.NotContains(t, out, "peak", "but the churn line is omitted without dedup stats")
@@ -425,7 +425,7 @@ func TestDiscoverAndInspectAgreeOnMemberDetail(t *testing.T) {
 
 	discover := captureStdout(t, func() { printGroups(bs, store, nil) })
 	inspect := captureStdout(t, func() {
-		printInspect("demo", group, state.GroupRecord{}, false, "", "none", time.Hour, 0, nil)
+		printInspect("demo", group, state.GroupRecord{}, false, "", "none", nil, time.Hour, 0, nil)
 	})
 
 	for _, want := range []string{"/data/app.db", "hostname=db.internal port=5432", "container=pg"} {
@@ -442,7 +442,7 @@ func TestInspectHandlesNoHistory(t *testing.T) {
 	// A never-run group: no record. Must render without panicking, and note
 	// the config is unavailable.
 	out := captureStdout(t, func() {
-		printInspect("demo", group, state.GroupRecord{}, false, "", "no config generated for this group", time.Hour, 0, nil)
+		printInspect("demo", group, state.GroupRecord{}, false, "", "no config generated for this group", nil, time.Hour, 0, nil)
 	})
 
 	assert.Contains(t, out, "Inspect demo")
@@ -600,7 +600,7 @@ func TestInspectShowsTheLastMeasuredSizeAfterAFailure(t *testing.T) {
 	rec, _ := store.Record("demo")
 
 	out := captureStdout(t, func() {
-		printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil)
+		printInspect("demo", group, rec, true, "", "none", nil, time.Hour, 0, nil)
 	})
 
 	assert.Contains(t, out, "1234 files",
@@ -675,7 +675,7 @@ func TestInspectRendersAMeasuredEmptyArchive(t *testing.T) {
 	rec, _ := store.Record("demo")
 
 	out := captureStdout(t, func() {
-		printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil)
+		printInspect("demo", group, rec, true, "", "none", nil, time.Hour, 0, nil)
 	})
 
 	assert.Contains(t, out, "0 files", "an archive measured as empty reports zero, not nothing")
@@ -724,5 +724,46 @@ func TestStatusJSONReportsTheCurrentRepositoriesNotThePersistedOnes(t *testing.T
 		doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, nil, nil, time.Now())
 		assert.Len(t, doc.Groups[0].Repositories, 2,
 			"silence is not a report that the group configures nothing")
+	})
+}
+
+// inspect reads the same record status does, so it needs the same filtering:
+// repository settings do not enter the scheduler fingerprint, and a group that
+// is not due keeps a removed destination in its record until it next runs.
+func TestInspectShowsOnlyTheCurrentRepositories(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	group := bs.Groups["demo"]
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		RepositoriesKnown:      true,
+		ConfiguredRepositories: []string{"local", "offsite", "archive"},
+		ConfiguredRepositoryPaths: map[string]string{
+			"local": "/mnt/local", "offsite": "/mnt/offsite", "archive": "/mnt/archive",
+		},
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Path: "/mnt/local", Result: state.ResultOK, Files: 11, Measured: true},
+			{ID: "offsite", Path: "/mnt/offsite", Result: state.ResultOK, Files: 22, Measured: true},
+			{ID: "archive", Path: "/mnt/archive", Result: state.ResultOK, Files: 33, Measured: true},
+		},
+	})
+	rec, _ := store.Record("demo")
+
+	configured := map[string]string{"local": "/mnt/local", "offsite": "/mnt/offsite"}
+	out := captureStdout(t, func() {
+		printInspect("demo", group, rec, true, "", "none", configured, time.Hour, 0, nil)
+	})
+
+	assert.Contains(t, out, "local")
+	assert.Contains(t, out, "offsite")
+	assert.NotContains(t, out, "archive",
+		"a destination the group no longer configures is history, not inventory")
+
+	t.Run("an unknown inventory shows the record as it stands", func(t *testing.T) {
+		out := captureStdout(t, func() {
+			printInspect("demo", group, rec, true, "", "none", nil, time.Hour, 0, nil)
+		})
+		assert.Contains(t, out, "archive", "silence is not a report that it was removed")
 	})
 }
