@@ -24,10 +24,24 @@ import (
 )
 
 // actionCreate is the borgmatic action that produces a --json result.
-// defaultActions include prune/compact/check: create alone would never prune.
-const actionCreate = "create"
+// actionsInclude reports whether this runner's configured action set contains
+// the named borgmatic action.
+func (r *Runner) actionsInclude(name string) bool {
+	for _, a := range r.actions {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
 
-var defaultActions = []string{actionCreate, "prune", "compact", "check"}
+// defaultActions include prune/compact/check: create alone would never prune.
+const (
+	actionCreate = "create"
+	actionPrune  = "prune"
+)
+
+var defaultActions = []string{actionCreate, actionPrune, "compact", "check"}
 
 // defaultKillGrace is the SIGTERM-to-SIGKILL grace after a run timeout fires.
 const defaultKillGrace = 60 * time.Second
@@ -448,12 +462,15 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 			outcome.DeduplicatedBytes = rep.Archive.Stats.DeduplicatedSize
 		}
 		outcome.Repositories = repoOutcomes
+		for _, ref := range repos {
+			outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
+		}
 		r.recorder.RecordRun(groupName, outcome)
 	}
 
 	switch {
 	case exitCode == 0:
-		record(state.ResultOK, perRepoSuccess(repos, results))
+		record(state.ResultOK, r.perRepoSuccess(repos, results))
 		r.logger.Info("borgmatic finished", "group", groupName, "exit_code", exitCode,
 			"warnings", warnings, "duration", duration.Round(time.Second).String())
 		return nil
@@ -510,8 +527,9 @@ type runState struct {
 	// errText accumulates full CRITICAL/ERROR message bodies (untruncated, bounded
 	// count) so per-repository failure attribution can find which destination a
 	// failure names. Guarded.
-	errTextMu sync.Mutex
-	errText   []string
+	errTextMu    sync.Mutex
+	errText      []string
+	errTextBytes int
 
 	// logTail is a bounded, oldest-first tail of log lines for inspect; guarded.
 	logMu   sync.Mutex
@@ -571,8 +589,16 @@ func applyStats(ro *state.RepoOutcome, res createResult) {
 // perRepoSuccess builds per-repository outcomes for a fully-successful group
 // run: every configured repository backed up. Those with a create result carry
 // its stats; a repo without one (a prune/check-only cycle) is still ok, sans stats.
-func perRepoSuccess(configured []config.RepoRef, results []createResult) []state.RepoOutcome {
+func (r *Runner) perRepoSuccess(configured []config.RepoRef, results []createResult) []state.RepoOutcome {
 	if len(configured) == 0 {
+		return nil
+	}
+	// A maintenance-only cycle (prune/compact/check with no create) exits zero
+	// without writing an archive anywhere. Recording that as a per-repository
+	// success would advance every repository's last-success, reset its staleness
+	// gauge and count an ok backup, so a manager configured that way would look
+	// permanently healthy while never backing anything up.
+	if !r.actionsInclude(actionCreate) {
 		return nil
 	}
 	byKey := indexResults(results)
@@ -705,10 +731,6 @@ const borgmaticListAction = "list"
 // destination must not stall the failure path.
 const probeTimeout = 60 * time.Second
 
-// probeSkew tolerates clock resolution between the manager's run-start stamp and
-// borg's recorded archive time.
-const probeSkew = 5 * time.Second
-
 // confirmRepoSucceeded reports whether repoPath holds an archive created at or
 // after runStart, the definitive per-repository success signal when create
 // --json is suppressed by a group failure. Any uncertainty (shutdown in
@@ -795,7 +817,13 @@ func newestArchiveAtOrAfter(raw []byte, runStart time.Time) bool {
 	if err := json.Unmarshal(raw, &results); err != nil {
 		return false
 	}
-	cutoff := runStart.Add(-probeSkew)
+	// Truncated rather than widened. borg reports whole-second timestamps, so
+	// an archive written in the same second as the run's start can legitimately
+	// read as marginally earlier; a five-second window went much further and
+	// accepted archives written *before* the run, which a manual retry or an
+	// event-triggered cycle on a small dataset reaches easily. That credited a
+	// failed run with a previous run's archive.
+	cutoff := runStart.Truncate(time.Second)
 	for _, res := range results {
 		for _, a := range res.Archives {
 			ts := a.Start
@@ -895,6 +923,13 @@ func (rs *runState) firstError() string {
 // failing run names its repo early, so a modest cap suffices under log spam.
 const maxErrText = 500
 
+// maxErrTextBytes bounds the total error text retained alongside the entry
+// count. Entries are capped in number but not in size, and the scanner accepts
+// lines up to a megabyte, so a pathologically noisy run could hold hundreds of
+// megabytes for its whole duration. Path matching only needs enough of each
+// message to find a repository path in it.
+const maxErrTextBytes = 256 << 10
+
 // recordErrorText keeps the full (untruncated) error body: a repo path can sit
 // past the reason-truncation point, so path matching needs the whole message.
 func (rs *runState) recordErrorText(msg string) {
@@ -904,10 +939,11 @@ func (rs *runState) recordErrorText(msg string) {
 	}
 	rs.errTextMu.Lock()
 	defer rs.errTextMu.Unlock()
-	if len(rs.errText) >= maxErrText {
+	if len(rs.errText) >= maxErrText || rs.errTextBytes >= maxErrTextBytes {
 		return
 	}
 	rs.errText = append(rs.errText, msg)
+	rs.errTextBytes += len(msg)
 }
 
 func (rs *runState) errorMessages() []string {
