@@ -843,48 +843,26 @@ func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
 	})
 }
 
-func TestGlobMatches(t *testing.T) {
-	for _, tc := range []struct {
-		pattern, name string
-		want          bool
-	}{
-		{"app*", "apple20260102150405", true},
-		{"apple*", "app20260102150405", false},
-		{"*-app-*", "host-app-prod-20260102150405", true},
-		{"*-app-*", "host-other-20260102150405", false},
-		{"*-app", "20260102150405-apple", false},
-		{"*-app", "20260102150405-app", true},
-		{"*", "anything", true},
-		{"exact", "exact", true},
-		{"exact", "exactly", false},
-		{"a*b*c", "axxbyyc", true},
-		{"a*b*c", "axxc", false},
-	} {
-		t.Run(tc.pattern+"_vs_"+tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, config.GlobMatchesForTest(tc.pattern, tc.name))
-		})
-	}
-}
-
 func TestPatternsCollide(t *testing.T) {
-	// The check runs in both directions because the two groups' formats need not
-	// be the same: a per-group override can give one group a format whose
-	// literal text is the other group's whole name. Only the second direction
-	// sees that, and group order here is alphabetical, which always puts a
-	// prefix before its extension, so the first direction alone would miss it.
+	defer config.SetSampleHostname("myhost")()
+
+	// Both directions, because the two groups' formats need not be the same: a
+	// per-group override can give one group a format whose literal text is the
+	// other group's whole name. Only the second direction sees that, and group
+	// order is alphabetical, which always puts a prefix before its extension.
 	t.Run("a collision only the second direction sees", func(t *testing.T) {
-		assert.False(t, config.GlobMatchesForTest("alpha", "alpha20260102150405"),
+		assert.False(t, config.PatternMatchesFormatForTest("alpha", "alpha{now}"),
 			"alpha's own pattern does not match beta's names")
 		assert.True(t, config.PatternsCollideForTest(
-			"alpha", []string{"alpha"}, // group alpha, format "{group}"
-			"alpha*", []string{"alpha20260102150405"}), // group beta, format "alpha{now}"
+			"alpha", "{group}", // group alpha, whose name is the whole format
+			"alpha*", "alpha{now}"), // group beta, whose literal text is alpha's name
 			"but beta's pattern claims alpha's archives")
 	})
 
 	t.Run("distinguishable patterns do not collide", func(t *testing.T) {
 		assert.False(t, config.PatternsCollideForTest(
-			"*-app-*", []string{"20260102150405-app-20260102150405"},
-			"*-other-*", []string{"20260102150405-other-20260102150405"}))
+			"*-app-*", "{hostname}-app-{now}",
+			"*-other-*", "{hostname}-other-{now}"))
 	})
 
 	// Unreachable through generation today, because a shared-repo group whose
@@ -892,108 +870,79 @@ func TestPatternsCollide(t *testing.T) {
 	// Kept because "nothing is known about this group's archive names" must not
 	// read as "its archives are distinguishable" if that ever changes.
 	t.Run("an unknown pattern is treated as colliding", func(t *testing.T) {
-		assert.True(t, config.PatternsCollideForTest("", nil, "*-app-*", []string{"x-app-y"}))
-		assert.True(t, config.PatternsCollideForTest("*-app-*", []string{"x-app-y"}, "", nil))
+		assert.True(t, config.PatternsCollideForTest("", "", "*-app-*", "x-app-{now}"))
+		assert.True(t, config.PatternsCollideForTest("*-app-*", "x-app-{now}", "", ""))
 	})
 }
 
-// The sample renders what borg would actually write. A placeholder whose value
-// this host knows is rendered as that value; one whose value cannot be known
-// falls back to a digits-only stand-in that introduces no separators.
-func TestArchiveSampleName(t *testing.T) {
+// Sampling instants could never answer this. Each directive is small on its own,
+// but a format with two of them generates their product: group "02-59" collides
+// with a sibling formatting "{now:%m}-{now:%S}" only in February, on second 59,
+// and no feasible number of sampled instants contains every such pair. Matching
+// against the format's structure explores the combinations without enumerating
+// them.
+func TestDirectiveCombinationsAreMatched(t *testing.T) {
 	defer config.SetSampleHostname("myhost")()
 
-	assert.Equal(t, "plain", config.ArchiveSampleNameForTest("plain"))
-	assert.NotContains(t, config.ArchiveSampleNameForTest("app{unknowable}"), "{",
-		"a placeholder left literal would never match a real archive name")
+	assert.True(t, config.PatternMatchesFormatForTest("x-02-59-*", "x-{now:%m}-{now:%S}-prod-{now}"),
+		"February, second 59")
+	assert.False(t, config.PatternMatchesFormatForTest("x-13-59-*", "x-{now:%m}-{now:%S}-prod-{now}"),
+		"there is no thirteenth month")
+	assert.False(t, config.PatternMatchesFormatForTest("x-02-60-*", "x-{now:%m}-{now:%S}-prod-{now}"),
+		"nor a sixtieth second")
 
-	assert.Equal(t, "myhost-app-2026-07-27T16:04:26",
-		config.ArchiveSampleNameForTest("{hostname}-app-{now}"),
-		"the hostname is known, and {now} renders in borg's default form")
+	// Through the collision decision, in both directions.
+	assert.True(t, config.PatternsCollideForTest(
+		"x-02-59-*", "x-{group}-{now}",
+		"x-*-*-prod-*", "x-{now:%m}-{now:%S}-prod-{now}"))
 
-	// The name is what precedes the colon.
-	assert.Equal(t, "myhost-x", config.ArchiveSampleNameForTest("{hostname:%s}-x"),
-		"a format spec does not change which placeholder it is")
-	assert.Equal(t, "myhost-x", config.ArchiveSampleNameForTest("{ HOSTNAME }-x"),
-		"nor does case or padding")
-
-	// A formatted timestamp renders through its directives, which is how a
-	// two-digit month can collide with a group named after one.
-	assert.Equal(t, "x-07-y", config.ArchiveSampleNameForTest("x-{now:%m}-y"))
-	assert.Equal(t, "2026-07-27", config.ArchiveSampleNameForTest("{now:%Y-%m-%d}"))
-
-	// An unsupported directive gives up rather than rendering half a value.
-	assert.Equal(t, "x-20260102150405-y", config.ArchiveSampleNameForTest("x-{now:%j}-y"))
+	// Single directives still work, including the earlier month and day cases.
+	assert.True(t, config.PatternMatchesFormatForTest("x-07-*", "x-{now:%m}-prod-{now}"))
+	assert.True(t, config.PatternMatchesFormatForTest("x-31-*", "x-{now:%d}-prod-{now}"))
+	assert.False(t, config.PatternMatchesFormatForTest("x-32-*", "x-{now:%d}-prod-{now}"))
+	assert.True(t, config.PatternMatchesFormatForTest("x-23-*", "x-{now:%H}-prod-{now}"))
+	assert.False(t, config.PatternMatchesFormatForTest("x-24-*", "x-{now:%H}-prod-{now}"))
 }
 
-func TestStrftimeLayout(t *testing.T) {
-	for _, tc := range []struct {
-		spec, layout string
-		ok           bool
-	}{
-		{spec: "%Y-%m-%d", layout: "2006-01-02", ok: true},
-		{spec: "%H:%M:%S", layout: "15:04:05", ok: true},
-		{spec: "%m", layout: "01", ok: true},
-		{spec: "%b %a", layout: "Jan Mon", ok: true},
-		{spec: "backup-%Y", layout: "backup-2006", ok: true},
-		{spec: "100%%", layout: "100%", ok: true},
-		{spec: "%j", ok: false},         // day of year has no Go layout
-		{spec: "%Y-%q", ok: false},      // unknown directive
-		{spec: "trailing %", ok: false}, // dangling percent
-	} {
-		t.Run(tc.spec, func(t *testing.T) {
-			layout, ok := config.StrftimeLayoutForTest(tc.spec)
-			assert.Equal(t, tc.ok, ok)
-			if tc.ok {
-				assert.Equal(t, tc.layout, layout)
-			}
-		})
-	}
-}
-
-// A single sample answers only for the date it used. Codex's case: group "07"
-// has the pattern "*-07-*", and a sibling whose format includes {now:%m} writes
-// "x-07-prod-..." every July. Whether they collide depends on the month, so the
-// check renders across the year.
-func TestACollisionThatOnlyExistsInSomeMonthsIsStillFound(t *testing.T) {
+// The domains are what make the match exact, so they are asserted directly.
+func TestFormatDirectiveDomains(t *testing.T) {
 	defer config.SetSampleHostname("myhost")()
 
-	names := config.ArchiveSampleNamesForTest("x-{now:%m}-prod-{now}")
-
-	// Every month is rendered, so the check does not depend on when it runs.
-	for m := 1; m <= 12; m++ {
-		prefix := fmt.Sprintf("x-%02d-prod-", m)
-		found := false
-		for _, name := range names {
-			if strings.HasPrefix(name, prefix) {
-				found = true
-				break
-			}
-		}
-		assert.True(t, found, "month %02d must be represented", m)
+	domainOf := func(format string) []string {
+		alts := config.FormatAlternativesForTest(format)
+		require.Len(t, alts, 1, "one directive, one segment")
+		return alts[0]
 	}
 
-	assert.True(t, config.PatternsCollideForTest(
-		"x-07-*", config.ArchiveSampleNamesForTest("x-{group}-{now}"),
-		"x-*-prod-*", names),
-		`the group named "07" claims the July archives of its sibling`)
+	assert.Len(t, domainOf("{now:%m}"), 12)
+	assert.Len(t, domainOf("{now:%d}"), 31)
+	assert.Len(t, domainOf("{now:%H}"), 24)
+	assert.Len(t, domainOf("{now:%M}"), 60)
+	assert.Len(t, domainOf("{now:%S}"), 60)
+	assert.Contains(t, domainOf("{now:%b}"), "Jul")
+	assert.Contains(t, domainOf("{now:%A}"), "Wednesday")
+	assert.Contains(t, domainOf("{now:%Y}"), fmt.Sprintf("%d", time.Now().Year()))
 
-	// The same for a day-of-month format, which twelve monthly samples missed:
-	// they only ever rendered days 2 to 13.
-	assert.True(t, config.PatternsCollideForTest(
-		"x-31-*", config.ArchiveSampleNamesForTest("x-{group}-{now}"),
-		"x-*-prod-*", config.ArchiveSampleNamesForTest("x-{now:%d}-prod-{now}")),
-		`the group named "31" claims what its sibling writes on the 31st`)
+	// A known host value is a literal, not a domain.
+	assert.Equal(t, [][]string{{"myhost"}}, config.FormatAlternativesForTest("{hostname}"))
 
-	// And for hours, minutes and seconds, whose domains are larger still.
-	for _, tc := range []struct{ group, directive string }{
-		{"23", "%H"}, {"59", "%M"}, {"07", "%S"},
-	} {
-		assert.True(t, config.PatternsCollideForTest(
-			"x-"+tc.group+"-*", config.ArchiveSampleNamesForTest("x-{group}-{now}"),
-			"x-*-prod-*", config.ArchiveSampleNamesForTest("x-{now:"+tc.directive+"}-prod-{now}")),
-			"a group named %q collides with a sibling formatting %s", tc.group, tc.directive)
-	}
+	// {now} with no spec is borg's default rendering, so it decomposes the same
+	// way: literals and directives, not one opaque blob.
+	alts := config.FormatAlternativesForTest("{now}")
+	assert.Greater(t, len(alts), 1, "the default timestamp is structured too")
+
+	// A placeholder this code cannot characterize matches anything, which
+	// reports a collision rather than missing one.
+	assert.Equal(t, [][]string{nil}, config.FormatAlternativesForTest("{something-new}"))
+	assert.True(t, config.PatternMatchesFormatForTest("literally-anything-*", "{something-new}"))
+
+	// The same for a directive inside a spec that this code does not know: the
+	// segment must widen, not narrow. Narrowing it to a fixed value would make
+	// two formats look disjoint because a value nobody can predict happened not
+	// to match.
+	assert.Equal(t, [][]string{{"x-"}, nil, {"-y"}}, config.FormatAlternativesForTest("x-{now:%j}-y"))
+	assert.True(t, config.PatternMatchesFormatForTest("x-anything-at-all-y", "x-{now:%j}-y"))
+	assert.True(t, config.PatternMatchesFormatForTest("x-*-y", "x-{now:%j}-y"))
 }
 
 // The collision the digits-only stand-in hid: with this hostname, group "prod"
@@ -1124,48 +1073,6 @@ func TestAGroupNamedLikeADateCollidesWithAFormattedTimestamp(t *testing.T) {
 	assert.NotEmpty(t, meta["07"].AmbiguousRepos,
 		`"x-07-*" claims the archives prod writes every July`)
 	assert.NotEmpty(t, meta["prod"].AmbiguousRepos)
-}
-
-// A year is as plausible a group name as a month, and the check runs for years
-// on end, so both the current year and the next one are covered.
-func TestSampleInstantsCoverEveryDirectiveValue(t *testing.T) {
-	seen := func(format string) map[string]bool {
-		out := map[string]bool{}
-		for _, name := range config.ArchiveSampleNamesForTest(format) {
-			out[name] = true
-		}
-		return out
-	}
-
-	months := seen("{now:%m}")
-	for m := 1; m <= 12; m++ {
-		assert.True(t, months[fmt.Sprintf("%02d", m)], "month %02d", m)
-	}
-	days := seen("{now:%d}")
-	for d := 1; d <= 31; d++ {
-		assert.True(t, days[fmt.Sprintf("%02d", d)], "day %02d", d)
-	}
-	hours := seen("{now:%H}")
-	for h := 0; h < 24; h++ {
-		assert.True(t, hours[fmt.Sprintf("%02d", h)], "hour %02d", h)
-	}
-	minutes := seen("{now:%M}")
-	for m := 0; m < 60; m++ {
-		assert.True(t, minutes[fmt.Sprintf("%02d", m)], "minute %02d", m)
-	}
-	seconds := seen("{now:%S}")
-	for s := 0; s < 60; s++ {
-		assert.True(t, seconds[fmt.Sprintf("%02d", s)], "second %02d", s)
-	}
-
-	years := seen("{now:%Y}")
-	now := time.Now()
-	assert.True(t, years[fmt.Sprintf("%d", now.Year())], "the current year")
-	assert.True(t, years[fmt.Sprintf("%d", now.Year()+1)], "and the next one")
-
-	// A format with no time placeholder renders once, not hundreds of times: the
-	// collision check is quadratic in the sample count.
-	assert.Len(t, config.ArchiveSampleNamesForTest("x-{hostname}-y"), 1)
 }
 
 // An at-sign in a local path is not a remote repository. Treating it as one

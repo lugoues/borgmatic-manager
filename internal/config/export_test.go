@@ -1,7 +1,5 @@
 package config
 
-import "time"
-
 // SetLookPath replaces the exec.LookPath seam for tests.
 func (g *Generator) SetLookPath(fn func(string) (string, error)) {
 	g.lookPath = fn
@@ -16,29 +14,33 @@ const PlaceholderRunID = placeholderRunID
 // shared repository.
 func ArchiveMatchPattern(format string) string { return archiveMatchPattern(format) }
 
-// GlobMatchesForTest exposes the archive-name matcher so its edge cases can be
-// tested directly rather than only through generation.
-func GlobMatchesForTest(pattern, name string) bool { return globMatches(pattern, name) }
-
-// ArchiveSampleNameForTest renders one sample at a fixed instant, so the
-// rendering of individual placeholders can be asserted directly.
-func ArchiveSampleNameForTest(format string) string {
-	return archiveSampleNameAt(format, time.Date(2026, 7, 27, 16, 4, 26, 0, time.Local))
+// PatternMatchesFormatForTest reports whether a glob can match any name the
+// format generates, which is the whole collision question for one direction.
+func PatternMatchesFormatForTest(pattern, format string) bool {
+	return patternMatchesFormat(pattern, archiveFormatSegments(format))
 }
 
-// ArchiveSampleNamesForTest exposes the full spread the collision check uses.
-func ArchiveSampleNamesForTest(format string) []string { return archiveSampleNames(format) }
-
-// StrftimeLayoutForTest exposes the directive conversion.
-func StrftimeLayoutForTest(spec string) (string, bool) { return strftimeLayout(spec) }
+// FormatAlternativesForTest exposes the decomposition, so a directive's domain
+// can be asserted directly rather than inferred from a match.
+func FormatAlternativesForTest(format string) [][]string {
+	var out [][]string
+	for _, seg := range archiveFormatSegments(format) {
+		if seg.any {
+			out = append(out, nil)
+			continue
+		}
+		out = append(out, seg.alts)
+	}
+	return out
+}
 
 // PatternsCollideForTest exposes the collision decision so the asymmetric and
 // degenerate cases can be stated directly rather than reached through a config.
-func PatternsCollideForTest(patternA string, samplesA []string, patternB string, samplesB []string) bool {
-	return patternsCollide(patternA, samplesA, patternB, samplesB)
+func PatternsCollideForTest(patternA, formatA, patternB, formatB string) bool {
+	return patternsCollide(patternA, archiveFormatSegments(formatA), patternB, archiveFormatSegments(formatB))
 }
 
-// SetSampleHostname pins the hostname the sample renderer uses, so a collision
+// SetSampleHostname pins the hostname the decomposition uses, so a collision
 // that depends on the hostname can be tested on any machine.
 func SetSampleHostname(name string) func() {
 	prev := sampleHostname

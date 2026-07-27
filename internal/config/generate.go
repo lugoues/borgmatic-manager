@@ -338,11 +338,11 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 	// and warn about a conflict with a group that is not running.
 	keptRepoGroups := make(map[string][]string, len(repoGroups))
 	patterns := make(map[string]string, len(kept))
-	samples := make(map[string][]string, len(kept))
+	samples := make(map[string][]formatSegment, len(kept))
 	for _, e := range kept {
 		patterns[e.name] = e.meta.ArchivePattern
 		format, _ := e.final["archive_name_format"].(string)
-		samples[e.name] = archiveSampleNames(format)
+		samples[e.name] = archiveFormatSegments(format)
 		for _, repo := range e.meta.Repos {
 			keptRepoGroups[repo] = append(keptRepoGroups[repo], e.name)
 		}
@@ -662,7 +662,7 @@ func volumeNamedPath(hostPath, volumeName string) string {
 // "x-app--other-y", so every pair of groups would look like a collision. What
 // matters is narrower: whether one group's pattern matches a name the other
 // group's format would actually generate.
-func overlappingPatternRepos(repoGroups map[string][]string, patterns map[string]string, samples map[string][]string, logger *slog.Logger) map[string][]string {
+func overlappingPatternRepos(repoGroups map[string][]string, patterns map[string]string, formats map[string][]formatSegment, logger *slog.Logger) map[string][]string {
 	affected := map[string][]string{}
 	add := func(name, repo string) {
 		for _, r := range affected[name] {
@@ -685,7 +685,7 @@ func overlappingPatternRepos(repoGroups map[string][]string, patterns map[string
 		sort.Strings(groups)
 		for i, a := range groups {
 			for _, b := range groups[i+1:] {
-				if !patternsCollide(patterns[a], samples[a], patterns[b], samples[b]) {
+				if !patternsCollide(patterns[a], formats[a], patterns[b], formats[b]) {
 					continue
 				}
 				logger.Warn("groups sharing a repository have overlapping archive name patterns; retention can cross group boundaries and neither group's backups can be confirmed independently in it, rename a group or split repositories",
@@ -700,119 +700,110 @@ func overlappingPatternRepos(repoGroups map[string][]string, patterns map[string
 }
 
 // patternsCollide reports whether either group's pattern claims any archive name
-// the other group's format can produce. An empty pattern or no samples means the
-// group's config names no archive format, so nothing distinguishes its archives
-// from anyone else's: treated as a collision, which is the safe direction.
-func patternsCollide(patternA string, samplesA []string, patternB string, samplesB []string) bool {
-	if patternA == "" || patternB == "" || len(samplesA) == 0 || len(samplesB) == 0 {
+// the other group's format can generate. An absent pattern or format means
+// nothing distinguishes that group's archives from anyone else's: treated as a
+// collision, which is the safe direction.
+func patternsCollide(patternA string, formatA []formatSegment, patternB string, formatB []formatSegment) bool {
+	if patternA == "" || patternB == "" || len(formatA) == 0 || len(formatB) == 0 {
 		return true
 	}
-	for _, sample := range samplesB {
-		if sample == "" || globMatches(patternA, sample) {
-			return true
-		}
-	}
-	for _, sample := range samplesA {
-		if sample == "" || globMatches(patternB, sample) {
-			return true
-		}
-	}
-	return false
+	return patternMatchesFormat(patternA, formatB) || patternMatchesFormat(patternB, formatA)
 }
 
-// globMatches reports whether pattern, in which "*" matches any run of
-// characters, matches name.
-func globMatches(pattern, name string) bool {
-	memo := make(map[[2]int]bool, len(pattern)*len(name))
-	var walk func(i, j int) bool
-	walk = func(i, j int) bool {
-		key := [2]int{i, j}
-		if v, seen := memo[key]; seen {
-			return v
+// patternMatchesFormat reports whether the glob matches any name the format can
+// generate.
+//
+// The glob is walked as a state machine over the set of positions it could be
+// in, and each segment advances that set through every alternative it allows. A
+// format with several directives is therefore explored in combination without
+// its combinations ever being enumerated, which is what a sample of instants
+// could not do.
+func patternMatchesFormat(pattern string, segs []formatSegment) bool {
+	states := starClosure(pattern, map[int]bool{0: true})
+	for _, seg := range segs {
+		if seg.any {
+			// The segment can be anything, including whatever the rest of the
+			// pattern wants. Report a collision rather than guess.
+			return true
 		}
-		var out bool
-		switch {
-		case i == len(pattern):
-			out = j == len(name)
-		case pattern[i] == '*':
-			// The star matches nothing here, or one more character of name.
-			out = walk(i+1, j) || (j < len(name) && walk(i, j+1))
-		case j == len(name):
-			out = false
-		default:
-			out = pattern[i] == name[j] && walk(i+1, j+1)
+		next := map[int]bool{}
+		for _, alt := range seg.alts {
+			for state := range consume(pattern, states, alt) {
+				next[state] = true
+			}
 		}
-		memo[key] = out
-		return out
+		if len(next) == 0 {
+			return false
+		}
+		states = next
 	}
-	return walk(0, 0)
+	return states[len(pattern)]
 }
 
-// archiveSampleNames renders the archive names a format produces, one per
-// representative instant.
-//
-// One sample is not enough once a format can contain a formatted timestamp. A
-// group named "07" has the pattern "*-07-*", and a sibling whose format includes
-// {now:%m} writes "x-07-prod-..." every July: whether those collide depends on
-// the date, so a single rendering answers only for the date it used. Rendering
-// across the year answers for the year, and a collision that exists on any date
-// is a collision.
-//
-// Placeholders whose values this host already knows are rendered as those
-// values, because a stand-in can hide a real collision. With the default format
-// and a hostname like "db-app-node", groups "app" and "prod" produce
-// "db-app-node-app-..." and "db-app-node-prod-...", and the second matches the
-// first group's "*-app-*" pattern through the hostname alone.
-func archiveSampleNames(format string) []string {
-	// Deduplicated: a format with no time placeholder renders identically at
-	// every instant, and the collision check is quadratic in the number of
-	// samples it is handed.
-	seen := make(map[string]bool, len(sampleInstants))
-	out := make([]string, 0, len(sampleInstants))
-	for _, at := range sampleInstants {
-		name := archiveSampleNameAt(format, at)
-		if seen[name] {
-			continue
+// consume advances every state through the literal text.
+func consume(pattern string, states map[int]bool, text string) map[int]bool {
+	cur := states
+	for i := 0; i < len(text) && len(cur) > 0; i++ {
+		next := map[int]bool{}
+		for state := range cur {
+			if state >= len(pattern) {
+				continue
+			}
+			switch pattern[state] {
+			case '*':
+				next[state] = true // the star keeps consuming
+			case text[i]:
+				next[state+1] = true
+			}
 		}
-		seen[name] = true
-		out = append(out, name)
+		cur = starClosure(pattern, next)
+	}
+	return cur
+}
+
+// starClosure adds the positions reachable by letting a star match nothing.
+func starClosure(pattern string, states map[int]bool) map[int]bool {
+	out := make(map[int]bool, len(states))
+	var add func(int)
+	add = func(state int) {
+		if out[state] {
+			return
+		}
+		out[state] = true
+		if state < len(pattern) && pattern[state] == '*' {
+			add(state + 1)
+		}
+	}
+	for state := range states {
+		add(state)
 	}
 	return out
 }
 
-// sampleInstants covers every value each supported directive can render, so a
-// collision that exists on one day of the year is found on any other.
+// archiveFormatSegments decomposes an archive_name_format into the alternatives
+// each position can take, so a pattern can be tested against every name the
+// format can ever generate rather than against a sample of them.
 //
-// Not a cross-product, which is unreachable, but full coverage of each
-// directive's own domain: every month, every day, every hour, minute and second,
-// and the current and next year (a group can be named after a year as easily as
-// after a month). A collision needing two directives at specific values
-// simultaneously is still possible in principle and is not covered; the ones
-// seen in practice come from a single short value, a month or a day, landing
-// beside the separators another group's name sits between.
-var sampleInstants = buildSampleInstants(time.Now())
-
-func buildSampleInstants(now time.Time) []time.Time {
-	years := []int{now.Year(), now.Year() + 1}
-	// January has 31 days, so every day value is renderable there without
-	// time.Date rolling a short month over into the next one and skipping it.
-	var out []time.Time
-	for _, y := range years {
-		for day := 1; day <= 31; day++ {
-			out = append(out, time.Date(y, time.January, day, (day*7)%24, (day*13)%60, (day*17)%60, 0, time.Local))
-		}
-		for m := 1; m <= 12; m++ {
-			out = append(out, time.Date(y, time.Month(m), 15, (m*2)%24, (m*5)%60, (m*3)%60, 0, time.Local))
-		}
-		for v := 0; v < 60; v++ {
-			out = append(out, time.Date(y, time.January, 15, v%24, v, v, 0, time.Local))
+// Sampling cannot answer this. Each directive is small on its own, but a format
+// with two of them generates their product: a group named "02-59" collides with
+// a sibling formatting "{now:%m}-{now:%S}" only in February, on second 59, and
+// no feasible number of sampled instants contains every such pair. Matching
+// against the structure explores the combinations without enumerating them.
+//
+// Placeholders whose values this host knows are decomposed to those values, so a
+// hostname that contains a group's name is seen. A placeholder this code cannot
+// characterize becomes a segment that matches anything, which reports a
+// collision rather than missing one.
+func archiveFormatSegments(format string) []formatSegment {
+	var out []formatSegment
+	var lit strings.Builder
+	flush := func() {
+		if lit.Len() > 0 {
+			out = append(out, formatSegment{alts: []string{lit.String()}})
+			lit.Reset()
 		}
 	}
-	return out
-}
 
-func archiveSampleNameAt(format string, at time.Time) string {
-	var b strings.Builder
 	depth := 0
 	var token strings.Builder
 	for _, r := range format {
@@ -825,83 +816,117 @@ func archiveSampleNameAt(format string, at time.Time) string {
 		case r == '}' && depth > 0:
 			depth--
 			if depth == 0 {
-				b.WriteString(samplePlaceholderValue(token.String(), at))
+				flush()
+				out = append(out, placeholderSegments(token.String())...)
 			}
 		case depth > 0:
 			token.WriteRune(r)
 		default:
-			b.WriteRune(r)
+			lit.WriteRune(r)
 		}
 	}
-	return b.String()
+	flush()
+	return out
 }
 
-// samplePlaceholderValue renders one of borg's runtime placeholders at a given
-// instant. A placeholder this host cannot resolve falls back to a digits-only
-// stand-in, which introduces no separator that could manufacture a match or hide
-// one.
-func samplePlaceholderValue(token string, at time.Time) string {
+// formatSegment is one position in a format: a finite set of alternatives, or
+// anything at all when the value cannot be characterized.
+type formatSegment struct {
+	alts []string
+	any  bool
+}
+
+func placeholderSegments(token string) []formatSegment {
 	name, spec, hasSpec := strings.Cut(token, ":")
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "hostname", "fqdn", "reverse-hostname":
 		if h := sampleHostname(); h != "" {
-			return h
+			return []formatSegment{{alts: []string{h}}}
 		}
 	case "user", "username":
 		if u := os.Getenv("USER"); u != "" {
-			return u
+			return []formatSegment{{alts: []string{u}}}
 		}
 	case "now", "utcnow":
-		when := at
-		if strings.EqualFold(strings.TrimSpace(name), "utcnow") {
-			when = at.UTC()
-		}
 		if !hasSpec {
-			return when.Format("2006-01-02T15:04:05")
+			spec = "%Y-%m-%dT%H:%M:%S" // borg's default rendering of {now}
 		}
-		if layout, ok := strftimeLayout(spec); ok {
-			return when.Format(layout)
-		}
+		return strftimeSegments(spec)
 	}
-	return samplePlaceholder
+	return []formatSegment{{any: true}}
 }
 
-// strftimeLayout converts the strftime directives borg passes to Python into a
-// Go layout. An unsupported directive gives up entirely rather than rendering
-// part of the value, since a half-rendered timestamp is neither the real text
-// nor a neutral stand-in.
-func strftimeLayout(spec string) (string, bool) {
-	var b strings.Builder
+// strftimeSegments turns a strftime spec into one segment per directive, each
+// carrying that directive's whole domain.
+func strftimeSegments(spec string) []formatSegment {
+	var out []formatSegment
+	var lit strings.Builder
+	flush := func() {
+		if lit.Len() > 0 {
+			out = append(out, formatSegment{alts: []string{lit.String()}})
+			lit.Reset()
+		}
+	}
 	for i := 0; i < len(spec); i++ {
 		if spec[i] != '%' {
-			b.WriteByte(spec[i])
+			lit.WriteByte(spec[i])
 			continue
 		}
 		i++
 		if i >= len(spec) {
-			return "", false
+			flush()
+			return append(out, formatSegment{any: true}) // dangling percent
 		}
-		layout, ok := strftimeDirectives[spec[i]]
-		if !ok {
-			return "", false
+		if spec[i] == '%' {
+			lit.WriteByte('%')
+			continue
 		}
-		b.WriteString(layout)
+		flush()
+		if domain, ok := strftimeDomains[spec[i]]; ok {
+			out = append(out, formatSegment{alts: domain})
+			continue
+		}
+		out = append(out, formatSegment{any: true})
 	}
-	return b.String(), true
+	flush()
+	return out
 }
 
-var strftimeDirectives = map[byte]string{
-	'Y': "2006", 'y': "06", 'm': "01", 'd': "02",
-	'H': "15", 'M': "04", 'S': "05",
-	'b': "Jan", 'B': "January", 'a': "Mon", 'A': "Monday",
-	'p': "PM", 'I': "03", 'Z': "MST", 'z': "-0700",
-	'%': "%",
-}
-
-// samplePlaceholder stands in for a placeholder whose value is unknowable here.
-// Digits only, so it introduces no separator that could manufacture a match
-// against another group's literal text or hide one.
-const samplePlaceholder = "20260102150405"
+// strftimeDomains is every value each supported directive can render. A
+// directive that is absent renders as "anything", which collides rather than
+// silently narrowing what a format can produce.
+var strftimeDomains = func() map[byte][]string {
+	pad := func(lo, hi int) []string {
+		out := make([]string, 0, hi-lo+1)
+		for v := lo; v <= hi; v++ {
+			out = append(out, fmt.Sprintf("%02d", v))
+		}
+		return out
+	}
+	// Years are open-ended in principle. A window around now covers a group
+	// named after a year, which is the case that matters, without pretending to
+	// cover every year a repository might outlive.
+	year := time.Now().Year()
+	years := make([]string, 0, 4)
+	yearsShort := make([]string, 0, 4)
+	for y := year - 1; y <= year+2; y++ {
+		years = append(years, fmt.Sprintf("%04d", y))
+		yearsShort = append(yearsShort, fmt.Sprintf("%02d", y%100))
+	}
+	months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+	longMonths := []string{"January", "February", "March", "April", "May", "June",
+		"July", "August", "September", "October", "November", "December"}
+	days := []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+	longDays := []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
+	return map[byte][]string{
+		'Y': years, 'y': yearsShort,
+		'm': pad(1, 12), 'd': pad(1, 31),
+		'H': pad(0, 23), 'I': pad(1, 12),
+		'M': pad(0, 59), 'S': pad(0, 59),
+		'b': months, 'B': longMonths, 'a': days, 'A': longDays,
+		'p': {"AM", "PM"},
+	}
+}()
 
 // sampleHostname is a seam: the value borg will expand {hostname} to is this
 // host's, and tests need to pin it.
