@@ -1059,6 +1059,58 @@ func resolveInPlaceReason(merge, force, mounted, encrypted bool, encryptionReaso
 // whether it was consulted at all.
 var canCreateSiblingFn = canCreateSibling
 
+// extractSessionPath names the file recording a running extract's session, kept
+// beside the volume's lock.
+func extractSessionPath(locksDir, targetData string) string {
+	sum := sha256.Sum256([]byte(targetData))
+	return filepath.Join(locksDir, "extract-"+hex.EncodeToString(sum[:8])+".session")
+}
+
+// recordExtractSession notes the process group an extract is running in, so a
+// later restore can tell whether one outlived the manager that started it.
+//
+// The per-volume lock dies with the manager, and Pdeathsig reaches borgmatic but
+// not the borg beneath it, so a manager that is SIGKILLed can leave borg writing
+// with nothing holding the lock. This is what stops the next restore from
+// racing that orphan: it is deliberately a record on disk rather than a lock,
+// because the whole point is that it has to survive the process that wrote it.
+func recordExtractSession(locksDir, targetData string, pgid int) error {
+	if err := os.MkdirAll(locksDir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(extractSessionPath(locksDir, targetData), []byte(strconv.Itoa(pgid)+"\n"), 0o600)
+}
+
+func clearExtractSession(locksDir, targetData string) {
+	_ = os.Remove(extractSessionPath(locksDir, targetData))
+}
+
+// checkNoOrphanedExtract refuses to start while a previous restore's extract is
+// still running for this volume.
+//
+// A stale record is removed rather than reported: the process group is gone, so
+// it says nothing. Process group ids are reused, so a live match is not proof
+// the group is that extract, which is why this reports rather than acts on it.
+func checkNoOrphanedExtract(locksDir, targetData string) error {
+	path := extractSessionPath(locksDir, targetData)
+	raw, err := os.ReadFile(path) // #nosec G304 -- a path this process builds in its own state dir
+	if err != nil {
+		return nil // no record, nothing to say
+	}
+	pgid, convErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if convErr != nil || pgid <= 1 {
+		_ = os.Remove(path)
+		return nil
+	}
+	if syscall.Kill(-pgid, 0) != nil {
+		_ = os.Remove(path) // gone, so the record is noise
+		return nil
+	}
+	return fmt.Errorf("a previous restore of %s was interrupted and its extract is still running as process "+
+		"group %d (nothing was changed); the manager that started it is gone, so stop it before restoring again: "+
+		"kill -TERM -%d", targetData, pgid, pgid)
+}
+
 // lockVolumeRestore takes an exclusive lock covering one volume's data
 // directory for the whole restore.
 //
@@ -1187,6 +1239,13 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return lockErr
 	}
 	defer restoreLock.Release()
+
+	// Before anything else touches this volume: an extract that outlived its
+	// manager is still writing, and the lock that would have excluded it died
+	// with that manager.
+	if orphanErr := checkNoOrphanedExtract(e.locksDir(), plan.targetData); orphanErr != nil {
+		return orphanErr
+	}
 
 	// A previous restore killed between the two renames leaves the data under a
 	// suffixed name and nothing at targetData. Put it back before concluding the
@@ -1341,7 +1400,8 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// "<sourceVolume>/_data" so files land directly in it, which is also what
 	// lets --into retarget a differently-named volume.
 	extract := func(destination string) error {
-		return runBorgmaticExtract(ctx, borgmaticPath, configPath, archive, plan.archivePath, destination)
+		return runBorgmaticExtract(ctx, borgmaticPath, configPath, archive, plan.archivePath, destination,
+			e.locksDir(), logger)
 	}
 
 	// Mirror restores stage and swap, so the live data is never destroyed
@@ -1446,7 +1506,7 @@ const extractKillGrace = 10 * time.Second
 // running after its parent exits keeps writing into the volume, so signals are
 // forwarded explicitly. The child gets its own process group because borgmatic
 // spawns borg, and only a group signal reaches both.
-func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive, archivePath, destination string) error {
+func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive, archivePath, destination, locksDir string, logger *slog.Logger) error {
 	// Pdeathsig below is delivered when the *thread* that started the child
 	// exits, not the process, so the goroutine has to keep one for the duration
 	// or the signal can arrive early on a perfectly healthy restore.
@@ -1515,6 +1575,18 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting borgmatic: %w", err)
 	}
+
+	// Recorded once the session exists and cleared when it is gone. Pdeathsig
+	// reaches borgmatic but not the borg beneath it, so a manager that is
+	// SIGKILLed can leave borg writing with the per-volume lock already released
+	// by its own death. This record is what a later restore consults, and it is
+	// a file rather than a lock precisely because it has to outlive the process
+	// that wrote it.
+	if sessionErr := recordExtractSession(locksDir, destination, cmd.Process.Pid); sessionErr != nil {
+		logger.Warn("could not record this extract's session, so a later restore cannot tell whether it "+
+			"outlived this manager", "error", sessionErr)
+	}
+	defer clearExtractSession(locksDir, destination)
 
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
