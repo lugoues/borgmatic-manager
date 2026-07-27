@@ -933,6 +933,22 @@ func repoSpellings(repoPath string) []string {
 	}
 	add(strings.TrimRight(repoPath, "/"))
 	add(config.CanonicalRepoKey(repoPath))
+
+	// borgmatic resolves ${BORG_REPO} and friends from the environment this
+	// process hands it, so the same expansion here recovers the location borg
+	// will name in an error. Without it the literal spelling is the only one on
+	// the list, an implicated destination goes unrecognized, and a repository
+	// borg said outright had failed is reported as unknown.
+	//
+	// CanonicalRepoKey cannot do this itself: it answers "which repositories
+	// must not run concurrently", and there "unknown" has to keep colliding with
+	// every other unresolvable path. Expanding is the right answer for matching
+	// and the wrong one for locking.
+	if expanded := os.ExpandEnv(repoPath); expanded != repoPath {
+		add(expanded)
+		add(strings.TrimRight(expanded, "/"))
+		add(config.CanonicalRepoKey(expanded))
+	}
 	return out
 }
 
@@ -1057,22 +1073,45 @@ type listResult struct {
 
 // borgTimeLayouts are the local-time formats borg emits in list --json
 // (microseconds optional).
-var borgTimeLayouts = []string{"2006-01-02T15:04:05.000000", "2006-01-02T15:04:05"}
+var borgTimeLayouts = []string{borgTimeLayoutMicros, "2006-01-02T15:04:05"}
 
-// newestArchiveAtOrAfter reports whether any archive in the list result started
-// at or after runStart (minus a small skew), meaning this cycle produced it.
+// borgTimeLayoutMicros is the sub-second form. Which layout parsed is what tells
+// the comparison whether it can trust the archive's second.
+const borgTimeLayoutMicros = "2006-01-02T15:04:05.000000"
+
+// archiveIsFromThisRun decides whether an archive timestamp belongs to this run.
+//
+// With sub-second precision the comparison is exact, and there is nothing to
+// decide: borg said when the archive started, and this run started before or
+// after it.
+//
+// With whole-second precision the archive's own second is ambiguous. An archive
+// stamped 12:00:00 against a run that started at 12:00:00.500 may have been
+// written at 12:00:00.100, before the run, or at 12:00:00.900, by it. Truncating
+// the run start resolves that in favour of confirming, which credits a failed
+// run with an archive a previous run wrote: the exact case of a small backup
+// succeeding and an immediate retry failing inside one second.
+//
+// So the ambiguous second is refused instead. That can leave a repository
+// unjudged when this run's own archive lands in the second the run began, and
+// the cost of being wrong that way is a last-success that stops advancing until
+// the next run confirms it. The cost of being wrong the other way is a
+// destination reported as freshly backed up when it was not, which is the alert
+// that exists to fire. Refusing is the direction that fails loudly.
+func archiveIsFromThisRun(archive time.Time, precise bool, runStart time.Time) bool {
+	if precise {
+		return !archive.Before(runStart)
+	}
+	return archive.Truncate(time.Second).After(runStart.Truncate(time.Second))
+}
+
+// newestArchiveAtOrAfter reports whether any archive in the list result was
+// written by this run rather than a previous one.
 func newestArchiveAtOrAfter(raw []byte, runStart time.Time) bool {
 	var results []listResult
 	if err := json.Unmarshal(raw, &results); err != nil {
 		return false
 	}
-	// Truncated rather than widened. borg reports whole-second timestamps, so
-	// an archive written in the same second as the run's start can legitimately
-	// read as marginally earlier; a five-second window went much further and
-	// accepted archives written *before* the run, which a manual retry or an
-	// event-triggered cycle on a small dataset reaches easily. That credited a
-	// failed run with a previous run's archive.
-	cutoff := runStart.Truncate(time.Second)
 	for _, res := range results {
 		for _, a := range res.Archives {
 			ts := a.Start
@@ -1084,7 +1123,7 @@ func newestArchiveAtOrAfter(raw []byte, runStart time.Time) bool {
 				if err != nil {
 					continue
 				}
-				if !t.Before(cutoff) {
+				if archiveIsFromThisRun(t, layout == borgTimeLayoutMicros, runStart) {
 					return true
 				}
 				break
