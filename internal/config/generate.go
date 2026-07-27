@@ -120,6 +120,8 @@ func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]GroupOverride, o
 type Refusal struct {
 	Group  string
 	Reason string
+	// RepositoriesKnown mirrors GroupRunMeta's: whether the list was understood.
+	RepositoriesKnown bool
 	// Repositories are the destinations the group configures, kept even though
 	// it will not run. A consumer reconciling per-repository state against the
 	// current configuration needs to know what a refused group configures: it
@@ -339,9 +341,10 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			g.logger.Error("archive_name_format must contain the literal {group} token when groups share a repository, retention for one group would otherwise prune the others' archives; skipping group",
 				"group", e.name, "archive_name_format", format)
 			refusals = append(refusals, Refusal{
-				Group:        e.name,
-				Reason:       "archive_name_format must contain the {group} token when groups share a repository",
-				Repositories: e.meta.Repositories,
+				Group:             e.name,
+				Reason:            "archive_name_format must contain the {group} token when groups share a repository",
+				Repositories:      e.meta.Repositories,
+				RepositoriesKnown: e.meta.RepositoriesKnown,
 			})
 			continue
 		}

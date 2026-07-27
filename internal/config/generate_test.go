@@ -1305,6 +1305,8 @@ func TestARefusalCarriesTheGroupsRepositories(t *testing.T) {
 	require.Len(t, refusals[0].Repositories, 1)
 	assert.Equal(t, "shared", refusals[0].Repositories[0].Label)
 	assert.Equal(t, "/mnt/shared", refusals[0].Repositories[0].Path)
+	assert.True(t, refusals[0].RepositoriesKnown,
+		"the list was understood, so consumers may treat it as the current inventory")
 }
 
 // A directory component ending in ":" makes an absolute path look like a URL.

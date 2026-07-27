@@ -794,9 +794,10 @@ func TestStatusInventoryCoversRefusedGroups(t *testing.T) {
 	configured := scheduler.RepositoryInventory(
 		map[string]config.GroupRunMeta{},
 		[]config.Refusal{{
-			Group:        "demo",
-			Reason:       "archive_name_format must contain the {group} token when groups share a repository",
-			Repositories: []config.RepoRef{{Path: "/mnt/local", Label: "local"}},
+			Group:             "demo",
+			Reason:            "archive_name_format must contain the {group} token when groups share a repository",
+			Repositories:      []config.RepoRef{{Path: "/mnt/local", Label: "local"}},
+			RepositoriesKnown: true,
 		}},
 	)
 	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil,

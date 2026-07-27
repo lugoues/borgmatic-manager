@@ -138,6 +138,15 @@ func RepositoryInventory(meta map[string]config.GroupRunMeta, refusals ...[]conf
 		out[name] = repos
 	}
 	for name, m := range meta {
+		if !m.RepositoriesKnown {
+			// Generation could not read this group's repository list. Reporting an
+			// empty map would say it configures none, and every consumer treats
+			// that as a confirmed inventory: the records would be suppressed in
+			// the gauges and dropped from status and inspect, losing valid
+			// history for a group whose config is merely mid-edit. Absence is how
+			// this map says "unknown".
+			continue
+		}
 		add(name, m.Repositories)
 	}
 	// Refused groups too. Generation drops them from meta, so leaving them out
@@ -146,6 +155,9 @@ func RepositoryInventory(meta map[string]config.GroupRunMeta, refusals ...[]conf
 	// series exported forever: the group never runs, so nothing reconciles it.
 	for _, list := range refusals {
 		for _, r := range list {
+			if !r.RepositoriesKnown {
+				continue
+			}
 			add(r.Group, r.Repositories)
 		}
 	}
