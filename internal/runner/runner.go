@@ -445,7 +445,8 @@ func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRe
 		// The actions are what this run would have taken; the validation dying
 		// says nothing about that. Without it the run drops out of the
 		// per-repository counter as though it were a maintenance cycle.
-		CreateAttempted: r.actionsInclude(actionCreate),
+		CreateAttempted:   r.actionsInclude(actionCreate),
+		RepositoriesKnown: true,
 	}
 	for _, ref := range repos {
 		id := refID(ref)
@@ -465,9 +466,10 @@ func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRe
 		return
 	}
 	outcome := state.RunOutcome{
-		Finished:        time.Now(),
-		Result:          "config-invalid",
-		CreateAttempted: r.actionsInclude(actionCreate),
+		Finished:          time.Now(),
+		Result:            "config-invalid",
+		CreateAttempted:   r.actionsInclude(actionCreate),
+		RepositoriesKnown: true,
 	}
 	for _, ref := range repos {
 		id := refID(ref)
@@ -527,6 +529,7 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 		}
 		outcome.Repositories = repoOutcomes
 		outcome.CreateAttempted = r.actionsInclude(actionCreate)
+		outcome.RepositoriesKnown = true
 		for _, ref := range repos {
 			id := refID(ref)
 			outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, id)
@@ -819,7 +822,7 @@ func applyStats(ro *state.RepoOutcome, res createResult) {
 	ro.OriginalBytes = res.Archive.Stats.OriginalSize
 	ro.CompressedBytes = res.Archive.Stats.CompressedSize
 	ro.DeduplicatedBytes = res.Archive.Stats.DeduplicatedSize
-	ro.DurationSeconds = int64(res.Archive.Duration)
+	ro.DurationSeconds = res.Archive.Duration
 }
 
 // perRepoSuccess builds per-repository outcomes for a fully-successful group

@@ -43,6 +43,11 @@ type RunOutcome struct {
 	// produced an outcome for it, and the first run after the change is exactly
 	// the one likely to fail.
 	ConfiguredRepositoryPaths map[string]string `json:"-"`
+	// RepositoriesKnown records that the run enumerated the group's
+	// repositories, which an empty ConfiguredRepositories cannot say for itself:
+	// a config that lists none and a run that never got far enough to look are
+	// the same empty slice and opposite situations.
+	RepositoriesKnown bool `json:"-"`
 	// CreateAttempted records whether this run tried to write an archive at all.
 	// A maintenance-only cycle (prune, compact, check, with no create) exits
 	// zero having backed nothing up, and counting that as a successful backup
@@ -82,13 +87,15 @@ type RepoOutcome struct {
 	OriginalBytes     int64  `json:"original_bytes,omitempty"`
 	CompressedBytes   int64  `json:"compressed_bytes,omitempty"`
 	DeduplicatedBytes int64  `json:"deduplicated_bytes,omitempty"`
-	DurationSeconds   int64  `json:"duration_seconds,omitempty"`
+	// DurationSeconds is fractional: borg reports it that way, an archive can
+	// take well under a second, and truncating made those read as instant.
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 	// CompletedAt is when borg finished writing this archive, which is not when
 	// the run finished. A create that succeeds and a check that then hangs until
 	// a 24-hour timeout would otherwise stamp the repository as fresh at the
 	// moment of the timeout, understating the archive's age by a day and
 	// delaying the staleness alert by exactly as long as the hang lasted.
-	CompletedAt time.Time `json:"completed_at,omitempty"`
+	CompletedAt time.Time `json:"completed_at,omitzero"`
 	// Measured records that borgmatic reported this archive, as opposed to the
 	// outcome being inferred from a confirmation probe. It is not the same
 	// question as "are any of the numbers above nonzero": an empty archive that
@@ -436,7 +443,7 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 		// the documented alert join cannot see the one destination that has never
 		// backed up. An empty record says "configured, nothing known yet", which
 		// is exactly what wants alerting on.
-		if len(outcome.ConfiguredRepositories) > 0 {
+		if outcome.RepositoriesKnown || len(outcome.ConfiguredRepositories) > 0 {
 			current := make(map[string]bool, len(outcome.ConfiguredRepositories))
 			for _, id := range outcome.ConfiguredRepositories {
 				current[id] = true
