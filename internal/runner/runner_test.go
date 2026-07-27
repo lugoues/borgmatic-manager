@@ -789,7 +789,7 @@ func TestPerRepoSuccess(t *testing.T) {
 			mkResult("/mnt/local", "local", 10),
 			mkResult("ssh://borg@a/./r", "offsite-a", 20),
 		}
-		out := perRepoSuccess(configured, results)
+		out := withCreate(t).perRepoSuccess(configured, results)
 		byID := map[string]state.RepoOutcome{}
 		for _, o := range out {
 			byID[o.ID] = o
@@ -801,14 +801,14 @@ func TestPerRepoSuccess(t *testing.T) {
 
 	t.Run("label match when the reported location differs", func(t *testing.T) {
 		results := []createResult{mkResult("/resolved/elsewhere", "local", 5)}
-		out := perRepoSuccess([]config.RepoRef{{Path: "/mnt/local", Label: "local"}}, results)
+		out := withCreate(t).perRepoSuccess([]config.RepoRef{{Path: "/mnt/local", Label: "local"}}, results)
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultOK, out[0].Result, "matched by label despite the path mismatch")
 		assert.EqualValues(t, 5, out[0].Files)
 	})
 
 	t.Run("prune-only cycle: ok without a create entry", func(t *testing.T) {
-		out := perRepoSuccess(configured, nil)
+		out := withCreate(t).perRepoSuccess(configured, nil)
 		require.Len(t, out, 2)
 		for _, o := range out {
 			assert.Equal(t, state.ResultOK, o.Result)
@@ -817,7 +817,7 @@ func TestPerRepoSuccess(t *testing.T) {
 	})
 
 	t.Run("no configured repos yields nil", func(t *testing.T) {
-		assert.Nil(t, perRepoSuccess(nil, []createResult{mkResult("/x", "", 1)}))
+		assert.Nil(t, withCreate(t).perRepoSuccess(nil, []createResult{mkResult("/x", "", 1)}))
 	})
 }
 
@@ -978,7 +978,17 @@ func TestContainsPathToken(t *testing.T) {
 func TestNewestArchiveAtOrAfter(t *testing.T) {
 	runStart := time.Now()
 	assert.True(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(time.Second))), runStart))
-	assert.True(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-2*time.Second))), runStart), "within the skew window still counts")
+	// An archive from before the run is not this run's, however recently it was
+	// written. The old five-second tolerance credited a failed run with the
+	// previous run's archive, which a manual retry or an event-triggered cycle
+	// on a small dataset reaches easily.
+	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-2*time.Second))), runStart),
+		"an archive written before the run started did not come from it")
+	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-1500*time.Millisecond))), runStart),
+		"nor one from a second and a half earlier")
+	// Whole-second borg timestamps must still match a run that started mid-second.
+	assert.True(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Truncate(time.Second))), runStart),
+		"an archive stamped in the same second the run began still counts")
 	assert.False(t, newestArchiveAtOrAfter([]byte(listJSON(runStart.Add(-time.Hour))), runStart))
 	assert.False(t, newestArchiveAtOrAfter([]byte(`[{"archives":[]}]`), runStart), "no archives")
 	assert.False(t, newestArchiveAtOrAfter([]byte("not json"), runStart))
@@ -1105,4 +1115,72 @@ func TestProbesRunConcurrentlySoLocksAreNotHeldPerRepository(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, len(repos), peak, "each repository must be probed while the others are in flight")
+}
+
+// withCreate is a runner whose action set includes create, which is what makes
+// a zero exit mean "an archive was written".
+func withCreate(t *testing.T) *Runner {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake", nil, 0)
+}
+
+// A maintenance-only cycle exits zero without writing an archive anywhere.
+// Recording that as a per-repository success advances every repository's
+// last-success and resets its staleness, so a manager configured that way looks
+// permanently healthy while never backing anything up.
+func TestMaintenanceOnlyRunRecordsNoRepositorySuccess(t *testing.T) {
+	configured := []config.RepoRef{
+		{Path: "/mnt/local", Label: "local"},
+		{Path: "ssh://borg@a/./r", Label: "offsite"},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	maintenance := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake",
+		[]string{actionPrune, "compact", "check"}, 0)
+	assert.Nil(t, maintenance.perRepoSuccess(configured, nil),
+		"a cycle without create backed nothing up, so no repository succeeded")
+
+	backing := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake",
+		[]string{actionCreate, actionPrune}, 0)
+	assert.Len(t, backing.perRepoSuccess(configured, nil), len(configured),
+		"a cycle that does create still records each repository, stats or not")
+}
+
+// The entry count alone does not bound memory: the scanner accepts lines up to
+// a megabyte, so 500 of them is half a gigabyte held for the whole run. A
+// backup that fails by drowning the manager in output is not an improvement
+// over one that just fails.
+func TestRetainedErrorTextIsBoundedByBytesAsWellAsCount(t *testing.T) {
+	t.Run("many small messages stop at the entry cap", func(t *testing.T) {
+		rs := &runState{}
+		for i := range maxErrText + 50 {
+			rs.recordErrorText(fmt.Sprintf("error %d", i))
+		}
+		assert.Len(t, rs.errText, maxErrText)
+	})
+
+	t.Run("few huge messages stop at the byte cap", func(t *testing.T) {
+		rs := &runState{}
+		huge := strings.Repeat("x", 64<<10)
+		for range maxErrText {
+			rs.recordErrorText(huge)
+		}
+		assert.Less(t, len(rs.errText), maxErrText,
+			"the byte budget must bind first when messages are large")
+		assert.LessOrEqual(t, rs.errTextBytes, maxErrTextBytes+len(huge),
+			"retention overshoots by at most the message that crossed the line")
+	})
+
+	t.Run("messages recorded before the cap are still matchable", func(t *testing.T) {
+		rs := &runState{}
+		rs.recordErrorText("  Error while creating archive /mnt/repo1  ")
+		for range 100 {
+			rs.recordErrorText(strings.Repeat("y", 64<<10))
+		}
+		require.NotEmpty(t, rs.errText)
+		assert.Equal(t, "Error while creating archive /mnt/repo1", rs.errText[0],
+			"the cap must drop late noise, not the messages already kept")
+		assert.True(t, mentionedInErrors("/mnt/repo1", rs.errText))
+	})
 }
