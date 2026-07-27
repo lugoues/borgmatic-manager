@@ -714,11 +714,18 @@ func TestStatusJSONReportsTheCurrentRepositoriesNotThePersistedOnes(t *testing.T
 	assert.NotContains(t, doc.Groups[0].Repositories, "offsite",
 		"a destination the group no longer configures is history, not inventory")
 
-	t.Run("a repointed label is dropped too", func(t *testing.T) {
+	// A repointed label keeps its entry but loses its history: the destination is
+	// configured and has never completed, which is what wants reporting, and the
+	// numbers that exist belong to somewhere else. Same shape the gauges take.
+	t.Run("a repointed label keeps its entry and loses its history", func(t *testing.T) {
 		configured := map[string]map[string]string{"demo": {"local": "/mnt/local", "offsite": "/mnt/elsewhere"}}
 		doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, configured, nil, time.Now())
-		assert.NotContains(t, doc.Groups[0].Repositories, "offsite",
-			"the id survived the repoint; this history belongs to the old destination")
+		require.Contains(t, doc.Groups[0].Repositories, "offsite")
+		repointed := doc.Groups[0].Repositories["offsite"]
+		assert.True(t, repointed.LastSuccess.IsZero(),
+			"the old destination's freshness is not the new one's")
+		assert.Nil(t, repointed.LastStats)
+		assert.Equal(t, "/mnt/elsewhere", repointed.Path)
 	})
 
 	t.Run("a group nobody reported on is passed through", func(t *testing.T) {
@@ -807,4 +814,36 @@ func TestStatusInventoryCoversRefusedGroups(t *testing.T) {
 	assert.Contains(t, doc.Groups[0].Repositories, "local")
 	assert.NotContains(t, doc.Groups[0].Repositories, "offsite",
 		"a refused group still says what it configures, and it no longer configures this")
+}
+
+// A destination the group configures but has never backed up has no record, and
+// repository settings do not make the group due, so none may appear for a whole
+// period. Showing only what has history hides the destination most likely to
+// need attention: the one that has never run.
+func TestStatusJSONShowsARepositoryThatHasNeverRun(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		RepositoriesKnown:         true,
+		ConfiguredRepositories:    []string{"local"},
+		ConfiguredRepositoryPaths: map[string]string{"local": "/mnt/local"},
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Path: "/mnt/local", Result: state.ResultOK, Measured: true},
+		},
+	})
+
+	// offsite has just been added; the group is not due, so nothing has run.
+	configured := map[string]map[string]string{
+		"demo": {"local": "/mnt/local", "offsite": "/mnt/offsite"},
+	}
+	doc := buildStatusDoc(bs, store, "", time.Hour, 0, nil, nil, configured, nil, time.Now())
+
+	require.Len(t, doc.Groups, 1)
+	repos := doc.Groups[0].Repositories
+	require.Contains(t, repos, "offsite", "a configured destination is reported before its first run")
+	assert.True(t, repos["offsite"].LastSuccess.IsZero())
+	assert.Equal(t, "/mnt/offsite", repos["offsite"].Path)
+	assert.False(t, repos["local"].LastSuccess.IsZero(), "and the working one keeps its history")
 }

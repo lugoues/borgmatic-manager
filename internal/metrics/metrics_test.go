@@ -1298,3 +1298,23 @@ func TestRedactionCoversUrlsWithASingleSlash(t *testing.T) {
 		assert.Equal(t, "elapsed 12:30/60s", redactURLsIn("elapsed 12:30/60s"))
 	})
 }
+
+// The periodic reader reports export failures through OpenTelemetry's global
+// error handler as unstructured stderr, so returning the original error put the
+// credential in the journal on every interval regardless of what the structured
+// warning said.
+func TestTheErrorReturnedToTheReaderIsRedacted(t *testing.T) {
+	l := &loggingExporter{
+		Exporter: &stubExporter{err: func() error {
+			return errors.New(`Post "https://collector.example/v1?token=s3cret": refused`)
+		}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	err := l.Export(context.Background(), &metricdata.ResourceMetrics{})
+	require.Error(t, err, "a failure is still a failure")
+	assert.NotContains(t, err.Error(), "s3cret",
+		"whatever prints this error must not have the token to print")
+	assert.Contains(t, err.Error(), "collector.example")
+	assert.Contains(t, err.Error(), "refused")
+}

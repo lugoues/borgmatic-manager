@@ -97,9 +97,15 @@ type loggingExporter struct {
 func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
 	err := l.Exporter.Export(ctx, rm)
 	if err != nil {
+		// Redacted in both directions. The structured warning is ours, but the
+		// error goes back to the periodic reader, which reports failures through
+		// OpenTelemetry's global error handler as unstructured stderr: returning
+		// the original put the credential in the journal on every interval
+		// regardless of what this line said.
+		redacted := redactURLsIn(err.Error())
 		l.logger.Warn("metrics export failed; the OTLP collector is unreachable or rejecting",
-			"error", redactURLsIn(err.Error()))
-		return err
+			"error", redacted)
+		return errors.New(redacted)
 	}
 	// The first success is news and the rest are not, so exactly one of the two
 	// lines is emitted: logging both for the same export reads as two events.
