@@ -545,3 +545,34 @@ func TestStatsWrittenBeforeTheMeasuredFlagAreStillKept(t *testing.T) {
 	require.NotNil(t, stats, "an outcome carrying numbers is still a measurement")
 	assert.Equal(t, int64(12), stats.Files)
 }
+
+// A create that succeeds and a check that then hangs until a 24-hour timeout
+// must not stamp the repository as fresh at the moment of the timeout: staleness
+// would understate the archive's age by exactly the hang, delaying the alert by
+// as long as the problem lasted.
+func TestRepositoryFreshnessComesFromTheArchiveNotTheRunEnd(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	wrote := time.Now().Add(-24 * time.Hour)
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultTerminated, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Measured: true, Files: 5, CompletedAt: wrote},
+		},
+	})
+
+	rec := s.Snapshot()["g"].Repositories["local"]
+	assert.WithinDuration(t, wrote, rec.LastSuccess, time.Second,
+		"the archive is a day old, whatever the run did afterwards")
+
+	t.Run("without a completion time the run end still stands in", func(t *testing.T) {
+		finished := time.Now()
+		s.RecordRun("h", state.RunOutcome{
+			Finished: finished, Result: state.ResultOK, CreateAttempted: true,
+			Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK}},
+		})
+		rec := s.Snapshot()["h"].Repositories["local"]
+		assert.WithinDuration(t, finished, rec.LastSuccess, time.Second)
+	})
+}

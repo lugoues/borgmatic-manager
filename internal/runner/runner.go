@@ -442,6 +442,10 @@ func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRe
 	outcome := state.RunOutcome{
 		Finished: time.Now(),
 		Result:   state.ResultTerminated,
+		// The actions are what this run would have taken; the validation dying
+		// says nothing about that. Without it the run drops out of the
+		// per-repository counter as though it were a maintenance cycle.
+		CreateAttempted: r.actionsInclude(actionCreate),
 	}
 	for _, ref := range repos {
 		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
@@ -454,8 +458,9 @@ func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRe
 		return
 	}
 	outcome := state.RunOutcome{
-		Finished: time.Now(),
-		Result:   "config-invalid",
+		Finished:        time.Now(),
+		Result:          "config-invalid",
+		CreateAttempted: r.actionsInclude(actionCreate),
 	}
 	for _, ref := range repos {
 		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
@@ -600,9 +605,26 @@ func (rs *runState) bufferResult(line string) {
 }
 
 // refID is a repository's stable identity: its label when set, else its path.
+// refID is the key a repository's persisted state is stored under.
+//
+// A label wins, being the operator's own name for the destination. Failing that
+// it is the path, except that an environment-backed path is resolved first: the
+// literal "${BORG_REPO}" is the same string whatever it points at, so a record
+// stored under it survives the variable being repointed. Failures do not clear
+// LastSuccess, so the new destination would inherit the old one's freshness and
+// report as recently backed up having never produced an archive.
+//
+// Resolving means the key changes when the destination does, which is the point:
+// the old record no longer matches a configured repository and is pruned, and
+// the new one starts with nothing known about it.
 func refID(ref config.RepoRef) string {
 	if ref.Label != "" {
 		return ref.Label
+	}
+	if strings.Contains(ref.Path, "${") {
+		if expanded := os.ExpandEnv(ref.Path); expanded != "" && expanded != ref.Path {
+			return expanded
+		}
 	}
 	return ref.Path
 }
@@ -771,6 +793,7 @@ func hasResult(measured map[int]createResult, i int) bool {
 
 func applyStats(ro *state.RepoOutcome, res createResult) {
 	ro.Measured = true
+	ro.CompletedAt = parseBorgTime(res.Archive.End)
 	ro.Files = res.Archive.Stats.NFiles
 	ro.OriginalBytes = res.Archive.Stats.OriginalSize
 	ro.CompressedBytes = res.Archive.Stats.CompressedSize
@@ -1032,11 +1055,28 @@ func containsPathToken(msg, path string) bool {
 
 // isNameByte reports whether b can continue a single path-name component. '/'
 // and ':' are excluded: they separate components, so they end a path token.
+// isNameByte reports whether a byte continues a path token rather than ending
+// it, which is what stops one repository's path matching inside another's.
+//
+// The set is deliberately wider than alphanumerics: a directory name may legally
+// contain @, +, =, ~, %, # and more. With "/mnt/repo" and "/mnt/repo@old"
+// configured, treating @ as a delimiter made an error naming only the second one
+// implicate the first, so a destination that had backed up was recorded as
+// failed alongside the one that really had.
+//
+// What is left out is what a message uses to separate a path from prose:
+// whitespace, quotes, brackets, and the punctuation that ends a clause. The
+// colon stays a delimiter because "Repository /mnt/repo: does not exist" is a
+// shape borg actually emits, and reading it as part of the path would stop the
+// repository being recognized at all. That costs a path that genuinely ends in a
+// colon, which is the rarer case by a wide margin.
 func isNameByte(b byte) bool {
 	switch {
 	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
 		return true
-	case b == '.' || b == '-' || b == '_':
+	case b == '.', b == '-', b == '_':
+		return true
+	case b == '@', b == '+', b == '=', b == '~', b == '%', b == '#', b == '^', b == '!':
 		return true
 	default:
 		return false
@@ -1188,12 +1228,29 @@ func newestArchiveAtOrAfter(raw []byte, runStart time.Time) bool {
 	return false
 }
 
+// parseBorgTime reads one of borg's local-time stamps, returning the zero time
+// when it is absent or unparsable so callers fall back rather than guess.
+func parseBorgTime(ts string) time.Time {
+	if ts == "" {
+		return time.Time{}
+	}
+	for _, layout := range borgTimeLayouts {
+		if t, err := time.ParseInLocation(layout, ts, time.Local); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 // createResult mirrors one repository entry of create --json output. The first
 // entry is representative for group-level dataset size; the full list drives
 // per-repository outcomes.
 type createResult struct {
 	Archive struct {
-		Name     string  `json:"name"`
+		Name string `json:"name"`
+		// End is when borg finished writing this archive. borgmatic reports it in
+		// the same local-time layouts as list --json.
+		End      string  `json:"end"`
 		Duration float64 `json:"duration"`
 		Stats    struct {
 			NFiles           int64 `json:"nfiles"`
