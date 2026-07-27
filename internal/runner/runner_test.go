@@ -796,7 +796,7 @@ func TestPerRepoSuccess(t *testing.T) {
 		}
 		assert.Equal(t, state.ResultOK, byID["local"].Result)
 		assert.EqualValues(t, 20, byID["offsite-a"].Files)
-		assert.EqualValues(t, 3, byID["offsite-a"].DurationSeconds)
+		assert.InDelta(t, 3.0, byID["offsite-a"].DurationSeconds, 0.001)
 	})
 
 	t.Run("label match when the reported location differs", func(t *testing.T) {
@@ -1374,7 +1374,7 @@ func TestALaterActionFailureKeepsTheCreateMeasurements(t *testing.T) {
 		assert.Equal(t, state.ResultOK, out[0].Result)
 		assert.Equal(t, int64(1234), out[0].Files, "the reported measurements must survive the run failing")
 		assert.Equal(t, int64(5000), out[0].OriginalBytes)
-		assert.Equal(t, int64(42), out[0].DurationSeconds)
+		assert.InDelta(t, 42.0, out[0].DurationSeconds, 0.001)
 		assert.Equal(t, int64(7), out[1].Files)
 		assert.Empty(t, pf.probed(), "a repository borgmatic already measured needs no probe")
 	})
@@ -2087,4 +2087,49 @@ func TestAnUnjudgedRepointedRepositoryIsStillReconciled(t *testing.T) {
 	assert.Equal(t, []string{"offsite"}, o.ConfiguredRepositories)
 	assert.Equal(t, map[string]string{"offsite": "/mnt/new"}, o.ConfiguredRepositoryPaths,
 		"the destination must travel with the id, or a repoint is never noticed")
+}
+
+// borg reports a fractional duration and an archive can take well under a
+// second, so truncating made small but valid backups read as instant and cost
+// every other duration its precision on a gauge that is already a float.
+func TestARepositoryDurationKeepsItsFraction(t *testing.T) {
+	var res createResult
+	res.Repository.Location = "/repo"
+	res.Archive.Name = "a"
+	res.Archive.Duration = 0.42
+	res.Archive.Stats.NFiles = 1
+
+	out := measuredOutcomes([]config.RepoRef{{Path: "/repo"}}, []createResult{res})
+	require.Len(t, out, 1)
+	assert.InDelta(t, 0.42, out[0].DurationSeconds, 0.0001,
+		"a backup faster than a second still took time")
+
+	t.Run("longer durations keep their fraction too", func(t *testing.T) {
+		res.Archive.Duration = 12.75
+		out := measuredOutcomes([]config.RepoRef{{Path: "/repo"}}, []createResult{res})
+		require.Len(t, out, 1)
+		assert.InDelta(t, 12.75, out[0].DurationSeconds, 0.0001)
+	})
+}
+
+// A run that enumerated its repositories says so, which an empty slice cannot:
+// without the flag, removing the last repository is indistinguishable from a run
+// that never got far enough to look, and the record keeps a destination that is
+// no longer configured.
+func TestRecordedOutcomesSayWhetherTheInventoryWasKnown(t *testing.T) {
+	fake := newFakeExecutor()
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", []string{actionCreate}, 0)
+	r.execCommand = fake.exec
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
+		Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
+	})
+	require.NoError(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	assert.True(t, rec.outcomes["g"].RepositoriesKnown)
 }

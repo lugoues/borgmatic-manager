@@ -683,3 +683,69 @@ func TestARepointNoticedOnlyByReconciliationStillResetsHistory(t *testing.T) {
 		require.NotNil(t, rec.LastStats)
 	})
 }
+
+// Removing the last repository leaves a known-but-empty inventory, which an
+// empty slice cannot say for itself: a config that lists none and a run that
+// never got far enough to look are the same empty slice and opposite situations.
+func TestAnEmptyRepositoryInventoryClearsTheRecord(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+		RepositoriesKnown: true, ConfiguredRepositories: []string{"local"},
+		Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK, Measured: true}},
+	})
+	require.Len(t, s.Snapshot()["g"].Repositories, 1)
+
+	// repositories: [] and the config rejected: the inventory is known to be empty.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: "config-invalid",
+		RepositoriesKnown: true,
+	})
+	assert.Empty(t, s.Snapshot()["g"].Repositories,
+		"a destination the group no longer configures must not linger in status or inspect")
+
+	t.Run("a run that never looked leaves the record alone", func(t *testing.T) {
+		s.RecordRun("h", state.RunOutcome{
+			Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+			RepositoriesKnown: true, ConfiguredRepositories: []string{"local"},
+			Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK, Measured: true}},
+		})
+		s.RecordRun("h", state.RunOutcome{Finished: time.Now(), Result: state.ResultFailed})
+		assert.Len(t, s.Snapshot()["h"].Repositories, 1,
+			"silence about the inventory is not a report that it is empty")
+	})
+}
+
+// time.Time is a struct, so omitempty never omits it: a repository with no
+// archive timestamp persisted completed_at as year one, which a consumer can
+// read as a real completion.
+func TestAnUnsetCompletionTimeIsAbsentFromTheJSON(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultFailed}},
+	})
+
+	raw, err := os.ReadFile(filepath.Join(dir, "schedule.json"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "completed_at",
+		"a zero time is not a completion time, and omitempty never omits a struct")
+	// last_success keeps its zero value deliberately: it is a long-standing
+	// field whose absence would change the shape of status JSON, and every
+	// reader of it already treats the zero as "never".
+	assert.Contains(t, string(raw), "last_success")
+
+	t.Run("a real completion time is still written", func(t *testing.T) {
+		when := time.Now().Add(-time.Hour)
+		s.RecordRun("h", state.RunOutcome{
+			Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+			Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK, Measured: true, CompletedAt: when}},
+		})
+		raw, err := os.ReadFile(filepath.Join(dir, "schedule.json"))
+		require.NoError(t, err)
+		assert.Contains(t, string(raw), "completed_at")
+	})
+}
