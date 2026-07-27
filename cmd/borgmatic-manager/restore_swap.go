@@ -1110,17 +1110,37 @@ const btrfsSubvolumeRootInode = 256
 //
 // Created restrictively and widened afterwards: MkdirTemp makes it 0700, and
 // umask would mask an intended mode passed to Mkdir anyway.
-func createStagingDir(model string, logger *slog.Logger) (string, error) {
-	staging, err := os.MkdirTemp(filepath.Dir(model), scratchPattern(model, stagingPrefix))
+func createStagingDir(model string, logger *slog.Logger) (staging string, err error) {
+	staging, err = os.MkdirTemp(filepath.Dir(model), scratchPattern(model, stagingPrefix))
 	if err != nil {
 		return "", err
 	}
-	subvolume, err := isBtrfsSubvolumeRoot(model)
+	// Claimed the moment it exists, so that if anything below fails the cleanup
+	// can prove the directory is this tool's and remove it. Marking at the end
+	// meant a placeholder stranded by a setup failure carried no proof, and
+	// leftover cleanup deliberately refuses to delete what it cannot verify, so
+	// every retry under a persistent failure left another one behind for good.
+	markAsOurs(staging)
+
+	// From here the directory exists, so every failure has to take it with it.
+	// The caller cannot: the failure paths below return an empty name, and it
+	// only learns the name from a successful return. Held separately for exactly
+	// that reason.
+	created := staging
+	defer func() {
+		if err != nil {
+			if rmErr := removeScratchDir(created); rmErr != nil {
+				logger.Warn("could not remove a staging directory that could not be set up; "+
+					"the volume itself is untouched", "path", created, "error", rmErr)
+			}
+		}
+	}()
+
+	subvolume, err := isSubvolume(model)
 	if err != nil {
 		return "", err
 	}
 	if !subvolume {
-		markAsOurs(staging)
 		return staging, nil
 	}
 	// Replace the placeholder with a subvolume of the same name. Safe rather
@@ -1143,6 +1163,8 @@ func createStagingDir(model string, logger *slog.Logger) (string, error) {
 		markAsOurs(staging)
 		return staging, nil
 	}
+	// The placeholder's claim went with the inode the subvolume replaced.
+	markAsOurs(staging)
 	// A new subvolume has a new subvolume id, so it is a new qgroup. Limits and
 	// parent assignments are keyed on that id and stay with the old one, which
 	// this restore is about to delete: the volume silently leaves whatever quota
@@ -1155,10 +1177,9 @@ func createStagingDir(model string, logger *slog.Logger) (string, error) {
 			"path", model)
 	}
 	// #nosec G302 -- a directory, and briefly: it takes the model's mode next
-	if err := os.Chmod(staging, 0o700); err != nil {
+	if err = os.Chmod(staging, 0o700); err != nil {
 		return "", err
 	}
-	markAsOurs(staging)
 	return staging, nil
 }
 

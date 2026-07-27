@@ -2701,3 +2701,42 @@ func TestRestoreWithSwapReapsAStubbornStagingSubvolumeOnFailure(t *testing.T) {
 	assert.Empty(t, stagingDirsFor(t, data), "and nothing was left behind")
 	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume is untouched")
 }
+
+// A failure between creating the placeholder and finishing its setup used to
+// return an empty name, so the caller never learned what to remove. The
+// directory was also unmarked at that point, and leftover cleanup refuses to
+// delete what it cannot verify, so every retry under a persistent failure
+// stranded another one for good.
+func TestCreateStagingDirRemovesItsPlaceholderWhenSetupFails(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	realIs := isSubvolume
+	isSubvolume = func(string) (bool, error) { return false, errors.New("statfs refused") }
+	defer func() { isSubvolume = realIs }()
+
+	// Repeated, because the symptom is accumulation rather than a single leak.
+	for range 3 {
+		_, err := createStagingDir(model, quietLogger())
+		require.Error(t, err)
+	}
+	assert.Empty(t, stagingDirsFor(t, model), "each failed attempt left a directory nothing will ever clean up")
+}
+
+// And the placeholder must be provably this tool's from the moment it exists,
+// or the cleanup that would remove it declines to.
+func TestCreateStagingDirClaimsThePlaceholderImmediately(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	staging, err := createStagingDir(model, quietLogger())
+	require.NoError(t, err)
+	ours, known, err := provablyOurs(staging)
+	require.NoError(t, err)
+	if !known {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+	assert.True(t, ours, "the placeholder is not claimed, so cleanup would decline to remove it")
+}
