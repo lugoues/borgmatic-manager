@@ -955,7 +955,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 		if _, ok := measured[i]; ok {
 			continue // borgmatic already reported its archive; nothing to probe
 		}
-		if !scope.canConfirm(ref.Path) {
+		if !scope.canConfirm(resolvedRepoPath(ref)) {
 			// The pattern also matches a sibling group's archives, so a probe
 			// answers a different question from the one being asked: a sibling
 			// backup landing in the same whole second would confirm a success
@@ -971,7 +971,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 		go func(i int, path string) {
 			defer wg.Done()
 			confirmed[i], confirmedAt[i] = r.confirmRepoSucceeded(ctx, configPath, path, scope.pattern, runStart)
-		}(i, ref.Path)
+		}(i, resolvedRepoPath(ref))
 	}
 	wg.Wait()
 
@@ -1232,7 +1232,13 @@ func (r *Runner) runProbe(ctx context.Context, configPath, repoPath, archivePatt
 		// so the newest archive in it can belong to someone else: without this
 		// another group's fresh archive confirms this group's failed run as a
 		// success, advancing its last-success and silencing the alert.
-		args = append(args, "--match-archives", archivePattern)
+		// "sh:" pins the syntax. borg reads a leading "re:", "sh:" or "pp:" as a
+		// selector, so a format beginning with one of those produces a pattern
+		// borg interprets as a regular expression while the collision check
+		// models it as a shell glob, and the two disagree about which archives
+		// belong to this group. Prefixing makes the whole thing a shell pattern,
+		// which is what the check assumes and what the pattern was built as.
+		args = append(args, "--match-archives", "sh:"+archivePattern)
 	}
 	cmd := r.execCommand(ctx, r.borgmaticPath, args...)
 	if cmd.SysProcAttr == nil {
