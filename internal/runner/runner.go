@@ -727,6 +727,14 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	// same path the successful create just reported.
 	measured := matchResults(configured, results)
 
+	// Resolved once per repository rather than per lookup: mentionedInErrors is
+	// asked about every repository twice (to decide whether to probe, then to
+	// build the outcome), and resolving a spelling can hit the filesystem.
+	implicated := make([]bool, len(configured))
+	for i, ref := range configured {
+		implicated[i] = ref.Path != "" && mentionedInErrors(ref.Path, errText)
+	}
+
 	// Probed together rather than one after another. Every one of this group's
 	// repository locks is still held here, and another group sharing one of them
 	// is skipped for the whole time: serially that is probeTimeout per
@@ -740,7 +748,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 		if _, ok := measured[i]; ok {
 			continue // borgmatic already reported its archive; nothing to probe
 		}
-		if ref.Path == "" || mentionedInErrors(ref.Path, errText) {
+		if ref.Path == "" || implicated[i] {
 			continue // named in an error: it failed, and probing it is pointless
 		}
 		wg.Add(1)
@@ -758,7 +766,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 		case hasResult(measured, i):
 			ro.Result = state.ResultOK
 			applyStats(&ro, measured[i])
-		case ref.Path != "" && mentionedInErrors(ref.Path, errText):
+		case implicated[i]:
 			// This destination is named in an error: it failed.
 		case confirmed[i]:
 			ro.Result = state.ResultOK
