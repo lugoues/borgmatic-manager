@@ -323,3 +323,78 @@ func TestRecordRunTracksPerRepositoryLastSuccess(t *testing.T) {
 	require.NotEmpty(t, rec.History)
 	assert.Nil(t, rec.History[len(rec.History)-1].Repositories)
 }
+
+// A later failure replaces LastRun outright, and a probe-confirmed success
+// carries no measurements at all. Reading sizes from LastRun therefore either
+// stopped reporting them or reported zeros, and a dataset that appears to have
+// shrunk to nothing is a worse lie than one that stops updating.
+func TestRepoStatsSurviveALaterFailureAndAStatlessSuccess(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now().Add(-2 * time.Hour), Result: state.ResultOK,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Files: 100, OriginalBytes: 5000, DurationSeconds: 12},
+		},
+	})
+	stats := s.Snapshot()["g"].Repositories["local"].LastStats
+	require.NotNil(t, stats)
+	assert.Equal(t, int64(100), stats.Files)
+
+	// A failure afterwards: the measurements from the last real backup stand.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now().Add(-time.Hour), Result: state.ResultFailed,
+		Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultFailed}},
+	})
+	stats = s.Snapshot()["g"].Repositories["local"].LastStats
+	require.NotNil(t, stats, "a failure must not erase the last measured backup")
+	assert.Equal(t, int64(5000), stats.OriginalBytes)
+
+	// A probe-confirmed success carries nothing to measure and must not
+	// overwrite real numbers with zeros.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed,
+		Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK}},
+	})
+	stats = s.Snapshot()["g"].Repositories["local"].LastStats
+	require.NotNil(t, stats)
+	assert.Equal(t, int64(5000), stats.OriginalBytes, "a stat-less success must not zero the sizes")
+}
+
+// A destination removed from the config lingered forever in status, inspect and
+// the exported series, and was counted in the partial ratio, so the group
+// reported partial permanently.
+func TestRemovedRepositoriesAreDroppedFromState(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK,
+		ConfiguredRepositories: []string{"local", "offsite"},
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK},
+			{ID: "offsite", Result: state.ResultOK},
+		},
+	})
+	require.Len(t, s.Snapshot()["g"].Repositories, 2)
+
+	// offsite is removed from the group's configuration.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK,
+		ConfiguredRepositories: []string{"local"},
+		Repositories:           []state.RepoOutcome{{ID: "local", Result: state.ResultOK}},
+	})
+	repos := s.Snapshot()["g"].Repositories
+	assert.Len(t, repos, 1, "a repository the group no longer configures must not linger")
+	assert.Contains(t, repos, "local")
+
+	// A failed run omits repositories it could not judge; that must not be read
+	// as their removal.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed,
+		ConfiguredRepositories: []string{"local"},
+	})
+	assert.Contains(t, s.Snapshot()["g"].Repositories, "local",
+		"an unjudged repository is not a removed one")
+}
