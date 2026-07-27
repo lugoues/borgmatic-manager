@@ -11,6 +11,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -58,6 +59,10 @@ type Emitter struct {
 	mu        sync.Mutex
 	offline   map[string]int
 	allGroups map[string]struct{}
+	// observed records that a cycle has reported an inventory, which an empty
+	// allGroups cannot: the last group being removed and no cycle having run yet
+	// are the same empty map and opposite situations.
+	observed bool
 }
 
 // New builds an Emitter and starts the periodic OTLP exporter. The caller must
@@ -286,6 +291,7 @@ func (e *Emitter) observe(o metric.Observer,
 	now := e.now()
 
 	e.mu.Lock()
+	observed := e.observed
 	known := make(map[string]struct{}, len(e.allGroups))
 	for g := range e.allGroups {
 		known[g] = struct{}{}
@@ -305,10 +311,13 @@ func (e *Emitter) observe(o metric.Observer,
 		// during every transient disappearance. The record is the right thing to
 		// keep and the wrong thing to export.
 		//
-		// Only filtered once an inventory has actually been observed, so a
-		// collection that lands before the first cycle still reports from disk,
-		// which is the point of reading the gauges from persisted state.
-		if len(known) > 0 {
+		// Filtered once an inventory has actually been observed, so a collection
+		// landing before the first cycle still reports from disk, which is the
+		// point of reading these gauges from persisted state. The flag is what
+		// carries that distinction: removing the last group leaves an inventory
+		// that is empty and observed, which an empty map alone cannot tell from
+		// one that was never filled.
+		if observed {
 			if _, ok := known[group]; !ok {
 				continue
 			}
@@ -479,7 +488,7 @@ func (e *Emitter) ObserveInventory(bs *models.BackupState, off *state.Offline) {
 		counts[name] = n
 	}
 	e.mu.Lock()
-	e.offline, e.allGroups = counts, groups
+	e.offline, e.allGroups, e.observed = counts, groups, true
 	e.mu.Unlock()
 }
 
@@ -532,10 +541,42 @@ func EffectiveProtocol(cfg config.MetricsSettings) string {
 	return protocolHTTP
 }
 
-// EffectiveEndpoint reports the endpoint that will actually be used. An empty
-// config endpoint lets the exporter fall back to the standard environment
-// variables, so report those rather than logging a blank.
+// EffectiveEndpoint reports the endpoint that will actually be used, redacted
+// for logging. An empty config endpoint lets the exporter fall back to the
+// standard environment variables, so report those rather than logging a blank.
+//
+// Redacted because this value goes to the journal, which is readable by more
+// people than the config is. An authenticated collector is configured exactly as
+// the OTLP spec allows, with userinfo in the URL or a token in the query string,
+// and printing it whole hands that credential to every journal reader. The
+// scheme, host and path are what an operator needs to see; the secret is not.
 func EffectiveEndpoint(cfg config.MetricsSettings) string {
+	return redactEndpoint(rawEndpoint(cfg))
+}
+
+// redactEndpoint strips userinfo and query values from a URL, leaving the parts
+// that identify where metrics are going. A value that does not parse as a URL is
+// reported as unprintable rather than guessed at, since a malformed endpoint
+// could still contain a secret.
+func redactEndpoint(endpoint string) string {
+	if endpoint == "" || !strings.Contains(endpoint, "//") {
+		return endpoint
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "(unparsable endpoint)"
+	}
+	if u.User != nil {
+		u.User = url.User("redacted")
+	}
+	if u.RawQuery != "" {
+		u.RawQuery = "redacted"
+	}
+	u.Fragment = ""
+	return u.String()
+}
+
+func rawEndpoint(cfg config.MetricsSettings) string {
 	if cfg.Endpoint != "" {
 		return cfg.Endpoint
 	}
