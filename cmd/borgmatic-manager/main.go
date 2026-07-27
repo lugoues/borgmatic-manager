@@ -723,8 +723,17 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	r := e.newRunner(progressLogger(), configsDir, pf.borgmaticPath, pf.runTimeout, store)
 
 	// A manual run is a valid data point: emit and flush before returning.
-	shutdownMetrics, _ := enableMetrics(ctx, e, store, r, logger)
+	shutdownMetrics, emitter := enableMetrics(ctx, e, store, r, logger)
 	defer shutdownMetrics()
+	// The inventory-derived series (which groups exist, how many of their
+	// volumes are offline) come from the scheduler's per-cycle observation,
+	// which a one-shot run never performs. Without this a manager driven only by
+	// manual runs publishes run counts and sizes but never says which groups
+	// exist, so the very series that distinguishes "never backed up" from "no
+	// longer configured" would be missing exactly where it is needed.
+	if emitter != nil {
+		emitter.ObserveInventory(backupState, offline)
+	}
 
 	now := time.Now()
 	var failed, locked, unattempted []string
