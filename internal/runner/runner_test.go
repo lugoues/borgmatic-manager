@@ -2038,3 +2038,53 @@ func TestAttributionPicksTheLongestMatchingRepository(t *testing.T) {
 		assert.Equal(t, []bool{false, false}, got)
 	})
 }
+
+// One destination writes its archive early while another fails only after a long
+// timeout. borgmatic suppresses the create JSON, so the healthy destination is
+// confirmed by probe, and without carrying the probe's own timestamp it is
+// stamped with the end of the whole failed run: an hours-old archive reported as
+// freshly completed, with its staleness alert delayed by the difference.
+func TestAProbeConfirmedSuccessKeepsItsArchiveTime(t *testing.T) {
+	runStart := time.Now().Add(-3 * time.Hour)
+	wrote := runStart.Add(5 * time.Minute)
+	offsite := config.RepoRef{Path: "/mnt/offsite", Label: "offsite"}
+
+	pf := &probeFake{out: map[string]string{offsite.Path: listJSON(wrote)}}
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", nil, 0)
+	r.execCommand = pf.exec
+	run := &runState{logger: r.logger, group: "g"}
+
+	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+		[]config.RepoRef{offsite}, nil, archiveScope{pattern: "host-g-*"}, run, runStart)
+
+	require.Len(t, out, 1)
+	assert.Equal(t, state.ResultOK, out[0].Result)
+	assert.WithinDuration(t, wrote, out[0].CompletedAt, time.Second,
+		"the archive's own time, not the end of a run that failed hours later")
+}
+
+// A repointed label whose first run fails before the destination can be judged
+// at all: the outcome omits it, so only the reconciliation carries its path.
+func TestAnUnjudgedRepointedRepositoryIsStillReconciled(t *testing.T) {
+	fake := newFakeExecutor()
+	// A run that fails before any repository can be implicated or confirmed.
+	fake.runScript = `echo '{"levelname":"CRITICAL","message":"before_backup hook failed","name":"borgmatic"}' >&2; exit 1`
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", []string{actionCreate}, 0)
+	r.execCommand = fake.exec
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
+		Repositories: []config.RepoRef{{Path: "/mnt/new", Label: "offsite"}},
+	})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["g"]
+	assert.Equal(t, []string{"offsite"}, o.ConfiguredRepositories)
+	assert.Equal(t, map[string]string{"offsite": "/mnt/new"}, o.ConfiguredRepositoryPaths,
+		"the destination must travel with the id, or a repoint is never noticed")
+}

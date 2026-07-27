@@ -448,7 +448,14 @@ func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRe
 		CreateAttempted: r.actionsInclude(actionCreate),
 	}
 	for _, ref := range repos {
-		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
+		id := refID(ref)
+		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, id)
+		if ref.Path != "" {
+			if outcome.ConfiguredRepositoryPaths == nil {
+				outcome.ConfiguredRepositoryPaths = map[string]string{}
+			}
+			outcome.ConfiguredRepositoryPaths[id] = ref.Path
+		}
 	}
 	r.recorder.RecordRun(groupName, outcome)
 }
@@ -463,7 +470,14 @@ func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRe
 		CreateAttempted: r.actionsInclude(actionCreate),
 	}
 	for _, ref := range repos {
-		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
+		id := refID(ref)
+		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, id)
+		if ref.Path != "" {
+			if outcome.ConfiguredRepositoryPaths == nil {
+				outcome.ConfiguredRepositoryPaths = map[string]string{}
+			}
+			outcome.ConfiguredRepositoryPaths[id] = ref.Path
+		}
 	}
 	r.recorder.RecordRun(groupName, outcome)
 }
@@ -514,7 +528,14 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 		outcome.Repositories = repoOutcomes
 		outcome.CreateAttempted = r.actionsInclude(actionCreate)
 		for _, ref := range repos {
-			outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
+			id := refID(ref)
+			outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, id)
+			if ref.Path != "" {
+				if outcome.ConfiguredRepositoryPaths == nil {
+					outcome.ConfiguredRepositoryPaths = map[string]string{}
+				}
+				outcome.ConfiguredRepositoryPaths[id] = ref.Path
+			}
 		}
 		r.recorder.RecordRun(groupName, outcome)
 	}
@@ -913,6 +934,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	// matter how many there are, and each probe touches a different repository
 	// so they do not contend.
 	confirmed := make([]bool, len(configured))
+	confirmedAt := make([]time.Time, len(configured))
 	var wg sync.WaitGroup
 	for i, ref := range configured {
 		if _, ok := measured[i]; ok {
@@ -933,7 +955,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 		wg.Add(1)
 		go func(i int, path string) {
 			defer wg.Done()
-			confirmed[i] = r.confirmRepoSucceeded(ctx, configPath, path, scope.pattern, runStart)
+			confirmed[i], confirmedAt[i] = r.confirmRepoSucceeded(ctx, configPath, path, scope.pattern, runStart)
 		}(i, ref.Path)
 	}
 	wg.Wait()
@@ -949,6 +971,12 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 			// This destination is named in an error: it failed.
 		case confirmed[i]:
 			ro.Result = state.ResultOK
+			// The probe found the archive and knows when it was written. Without
+			// carrying that, a destination whose archive completed early is
+			// stamped with the end of a run that failed hours later, reporting an
+			// old archive as fresh and delaying its staleness alert by the
+			// difference.
+			ro.CompletedAt = confirmedAt[i]
 		default:
 			// Neither implicated nor confirmed (probe skipped on shutdown, or
 			// no fresh archive): leave this repo's stored state untouched.
@@ -1168,15 +1196,15 @@ const probeTimeout = 60 * time.Second
 // --json is suppressed by a group failure. Any uncertainty (shutdown in
 // progress, unreachable repo, probe error, no fresh archive) returns false: the
 // caller then leaves the repo's stored state untouched rather than crediting it.
-func (r *Runner) confirmRepoSucceeded(ctx context.Context, configPath, repoPath, archivePattern string, runStart time.Time) bool {
+func (r *Runner) confirmRepoSucceeded(ctx context.Context, configPath, repoPath, archivePattern string, runStart time.Time) (bool, time.Time) {
 	if repoPath == "" || ctx.Err() != nil {
-		return false
+		return false, time.Time{}
 	}
 	out, ok := r.runProbe(ctx, configPath, repoPath, archivePattern)
 	if !ok {
-		return false
+		return false, time.Time{}
 	}
-	return newestArchiveAtOrAfter(out, runStart)
+	return newestArchiveFromThisRun(out, runStart)
 }
 
 // runProbe runs 'borgmatic list --repository <path> --last 1 --json', enforcing
@@ -1275,10 +1303,20 @@ func archiveIsFromThisRun(archive time.Time, precise bool, runStart time.Time) b
 // newestArchiveAtOrAfter reports whether any archive in the list result was
 // written by this run rather than a previous one.
 func newestArchiveAtOrAfter(raw []byte, runStart time.Time) bool {
+	ok, _ := newestArchiveFromThisRun(raw, runStart)
+	return ok
+}
+
+// newestArchiveFromThisRun also reports when that archive was written, so a
+// destination confirmed by probe is dated from its archive rather than from the
+// end of a run that may have failed hours later.
+func newestArchiveFromThisRun(raw []byte, runStart time.Time) (bool, time.Time) {
 	var results []listResult
 	if err := json.Unmarshal(raw, &results); err != nil {
-		return false
+		return false, time.Time{}
 	}
+	var newest time.Time
+	found := false
 	for _, res := range results {
 		for _, a := range res.Archives {
 			ts := a.Start
@@ -1291,13 +1329,16 @@ func newestArchiveAtOrAfter(raw []byte, runStart time.Time) bool {
 					continue
 				}
 				if archiveIsFromThisRun(t, layout == borgTimeLayoutMicros, runStart) {
-					return true
+					found = true
+					if t.After(newest) {
+						newest = t
+					}
 				}
 				break
 			}
 		}
 	}
-	return false
+	return found, newest
 }
 
 // parseBorgTime reads one of borg's local-time stamps, returning the zero time

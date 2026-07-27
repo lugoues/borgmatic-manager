@@ -635,3 +635,51 @@ func TestRepointingALabelledRepositoryResetsItsHistory(t *testing.T) {
 		assert.Equal(t, "/mnt/a", rec.Path)
 	})
 }
+
+// The repoint the outcome never mentions: the first run after the change fails
+// before the destination can be judged, so only the reconciliation carries its
+// path. That is the run most likely to happen, which is what makes it matter.
+func TestARepointNoticedOnlyByReconciliationStillResetsHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+		ConfiguredRepositories:    []string{"offsite"},
+		ConfiguredRepositoryPaths: map[string]string{"offsite": "/mnt/old"},
+		Repositories: []state.RepoOutcome{
+			{ID: "offsite", Path: "/mnt/old", Result: state.ResultOK, Files: 9, Measured: true},
+		},
+	})
+	require.False(t, s.Snapshot()["g"].Repositories["offsite"].LastSuccess.IsZero())
+
+	// Repointed, and the run fails before judging anything.
+	s.RecordRun("g", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultFailed, CreateAttempted: true,
+		ConfiguredRepositories:    []string{"offsite"},
+		ConfiguredRepositoryPaths: map[string]string{"offsite": "/mnt/new"},
+	})
+
+	rec := s.Snapshot()["g"].Repositories["offsite"]
+	assert.True(t, rec.LastSuccess.IsZero(),
+		"the new destination has never succeeded and must not inherit a last success")
+	assert.Nil(t, rec.LastStats)
+	assert.Equal(t, "/mnt/new", rec.Path)
+
+	t.Run("an unchanged path keeps its history through reconciliation", func(t *testing.T) {
+		s.RecordRun("h", state.RunOutcome{
+			Finished: time.Now().Add(-time.Hour), Result: state.ResultOK, CreateAttempted: true,
+			ConfiguredRepositories:    []string{"local"},
+			ConfiguredRepositoryPaths: map[string]string{"local": "/mnt/a"},
+			Repositories:              []state.RepoOutcome{{ID: "local", Path: "/mnt/a", Result: state.ResultOK, Files: 3, Measured: true}},
+		})
+		s.RecordRun("h", state.RunOutcome{
+			Finished: time.Now(), Result: state.ResultFailed, CreateAttempted: true,
+			ConfiguredRepositories:    []string{"local"},
+			ConfiguredRepositoryPaths: map[string]string{"local": "/mnt/a"},
+		})
+		rec := s.Snapshot()["h"].Repositories["local"]
+		assert.False(t, rec.LastSuccess.IsZero())
+		require.NotNil(t, rec.LastStats)
+	})
+}
