@@ -1233,3 +1233,68 @@ func TestRedactionRecognizesMalformedSchemes(t *testing.T) {
 		assert.Contains(t, got, "refused")
 	})
 }
+
+// A repository added to an already-successful group has no record yet, and
+// repository settings do not make the group due, so none may appear for a whole
+// period. The group-level fallback cannot reveal it either: a healthy sibling
+// already supplies the group's info series.
+func TestANewlyAddedRepositoryIsJoinableBeforeItsFirstRun(t *testing.T) {
+	now := time.Now()
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"web": {Repositories: map[string]state.RepoRecord{
+			"local": {Path: "/mnt/local", LastSuccess: now.Add(-time.Hour)},
+		}},
+	}})
+	e.now = func() time.Time { return now }
+
+	bs := models.NewBackupState()
+	bs.AddVolume("web", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+	e.ObserveRepositories(map[string]map[string]string{
+		"web": {"local": "/mnt/local", "offsite": "/mnt/offsite"},
+	})
+
+	rm := collect(t, reader)
+
+	info := findMetric(t, rm, "backup_repository_info").Data.(metricdata.Gauge[int64])
+	var reported []string
+	for _, dp := range info.DataPoints {
+		reported = append(reported, attr(dp.Attributes, "repository"))
+	}
+	sort.Strings(reported)
+	assert.Equal(t, []string{"local", "offsite"}, reported,
+		"the new destination needs a series to be joined against")
+
+	stale := findMetric(t, rm, "backup_seconds_since_last_success").Data.(metricdata.Gauge[float64])
+	require.Len(t, stale.DataPoints, 1, "it has never succeeded, so it has no staleness")
+	assert.Equal(t, "local", attr(stale.DataPoints[0].Attributes, "repository"))
+
+	t.Run("no duplicate for a repository that does have a record", func(t *testing.T) {
+		count := 0
+		for _, r := range reported {
+			if r == "local" {
+				count++
+			}
+		}
+		assert.Equal(t, 1, count)
+	})
+}
+
+// An endpoint can be malformed in either direction: "https:/collector?token=..."
+// has one slash and reaches the exporter unvalidated just as readily as one with
+// a bad scheme.
+func TestRedactionCoversUrlsWithASingleSlash(t *testing.T) {
+	for _, tc := range []struct{ name, in, secret string }{
+		{name: "quoted", in: `parse "https:/collector?token=s3cret": bad`, secret: "s3cret"},
+		{name: "bare", in: `dial https:/collector?token=s3cret failed`, secret: "s3cret"},
+		{name: "userinfo", in: `parse "https:/u:pw@collector/x": bad`, secret: "pw"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.NotContains(t, redactURLsIn(tc.in), tc.secret)
+		})
+	}
+
+	t.Run("text with a colon and slash but no secret is unchanged", func(t *testing.T) {
+		assert.Equal(t, "elapsed 12:30/60s", redactURLsIn("elapsed 12:30/60s"))
+	})
+}
