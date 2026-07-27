@@ -330,7 +330,7 @@ manager:
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `backup_runs_total` | counter | `group`, `repository`, `result` | One increment per repository per run. A fan-out with one failed destination records both an `ok` and a `failed`. |
+| `backup_runs_total` | counter | `group`, `repository`, `result` | One increment per repository per run. A fan-out with one failed destination records both an `ok` and a `failed`. `result` is `ok`, `failed`, `terminated` or `unknown`; `unknown` is a destination the run reached but could not judge, and it is a counter label only, never stored state. |
 | `backup_group_info` | gauge | `group` | Always 1, one per configured group. |
 | `backup_repository_info` | gauge | `group`, `repository` | Always 1, once per repository the group has attempted. Join target for staleness alerts. |
 | `backup_last_size_bytes` | gauge | `group`, `repository`, `kind` | Last successful archive size; `kind` is `original`, `compressed` or `deduplicated`. |
