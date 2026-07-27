@@ -2127,13 +2127,30 @@ func TestRecordedOutcomesSayWhetherTheInventoryWasKnown(t *testing.T) {
 	r.SetRecorder(rec)
 
 	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
-		Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
+		Repositories:      []config.RepoRef{{Path: "/repo", Label: "local"}},
+		RepositoriesKnown: true,
 	})
 	require.NoError(t, err)
 
 	rec.mu.Lock()
-	defer rec.mu.Unlock()
 	assert.True(t, rec.outcomes["g"].RepositoriesKnown)
+	rec.mu.Unlock()
+
+	// And the other direction: generation could not read the list, so a run that
+	// otherwise succeeds must not claim it knows the inventory. Hardcoding this
+	// deletes every persisted record for a group whose config is mid-edit.
+	rec2 := &recordingStore{}
+	r.SetRecorder(rec2)
+	_, err = r.TryRunGroup(context.Background(), "h", config.GroupRunMeta{
+		Repositories:      []config.RepoRef{{Path: "/repo", Label: "local"}},
+		RepositoriesKnown: false,
+	})
+	require.NoError(t, err)
+
+	rec2.mu.Lock()
+	defer rec2.mu.Unlock()
+	assert.False(t, rec2.outcomes["h"].RepositoriesKnown,
+		"the runner reports what generation understood, not what it hopes")
 }
 
 // A labelled repository keeps its id across a repoint by design, so the stored
@@ -2241,4 +2258,28 @@ func TestAttributionReservesTheWholeMatchedRange(t *testing.T) {
 			[]string{"Error: Repository host:/mnt/repo is unreachable."})
 		assert.Equal(t, []bool{true, false}, got)
 	})
+}
+
+// A malformed repositories value yields no refs for the same reason an empty
+// list does, and reading it as "this group configures nothing" makes the
+// reconciliation delete every persisted record for a group whose operator was in
+// the middle of configuring a repository.
+func TestAnUnreadableRepositoryListIsNotAKnownEmptyOne(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.validateScript = "echo 'schema error' >&2; exit 1"
+	r := newTestRunner(t, fake, nil)
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	// Generation could not read the list, so it reports neither repositories nor
+	// a claim to have understood them.
+	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["g"]
+	assert.Equal(t, "config-invalid", o.Result)
+	assert.False(t, o.RepositoriesKnown,
+		"an unreadable list is not a report that the group configures nothing")
 }
