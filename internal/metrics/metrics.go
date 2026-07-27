@@ -278,6 +278,18 @@ func (e *Emitter) observe(o metric.Observer,
 // not persist anything: it composes with the schedule store as a Recorder.
 func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 	ctx := context.Background()
+	// A maintenance-only cycle (prune, compact, check, with no create) exits zero
+	// having written no archive anywhere. The runner already refuses to record a
+	// per-repository success for one; counting it here would put the same lie in
+	// the counter by another route, and a manager configured that way would show
+	// a steady stream of successful backups it never took.
+	//
+	// A maintenance cycle that fails still counts: a check that keeps failing is
+	// exactly what an operator wants alerted on, and reporting it is not a claim
+	// that anything was backed up.
+	if !o.CreateAttempted && o.Result == state.ResultOK {
+		return
+	}
 	if len(o.Repositories) == 0 {
 		// A timeout, a signal, or a failure that cannot be attributed leaves
 		// Repositories empty while ConfiguredRepositories still names every
@@ -355,6 +367,8 @@ const (
 	protocolHTTPProto  = "http/protobuf"
 	envMetricsProtocol = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"
 	envProtocol        = "OTEL_EXPORTER_OTLP_PROTOCOL"
+	envMetricsEndpoint = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+	envEndpoint        = "OTEL_EXPORTER_OTLP_ENDPOINT"
 )
 
 // newExporter builds an OTLP metric exporter for the configured protocol. An
@@ -377,6 +391,32 @@ func newExporter(ctx context.Context, cfg config.MetricsSettings) (sdkmetric.Exp
 	default:
 		return nil, fmt.Errorf("unknown metrics protocol %q (want \"http\" or \"grpc\")", cfg.Protocol)
 	}
+}
+
+// EffectiveProtocol reports the OTLP transport that will actually be used, after
+// the config and the standard environment variables are taken into account. It
+// exists so a startup log cannot claim a different transport from the one the
+// exporter was built with: re-deriving it at the call site is how those drift.
+func EffectiveProtocol(cfg config.MetricsSettings) string {
+	if p := resolveProtocol(cfg.Protocol); p != "" {
+		return p
+	}
+	return protocolHTTP
+}
+
+// EffectiveEndpoint reports the endpoint that will actually be used. An empty
+// config endpoint lets the exporter fall back to the standard environment
+// variables, so report those rather than logging a blank.
+func EffectiveEndpoint(cfg config.MetricsSettings) string {
+	if cfg.Endpoint != "" {
+		return cfg.Endpoint
+	}
+	for _, key := range []string{envMetricsEndpoint, envEndpoint} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return "(OTLP default)"
 }
 
 // resolveProtocol picks the OTLP transport, falling back to the standard

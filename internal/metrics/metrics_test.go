@@ -371,3 +371,81 @@ func TestUnattributedRepositoriesStillCountAsAnAttempt(t *testing.T) {
 		"archive/" + state.ResultUnknown: 1,
 	}, got, "every configured destination the run reached counts exactly once")
 }
+
+// The runner refuses to record a per-repository success for a maintenance-only
+// cycle. The configured-repository fallback reached the same lie by another
+// route: a manager configured with prune/compact/check and no create showed a
+// steady stream of successful backups it never took.
+func TestMaintenanceOnlyCyclesAreNotCountedAsBackups(t *testing.T) {
+	t.Run("a successful maintenance cycle counts nothing", func(t *testing.T) {
+		e, reader := newTestEmitter(t, fakeSource{})
+		e.RecordRun("web", state.RunOutcome{
+			Result:                 state.ResultOK,
+			CreateAttempted:        false,
+			ConfiguredRepositories: []string{"local", "offsite"},
+		})
+		rm := collect(t, reader)
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				assert.NotEqual(t, "backup_runs_total", m.Name,
+					"no archive was written, so no backup run happened")
+			}
+		}
+	})
+
+	// A check that keeps failing is exactly what wants alerting on, and counting
+	// it is not a claim that anything was backed up.
+	t.Run("a failed maintenance cycle still counts", func(t *testing.T) {
+		e, reader := newTestEmitter(t, fakeSource{})
+		e.RecordRun("web", state.RunOutcome{
+			Result:                 state.ResultFailed,
+			CreateAttempted:        false,
+			ConfiguredRepositories: []string{"local"},
+		})
+		sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
+		require.Len(t, sum.DataPoints, 1)
+		assert.Equal(t, state.ResultFailed, attr(sum.DataPoints[0].Attributes, "result"))
+		assert.Equal(t, "local", attr(sum.DataPoints[0].Attributes, "repository"))
+	})
+
+	t.Run("a real backup still counts", func(t *testing.T) {
+		e, reader := newTestEmitter(t, fakeSource{})
+		e.RecordRun("web", state.RunOutcome{
+			Result:                 state.ResultOK,
+			CreateAttempted:        true,
+			ConfiguredRepositories: []string{"local"},
+			Repositories:           []state.RepoOutcome{{ID: "local", Result: state.ResultOK}},
+		})
+		sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
+		require.Len(t, sum.DataPoints, 1)
+		assert.Equal(t, int64(1), sum.DataPoints[0].Value)
+	})
+}
+
+// The startup log exists to tell an operator where metrics are going. Deriving
+// it separately from the exporter is how it comes to name a transport the
+// exporter is not using.
+func TestTheReportedTransportIsTheOneTheExporterUses(t *testing.T) {
+	t.Run("config wins", func(t *testing.T) {
+		assert.Equal(t, protocolGRPC, EffectiveProtocol(config.MetricsSettings{Protocol: "GRPC"}))
+	})
+	t.Run("the environment is reported when config is silent", func(t *testing.T) {
+		t.Setenv(envProtocol, "grpc")
+		assert.Equal(t, protocolGRPC, EffectiveProtocol(config.MetricsSettings{}))
+	})
+	t.Run("the default is named, not left blank", func(t *testing.T) {
+		assert.Equal(t, protocolHTTP, EffectiveProtocol(config.MetricsSettings{}))
+	})
+	t.Run("endpoint falls back to the environment", func(t *testing.T) {
+		t.Setenv(envEndpoint, "http://collector:4318")
+		assert.Equal(t, "http://collector:4318", EffectiveEndpoint(config.MetricsSettings{}))
+	})
+	t.Run("the metrics-specific endpoint wins", func(t *testing.T) {
+		t.Setenv(envEndpoint, "http://generic:4318")
+		t.Setenv(envMetricsEndpoint, "http://specific:4318")
+		assert.Equal(t, "http://specific:4318", EffectiveEndpoint(config.MetricsSettings{}))
+	})
+	t.Run("an unset endpoint says so rather than logging an empty string", func(t *testing.T) {
+		assert.NotEmpty(t, EffectiveEndpoint(config.MetricsSettings{}))
+	})
+}
