@@ -18,6 +18,11 @@ const (
 	ResultOK         = "ok"
 	ResultFailed     = "failed"
 	ResultTerminated = "terminated"
+	// ResultUnknown labels an attempt that happened but could not be judged: the
+	// run reached a repository and neither implicated nor confirmed it. It is a
+	// metrics label only, never a stored outcome, because storing it would
+	// overwrite what is actually known about that repository.
+	ResultUnknown = "unknown"
 )
 
 // RunOutcome is the observed result of a group's most recent borgmatic
@@ -352,14 +357,30 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 			rec.Repositories[ro.ID] = rr
 		}
 
-		// Repositories the group no longer configures are dropped. Left in place
-		// they linger forever in status, inspect and the exported series, and
-		// runRepoHealth counts them in the total, so a removed destination
-		// permanently reports the group as partial.
-		if len(outcome.ConfiguredRepositories) > 0 && rec.Repositories != nil {
+		// Reconcile the inventory against what the group configures now.
+		//
+		// Both directions matter. Repositories the group no longer configures are
+		// dropped: left in place they linger forever in status, inspect and the
+		// exported series, and runRepoHealth counts them in the total, so a
+		// removed destination permanently reports the group as partial.
+		//
+		// Repositories it does configure are materialized even when this run
+		// could not judge them. A destination added to an established group whose
+		// next run fails early (a pre-backup hook, say) appears in neither the
+		// outcome nor the record, so it is absent from the inventory series and
+		// the documented alert join cannot see the one destination that has never
+		// backed up. An empty record says "configured, nothing known yet", which
+		// is exactly what wants alerting on.
+		if len(outcome.ConfiguredRepositories) > 0 {
 			current := make(map[string]bool, len(outcome.ConfiguredRepositories))
 			for _, id := range outcome.ConfiguredRepositories {
 				current[id] = true
+				if rec.Repositories == nil {
+					rec.Repositories = map[string]RepoRecord{}
+				}
+				if _, known := rec.Repositories[id]; !known {
+					rec.Repositories[id] = RepoRecord{}
+				}
 			}
 			for id := range rec.Repositories {
 				if !current[id] {
