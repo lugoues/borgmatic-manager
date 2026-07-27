@@ -491,16 +491,15 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 		return nil
 
 	// Our own run-timeout escalation: a deliberate stop, recorded as terminated.
-	// Per-repo state is left untouched: an interrupted run confirms nothing.
 	case timedOut && (exitCode == sigtermExit || exitCode == sigkillExit):
-		record(state.ResultTerminated, nil)
+		record(state.ResultTerminated, measuredOutcomes(repos, results))
 		r.logger.Warn("borgmatic timed out and was terminated", "group", groupName, "exit_code", exitCode,
 			"timeout", r.runTimeout, "duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s timed out after %s and was terminated", groupName, r.runTimeout)
 
 	// SIGINT/SIGTERM without a timeout: clean shutdown, expected, not a failure.
 	case exitCode == sigintExit || exitCode == sigtermExit:
-		record(state.ResultTerminated, nil)
+		record(state.ResultTerminated, measuredOutcomes(repos, results))
 		r.logger.Warn("borgmatic terminated by signal", "group", groupName, "exit_code", exitCode,
 			"duration", duration.Round(time.Second).String())
 		return fmt.Errorf("borgmatic for group %s terminated (exit %d)", groupName, exitCode)
@@ -725,6 +724,40 @@ func (r *Runner) perRepoSuccess(configured []config.RepoRef, results []createRes
 			applyStats(&ro, res)
 		}
 		out = append(out, ro)
+	}
+	return out
+}
+
+// measuredOutcomes builds per-repository outcomes for a run that was stopped
+// rather than one that failed: a timeout, or a signal during shutdown.
+//
+// An interrupted run confirms nothing, so nothing is probed and a repository
+// borgmatic did not report is left out, keeping its stored state untouched. What
+// it did report is another matter. create runs first, so a run killed while a
+// later prune, compact or check hangs has already written archives and already
+// said so, with their measurements. Discarding those leaves the per-repository
+// last-success and sizes stale for a backup that demonstrably happened, and the
+// group-level outcome keeps the same numbers anyway, so the two disagreed.
+//
+// The run as a whole stays terminated. This is about which destinations are
+// known to hold a fresh archive, not about calling the run a success.
+func measuredOutcomes(configured []config.RepoRef, results []createResult) []state.RepoOutcome {
+	if len(configured) == 0 || len(results) == 0 {
+		return nil
+	}
+	matched := matchResults(configured, results)
+	out := make([]state.RepoOutcome, 0, len(matched))
+	for i, ref := range configured {
+		res, ok := matched[i]
+		if !ok {
+			continue
+		}
+		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultOK}
+		applyStats(&ro, res)
+		out = append(out, ro)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

@@ -1621,3 +1621,68 @@ func TestAnOverlappingArchivePatternCannotConfirmSuccess(t *testing.T) {
 		assert.Equal(t, int64(11), out[0].Files)
 	})
 }
+
+// create runs first, so a run killed while a later prune, compact or check hangs
+// has already written archives and already reported them with their
+// measurements. Discarding those leaves per-repository last-success and sizes
+// stale for a backup that demonstrably happened, while the group-level outcome
+// keeps the same numbers, so the two disagree about the same run.
+func TestATerminatedRunKeepsWhatBorgmaticAlreadyMeasured(t *testing.T) {
+	local := config.RepoRef{Path: "/mnt/local", Label: "local"}
+	offsite := config.RepoRef{Path: "/mnt/offsite", Label: "offsite"}
+	res := func(loc string, files int64) createResult {
+		var r createResult
+		r.Repository.Location = loc
+		r.Archive.Stats.NFiles = files
+		r.Archive.Stats.OriginalSize = files * 10
+		return r
+	}
+
+	t.Run("measured destinations survive the termination", func(t *testing.T) {
+		out := measuredOutcomes([]config.RepoRef{local, offsite},
+			[]createResult{res(local.Path, 42), res(offsite.Path, 7)})
+		require.Len(t, out, 2)
+		assert.Equal(t, state.ResultOK, out[0].Result)
+		assert.Equal(t, int64(42), out[0].Files)
+		assert.True(t, out[0].Measured)
+		assert.Equal(t, int64(7), out[1].Files)
+	})
+
+	t.Run("an unmeasured destination is left untouched, not failed", func(t *testing.T) {
+		out := measuredOutcomes([]config.RepoRef{local, offsite},
+			[]createResult{res(local.Path, 42)})
+		require.Len(t, out, 1)
+		assert.Equal(t, "local", out[0].ID,
+			"an interrupted run confirms nothing about a destination borgmatic never reported")
+	})
+
+	t.Run("a run killed before create reports nothing", func(t *testing.T) {
+		assert.Nil(t, measuredOutcomes([]config.RepoRef{local, offsite}, nil))
+	})
+}
+
+// The end-to-end shape through the timeout branch: the run is terminated, and
+// the destination that finished still carries its measurements.
+func TestTheTimeoutBranchRecordsMeasuredDestinations(t *testing.T) {
+	fake := newFakeExecutor()
+	// create reports its archive, then the run hangs past the timeout.
+	fake.runScript = `echo '[{"repository":{"location":"/repo","label":"local"},"archive":{"name":"a","stats":{"nfiles":42,"original_size":420}}}]'; sleep 30`
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", []string{actionCreate, actionPrune}, 300*time.Millisecond)
+	r.execCommand = fake.exec
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
+		Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
+	})
+	require.Error(t, err, "the run timed out")
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["files"]
+	assert.Equal(t, state.ResultTerminated, o.Result, "the run as a whole is still terminated")
+	require.Len(t, o.Repositories, 1, "and the destination that finished is still recorded")
+	assert.Equal(t, state.ResultOK, o.Repositories[0].Result)
+	assert.Equal(t, int64(42), o.Repositories[0].Files)
+}
