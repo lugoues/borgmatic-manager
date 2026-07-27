@@ -275,12 +275,22 @@ func printStatus(bs *models.BackupState, store *state.ScheduleStore, lockDir str
 				// A fan-out where some destinations still backed up is partial, not
 				// a flat failure: surface it, but distinctly from 0-of-N.
 				//
-				// okN < total is required, not just okN > 0. When create succeeds
-				// everywhere and a later action (prune, compact, check) fails, the
-				// probes confirm every destination and okN == total: reporting
-				// "partial (N/N ok)" then contradicts itself and buries the action
-				// failure and its error behind a status that says the opposite.
-				if okN, total := runRepoHealth(o, rec); total > 1 && okN > 0 && okN < total {
+				// Partial needs a destination known to be ok and a destination known
+				// to have failed. Neither can be inferred from the count alone.
+				//
+				// okN == total is the all-succeeded case: create reached every
+				// destination and a later action (prune, compact, check) failed the
+				// run. "partial (N/N ok)" contradicts itself and buries the error.
+				//
+				// okN < total is not enough either, because total counts every
+				// configured destination while perRepoFailure deliberately omits
+				// the ones it could neither implicate nor confirm. A probe that
+				// timed out is not a failure, and saying "some destinations failed"
+				// about a destination nothing is known about is a guess presented
+				// as a finding.
+				// total > 1 is implied by the two counts, and kept only so a
+				// degenerate record cannot render "partial (1/1 ok)".
+				if okN, failedN, total := runRepoHealth(o, rec); okN > 0 && failedN > 0 && total > 1 {
 					r.result = fmt.Sprintf("partial (%d/%d ok)", okN, total)
 					r.partial = true
 				} else {
@@ -722,20 +732,28 @@ func printInspect(name string, group *models.VolumeGroup, rec state.GroupRecord,
 	}
 }
 
-// runRepoHealth reports how many destinations this run confirmed ok (okN) out
-// of the group's tracked total. total comes from the persisted per-repo records
-// (every configured destination), falling back to the run's own set.
-func runRepoHealth(o *state.RunOutcome, rec state.GroupRecord) (okN, total int) {
+// runRepoHealth reports how many of the group's destinations this run confirmed
+// ok and how many it found failed, out of the tracked total. total comes from
+// the persisted per-repo records (every configured destination), falling back to
+// the run's own set.
+//
+// okN + failedN need not equal total: a destination the run could neither
+// implicate nor confirm is in neither count, which is why callers must not read
+// "not ok" as "failed".
+func runRepoHealth(o *state.RunOutcome, rec state.GroupRecord) (okN, failedN, total int) {
 	for _, ro := range o.Repositories {
-		if ro.Result == state.ResultOK {
+		switch ro.Result {
+		case state.ResultOK:
 			okN++
+		case state.ResultFailed:
+			failedN++
 		}
 	}
 	total = len(rec.Repositories)
 	if total == 0 {
 		total = len(o.Repositories)
 	}
-	return okN, total
+	return okN, failedN, total
 }
 
 // printRepoRows renders one row per repository in a fan-out group: each
@@ -766,8 +784,13 @@ func printRepoRows(repos map[string]state.RepoRecord, now time.Time) {
 		// out the size of the backup that did complete. The result column still
 		// reflects LastRun, so the row reads "failed" with the last known size
 		// rather than "failed" with no size at all.
+		// Non-nil is the test, not nonzero. LastStats is only set by an outcome
+		// that was measured, so an all-zero one is an archive borgmatic reported
+		// as empty, and rendering that as "-" claims there is no measurement when
+		// there is one that says zero. An empty backup and an unknown one are
+		// different problems.
 		size := "-"
-		if st := rr.LastStats; st != nil && (st.Files > 0 || st.OriginalBytes > 0) {
+		if st := rr.LastStats; st != nil {
 			s := humanBytes(st.OriginalBytes)
 			if st.DeduplicatedBytes > 0 {
 				s += fmt.Sprintf(" (+%s dedup)", humanBytes(st.DeduplicatedBytes))

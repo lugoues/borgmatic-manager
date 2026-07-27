@@ -608,3 +608,76 @@ func TestInspectShowsTheLastMeasuredSizeAfterAFailure(t *testing.T) {
 	assert.Contains(t, out, state.ResultFailed,
 		"while the result column still reports the failure")
 }
+
+// perRepoFailure omits a destination it could neither implicate nor confirm (a
+// probe that timed out proves nothing), while runRepoHealth counts every
+// configured destination in the total. Reading "not ok" as "failed" then reports
+// "some destinations failed" about one that nothing is known about.
+func TestStatusDoesNotCallAnIndeterminateDestinationAFailure(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished:               time.Now(),
+		Result:                 state.ResultFailed,
+		ExitCode:               1,
+		LastError:              "Command error: borg check",
+		ConfiguredRepositories: []string{"local", "offsite"},
+		// offsite is absent: its probe timed out, so nothing is known about it.
+		Repositories: []state.RepoOutcome{{ID: "local", Result: state.ResultOK}},
+	})
+
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) })
+
+	assert.NotContains(t, out, "partial", "an unjudged destination is not a failed one")
+	assert.Contains(t, out, "1 group failed", "the run still failed and must say so")
+}
+
+// The control: a destination explicitly reported failed still reads as partial.
+func TestStatusStillReportsAConfirmedPartialFanOut(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished:               time.Now(),
+		Result:                 state.ResultFailed,
+		ExitCode:               1,
+		ConfiguredRepositories: []string{"local", "offsite", "archive"},
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK},
+			{ID: "offsite", Result: state.ResultFailed},
+			// archive is indeterminate, and must not change the verdict.
+		},
+	})
+
+	out := captureStdout(t, func() { printStatus(bs, store, "", time.Hour, 0, nil, nil, nil) })
+
+	assert.Contains(t, out, "partial (1/3 ok)", "one confirmed ok and one confirmed failed is partial")
+	assert.Contains(t, out, "1 group partial")
+}
+
+// A successful create of an empty source measures 0 files and 0 bytes. That is a
+// backup that happened, and rendering it as "-" claims there is no measurement
+// when there is one that says zero. An empty backup and an unknown one are
+// different problems, and only one of them is the operator's to chase.
+func TestInspectRendersAMeasuredEmptyArchive(t *testing.T) {
+	bs := models.NewBackupState()
+	bs.AddVolume("demo", models.VolumeInfo{Name: "demo_vol", HostPath: "/mnt/demo"})
+	group := bs.Groups["demo"]
+	store := state.LoadSchedule(t.TempDir(), nil)
+	store.RecordRun("demo", state.RunOutcome{
+		Finished: time.Now(), Result: state.ResultOK, CreateAttempted: true,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Measured: true}, // empty archive
+			{ID: "offsite", Result: state.ResultOK, Files: 5, OriginalBytes: 100, Measured: true},
+		},
+	})
+	rec, _ := store.Record("demo")
+
+	out := captureStdout(t, func() {
+		printInspect("demo", group, rec, true, "", "none", time.Hour, 0, nil)
+	})
+
+	assert.Contains(t, out, "0 files", "an archive measured as empty reports zero, not nothing")
+	assert.Contains(t, out, "5 files")
+}

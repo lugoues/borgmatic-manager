@@ -334,8 +334,11 @@ func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 			}
 			return
 		}
-		// Nothing to attribute it to: a config that failed to validate never
-		// produced a repository set. One group-level sample, empty repository.
+		// Nothing to attribute it to. A config-invalid run does name its
+		// destinations (the manager wrote the config that failed validation) and
+		// the runner passes them, so this is now only reached when the group has
+		// no usable repository set at all: generation itself failed, or the
+		// config named none.
 		e.runsTotal.Add(ctx, 1, metric.WithAttributes(
 			attribute.String("group", group), attribute.String("repository", ""), attribute.String("result", o.Result)))
 		return
