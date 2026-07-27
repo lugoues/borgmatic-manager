@@ -749,3 +749,49 @@ func TestAnUnsetCompletionTimeIsAbsentFromTheJSON(t *testing.T) {
 		assert.Contains(t, string(raw), "completed_at")
 	})
 }
+
+// A path that gains a trailing separator, or is written through a symlink, is
+// the same destination. Treating it as a new one discards the repository's whole
+// history, and a group that is not due has no way to earn it back until it next
+// runs.
+func TestAnEquivalentPathSpellingKeepsItsHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := state.LoadSchedule(dir, nil)
+
+	record := func(path string, files int64, result string) {
+		s.RecordRun("g", state.RunOutcome{
+			Finished: time.Now(), Result: result, CreateAttempted: true,
+			RepositoriesKnown:         true,
+			ConfiguredRepositories:    []string{"offsite"},
+			ConfiguredRepositoryPaths: map[string]string{"offsite": path},
+			Repositories: []state.RepoOutcome{
+				{ID: "offsite", Path: path, Result: result, Files: files, Measured: result == state.ResultOK},
+			},
+		})
+	}
+
+	record("/mnt/repo", 12, state.ResultOK)
+	require.NotNil(t, s.Snapshot()["g"].Repositories["offsite"].LastStats)
+
+	// The same destination, spelled with a trailing separator.
+	record("/mnt/repo/", 0, state.ResultFailed)
+	rec := s.Snapshot()["g"].Repositories["offsite"]
+	require.NotNil(t, rec.LastStats, "a trailing separator is not a new destination")
+	assert.Equal(t, int64(12), rec.LastStats.Files)
+	assert.False(t, rec.LastSuccess.IsZero())
+
+	t.Run("a genuinely different destination still resets", func(t *testing.T) {
+		record("/mnt/elsewhere", 0, state.ResultFailed)
+		rec := s.Snapshot()["g"].Repositories["offsite"]
+		assert.Nil(t, rec.LastStats)
+		assert.True(t, rec.LastSuccess.IsZero())
+	})
+}
+
+func TestSameDestination(t *testing.T) {
+	assert.True(t, state.SameDestination("/mnt/repo", "/mnt/repo"))
+	assert.True(t, state.SameDestination("/mnt/repo", "/mnt/repo/"))
+	assert.True(t, state.SameDestination("/mnt/a/../repo", "/mnt/repo"))
+	assert.False(t, state.SameDestination("/mnt/repo", "/mnt/other"))
+	assert.True(t, state.SameDestination("ssh://borg@h/./r", "ssh://borg@h/./r/"))
+}

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lugoues/borgmatic-manager/internal/config"
 	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 )
 
@@ -385,6 +386,21 @@ func (s *ScheduleStore) MarkSuccess(name, fingerprint string, startedAt time.Tim
 // so state stays small.
 const maxHistory = 90
 
+// SameDestination reports whether two spellings name the same repository.
+//
+// Canonical, not literal. A path that gains a trailing separator, or is written
+// through a symlink, is the same destination, and treating it as a new one
+// discards a repository's whole history: its last success and statistics go, and
+// a group that is not due has no way to earn them back until it next runs. The
+// matching side has compared repositories this way since the create results were
+// first attributed; the reconciliation was still comparing strings.
+func SameDestination(a, b string) bool {
+	if a == b {
+		return true
+	}
+	return config.CanonicalRepoKey(a) == config.CanonicalRepoKey(b)
+}
+
 // RecordRun stores a run outcome without touching schedule fields: the full
 // outcome becomes LastRun, a log-stripped copy joins the bounded History.
 func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
@@ -405,7 +421,7 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 			// label starts from nothing known rather than from the previous
 			// destination's freshness. An empty stored path is a record written
 			// before this field existed: adopted, not reset.
-			if ro.Path != "" && rr.Path != "" && rr.Path != ro.Path {
+			if samePath := SameDestination(rr.Path, ro.Path); ro.Path != "" && rr.Path != "" && !samePath {
 				rr = RepoRecord{}
 			}
 			if ro.Path != "" {
@@ -455,7 +471,7 @@ func (s *ScheduleStore) RecordRun(name string, outcome RunOutcome) {
 				switch {
 				case !known:
 					rec.Repositories[id] = RepoRecord{Path: path}
-				case path != "" && rr.Path != "" && rr.Path != path:
+				case path != "" && rr.Path != "" && !SameDestination(rr.Path, path):
 					// Repointed, and this run never judged it. The history
 					// belongs to the destination it was taken from.
 					rec.Repositories[id] = RepoRecord{Path: path}
