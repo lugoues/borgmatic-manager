@@ -66,7 +66,7 @@ func attr(set attribute.Set, key string) string {
 func TestRecordRunCountsPerRepository(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
 	e.RecordRun("web", state.RunOutcome{
-		Result: state.ResultFailed,
+		Result: state.ResultFailed, CreateAttempted: true,
 		Repositories: []state.RepoOutcome{
 			{ID: "local", Result: state.ResultOK},
 			{ID: "offsite", Result: state.ResultFailed},
@@ -277,6 +277,7 @@ func TestTerminatedRunsCountAgainstEachConfiguredRepository(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
 	e.RecordRun("web", state.RunOutcome{
 		Result:                 state.ResultTerminated,
+		CreateAttempted:        true,
 		ConfiguredRepositories: []string{"local", "offsite"},
 		// Repositories is empty: the run was killed before anything could be judged.
 	})
@@ -297,7 +298,7 @@ func TestTerminatedRunsCountAgainstEachConfiguredRepository(t *testing.T) {
 // group-level sample is the honest answer.
 func TestARunWithNoKnownRepositoriesStillCountsOnce(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
-	e.RecordRun("web", state.RunOutcome{Result: state.ResultFailed})
+	e.RecordRun("web", state.RunOutcome{Result: state.ResultFailed, CreateAttempted: true})
 
 	sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
 	require.Len(t, sum.DataPoints, 1)
@@ -359,6 +360,7 @@ func TestUnattributedRepositoriesStillCountAsAnAttempt(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
 	e.RecordRun("web", state.RunOutcome{
 		Result:                 state.ResultFailed,
+		CreateAttempted:        true,
 		ConfiguredRepositories: []string{"local", "offsite", "archive"},
 		Repositories: []state.RepoOutcome{
 			{ID: "local", Result: state.ResultOK},
@@ -400,19 +402,27 @@ func TestMaintenanceOnlyCyclesAreNotCountedAsBackups(t *testing.T) {
 		}
 	})
 
-	// A check that keeps failing is exactly what wants alerting on, and counting
-	// it is not a claim that anything was backed up.
-	t.Run("a failed maintenance cycle still counts", func(t *testing.T) {
+	// A failing check is still alertable, on the group counter, which is where
+	// the README points maintenance alerts. Counting it per repository as well
+	// weighs a maintenance failure against a backup success rate and duplicates
+	// what the group counter already says.
+	t.Run("a failed maintenance cycle counts only at the group level", func(t *testing.T) {
 		e, reader := newTestEmitter(t, fakeSource{})
 		e.RecordRun("web", state.RunOutcome{
 			Result:                 state.ResultFailed,
 			CreateAttempted:        false,
 			ConfiguredRepositories: []string{"local"},
 		})
-		sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
-		require.Len(t, sum.DataPoints, 1)
-		assert.Equal(t, state.ResultFailed, attr(sum.DataPoints[0].Attributes, "result"))
-		assert.Equal(t, "local", attr(sum.DataPoints[0].Attributes, "repository"))
+		rm := collect(t, reader)
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				assert.NotEqual(t, "backup_runs_total", m.Name,
+					"no backup was attempted, in either direction")
+			}
+		}
+		group := findMetric(t, rm, "backup_group_runs_total").Data.(metricdata.Sum[int64])
+		require.Len(t, group.DataPoints, 1)
+		assert.Equal(t, state.ResultFailed, attr(group.DataPoints[0].Attributes, "result"))
 	})
 
 	t.Run("a real backup still counts", func(t *testing.T) {
@@ -581,10 +591,11 @@ func TestTheCounterUsesItsDocumentedResultLabels(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
 	e.RecordRun("web", state.RunOutcome{
 		Result:                 "config-invalid",
+		CreateAttempted:        true,
 		ConfiguredRepositories: []string{"local"},
 	})
 	e.RecordRun("api", state.RunOutcome{
-		Result:       state.ResultTerminated,
+		Result: state.ResultTerminated, CreateAttempted: true,
 		Repositories: []state.RepoOutcome{{ID: "local", Result: "something-new"}},
 	})
 	e.RecordRun("db", state.RunOutcome{
@@ -665,23 +676,23 @@ func TestAMaintenanceOnlyCycleCountsAsARunButNotAsABackup(t *testing.T) {
 		"the run itself succeeded, and a success rate has to be able to say so")
 }
 
-// The failure direction of the same rule, which was already right and must stay
-// right: a check that keeps failing is what wants alerting on.
-func TestAFailedMaintenanceCycleCountsInBothPlacesItCan(t *testing.T) {
+// A run that never started still intended to back up: its actions say so, and
+// the validation dying says nothing about that. Without the flag it drops out of
+// the per-repository counter as though it were a maintenance cycle, undoing the
+// attribution a config-invalid run is supposed to carry.
+func TestARunThatNeverStartedIsStillABackupRun(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
 	e.RecordRun("web", state.RunOutcome{
-		Result: state.ResultFailed, CreateAttempted: false,
-		ConfiguredRepositories: []string{"local"},
+		Result:                 "config-invalid",
+		CreateAttempted:        true,
+		ConfiguredRepositories: []string{"local", "offsite"},
 	})
-	rm := collect(t, reader)
 
-	group := findMetric(t, rm, "backup_group_runs_total").Data.(metricdata.Sum[int64])
-	require.Len(t, group.DataPoints, 1)
-	assert.Equal(t, state.ResultFailed, attr(group.DataPoints[0].Attributes, "result"))
-
-	perRepo := findMetric(t, rm, "backup_runs_total").Data.(metricdata.Sum[int64])
-	require.Len(t, perRepo.DataPoints, 1)
-	assert.Equal(t, state.ResultFailed, attr(perRepo.DataPoints[0].Attributes, "result"))
+	sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
+	require.Len(t, sum.DataPoints, 2, "one per configured destination")
+	for _, dp := range sum.DataPoints {
+		assert.Equal(t, state.ResultFailed, attr(dp.Attributes, "result"))
+	}
 }
 
 // A one-shot run is supported while the daemon is up, so two processes export
