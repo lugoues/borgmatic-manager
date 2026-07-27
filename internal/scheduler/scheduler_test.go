@@ -680,12 +680,12 @@ func TestRepositoryInventoryCarriesDestinations(t *testing.T) {
 	t.Setenv("BORG_REPO", "/srv/borg/resolved")
 
 	got := RepositoryInventory(map[string]config.GroupRunMeta{
-		"web": {Repositories: []config.RepoRef{
+		"web": {RepositoriesKnown: true, Repositories: []config.RepoRef{
 			{Path: "/mnt/local", Label: "local"},
 			{Path: "${BORG_REPO}", Label: "offsite"},
 			{Path: "/mnt/plain"},
 		}},
-		"empty": {},
+		"empty": {RepositoriesKnown: true},
 	})
 
 	assert.Equal(t, map[string]string{
@@ -704,12 +704,13 @@ func TestRepositoryInventoryCarriesDestinations(t *testing.T) {
 func TestRepositoryInventoryIncludesRefusedGroups(t *testing.T) {
 	got := RepositoryInventory(
 		map[string]config.GroupRunMeta{
-			"good": {Repositories: []config.RepoRef{{Path: "/mnt/local", Label: "local"}}},
+			"good": {Repositories: []config.RepoRef{{Path: "/mnt/local", Label: "local"}}, RepositoriesKnown: true},
 		},
 		[]config.Refusal{{
-			Group:        "refused",
-			Reason:       "archive_name_format must contain the {group} token when groups share a repository",
-			Repositories: []config.RepoRef{{Path: "/mnt/shared", Label: "shared"}},
+			Group:             "refused",
+			Reason:            "archive_name_format must contain the {group} token when groups share a repository",
+			Repositories:      []config.RepoRef{{Path: "/mnt/shared", Label: "shared"}},
+			RepositoriesKnown: true,
 		}},
 	)
 
@@ -718,7 +719,35 @@ func TestRepositoryInventoryIncludesRefusedGroups(t *testing.T) {
 		"a refused group configures destinations even though it will not run")
 
 	t.Run("no refusals is still valid", func(t *testing.T) {
-		got := RepositoryInventory(map[string]config.GroupRunMeta{"good": {}})
+		got := RepositoryInventory(map[string]config.GroupRunMeta{"good": {RepositoriesKnown: true}})
 		assert.Contains(t, got, "good")
 	})
+}
+
+// Generation could not read a group's repository list, so the inventory must not
+// say it configures none: every consumer treats an empty map as confirmed, and
+// the records would be suppressed in the gauges and dropped from status and
+// inspect for a group whose config is merely mid-edit.
+func TestRepositoryInventoryOmitsGroupsItCouldNotRead(t *testing.T) {
+	got := RepositoryInventory(
+		map[string]config.GroupRunMeta{
+			"readable":   {RepositoriesKnown: true, Repositories: []config.RepoRef{{Path: "/mnt/a", Label: "a"}}},
+			"none":       {RepositoriesKnown: true},
+			"unreadable": {},
+		},
+		[]config.Refusal{
+			{Group: "refused-readable", RepositoriesKnown: true,
+				Repositories: []config.RepoRef{{Path: "/mnt/b", Label: "b"}}},
+			{Group: "refused-unreadable"},
+		},
+	)
+
+	assert.Contains(t, got, "readable")
+	assert.Contains(t, got, "none", "a config that lists none is a report, not a silence")
+	assert.Empty(t, got["none"])
+	assert.Contains(t, got, "refused-readable")
+
+	assert.NotContains(t, got, "unreadable",
+		"absence is how this map says the inventory is unknown")
+	assert.NotContains(t, got, "refused-unreadable")
 }
