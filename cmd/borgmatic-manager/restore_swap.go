@@ -90,7 +90,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 		if committed || keepStaging || staging == "" || errors.Is(err, errStranded) {
 			return
 		}
-		if rmErr := os.RemoveAll(staging); rmErr != nil {
+		if rmErr := removeScratchDir(staging); rmErr != nil {
 			logger.Warn("could not remove the staging directory; the volume itself is untouched",
 				"staging", staging, "error", rmErr)
 		}
@@ -117,7 +117,7 @@ func restoreWithSwap(targetData string, logger *slog.Logger, allowEmpty bool, ex
 	// rename gives the namespace change atomically but says nothing about the
 	// contents being on disk. Persist them before the original, which is the
 	// only other durable copy, is deleted.
-	if syncErr := syncStagedData(filepath.Dir(targetData)); syncErr != nil {
+	if syncErr := syncStagedData(targetData, staging, filepath.Dir(targetData)); syncErr != nil {
 		return fmt.Errorf("flushing the restored data to disk (the volume is untouched): %w", syncErr)
 	}
 
@@ -1426,16 +1426,32 @@ func clearInheritedSELinuxContext(staging string, logger *slog.Logger) error {
 // it blocks until a writer appears, and borgmatic has already exited. One
 // syncfs needs no descriptor on any of them.
 //
-// dir must be on the same filesystem as the staged data, which the parent of
-// the target satisfies: staging is created as its sibling.
-func syncStagedData(dir string) error {
-	// #nosec G304 -- the parent of a directory this process is restoring into
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
+// The candidates must all be on the staged data's filesystem, which the volume,
+// the staging directory and their shared parent all satisfy. The first that can
+// be opened wins: which of them is readable depends on modes this code does not
+// choose, and a parent that grants write and search but not read (mode 0300) is
+// a layout the previous in-place restore handled without ever reading it.
+func syncStagedData(candidates ...string) error {
+	var errs []error
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		// #nosec G304 -- a directory on the filesystem this process is restoring into
+		f, err := os.Open(dir)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		syncErr := unix.Syncfs(int(f.Fd()))
+		_ = f.Close()
+		if syncErr == nil {
+			return nil
+		}
+		errs = append(errs, syncErr)
 	}
-	defer func() { _ = f.Close() }()
-	return unix.Syncfs(int(f.Fd()))
+	return fmt.Errorf("no directory on the restored data's filesystem could be opened to flush it: %w",
+		errors.Join(errs...))
 }
 
 // syncDirFn is the seam for the durability barrier, so a test can make a flush

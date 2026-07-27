@@ -2594,3 +2594,110 @@ type fakeRuntime struct {
 func (f *fakeRuntime) ListContainers(context.Context) ([]runtime.ContainerInfo, error) {
 	return f.containers, nil
 }
+
+// A parent that grants write and search but not read is a layout the previous
+// in-place restore handled without ever reading it. Staging can be created and
+// filled there, so the flush must not be the one step that needs more.
+func TestRestoreWithSwapWorksUnderAnUnreadableParent(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads regardless of the directory mode")
+	}
+	data := liveVolume(t)
+	parent := filepath.Dir(data)
+	before, err := os.Stat(parent)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(parent, 0o300)) // write + search, no read
+	defer func() { _ = os.Chmod(parent, before.Mode().Perm()) }()
+
+	require.NoError(t, restoreWithSwap(data, quietLogger(), false, func(dest string) error {
+		return os.WriteFile(filepath.Join(dest, "restored.txt"), []byte("restored"), 0o644)
+	}, nil), "a restore that needs no read on the parent must not fail on the flush")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data))
+}
+
+// The flush only needs some directory on the right filesystem; which of the
+// candidates is readable depends on modes this code does not choose.
+func TestSyncStagedDataFallsThroughToAReadableCandidate(t *testing.T) {
+	dir := t.TempDir()
+	require.Error(t, syncStagedData(filepath.Join(dir, "nope")),
+		"a candidate that cannot be opened is not a flush")
+	require.NoError(t, syncStagedData(filepath.Join(dir, "nope"), dir),
+		"but a later one that can be opened is")
+	require.Error(t, syncStagedData(), "and no candidates at all is a failure, not a silent success")
+}
+
+// signal.Notify sends without blocking and drops what it cannot deliver, so a
+// one-slot channel lets a SIGCONT displace a SIGTERM that was already waiting.
+func TestForwardedSignalsAreNotDroppedWhenTwoArriveTogether(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "child.log")
+	logFile, err := os.Create(logPath)
+	require.NoError(t, err)
+	defer func() { _ = logFile.Close() }()
+
+	// #nosec G204 -- re-execs this test binary
+	child := exec.Command(os.Args[0], "-test.run=TestExtractSignalHelper")
+	child.Env = minimalEnv("BM_EXTRACT_SIGNAL_HELPER=1")
+	child.Stdout, child.Stderr = logFile, logFile
+	require.NoError(t, child.Start())
+	t.Cleanup(func() {
+		_ = child.Process.Signal(syscall.SIGCONT)
+		_ = child.Process.Kill()
+		reapBounded(t, child)
+	})
+
+	grandchild := waitForPID(t, logPath)
+
+	// Suspend, then deliver a termination and a resume back to back: the
+	// terminate must survive the continue rather than be displaced by it.
+	require.NoError(t, child.Process.Signal(syscall.SIGTSTP))
+	requireProcState(t, child.Process.Pid, "T", "the manager did not stop")
+	require.NoError(t, child.Process.Signal(syscall.SIGTERM))
+	require.NoError(t, child.Process.Signal(syscall.SIGCONT))
+
+	assert.Eventually(t, func() bool {
+		return syscall.Kill(grandchild, 0) != nil
+	}, helperGrace, 20*time.Millisecond, "the termination was dropped and borg kept running")
+}
+
+// The capacity is the invariant that prevents a dropped signal. Asserted
+// structurally rather than by racing two signals into the channel, because that
+// race is won or lost on scheduling and a test of it passes either way.
+func TestTheSignalChannelCanHoldEverySignalItRegisters(t *testing.T) {
+	ch, forwarded := forwardedSignalChannel()
+	require.NotEmpty(t, forwarded)
+	assert.GreaterOrEqual(t, cap(ch), len(forwarded),
+		"signal.Notify drops what it cannot deliver, so a smaller channel can lose a terminate to a continue")
+
+	for _, want := range []os.Signal{
+		syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM,
+		syscall.SIGHUP, syscall.SIGTSTP, syscall.SIGCONT,
+	} {
+		assert.Contains(t, forwarded, want, "the extract's own session makes this the only path for %s", want)
+	}
+}
+
+// A pre-swap failure has to clean up staging even when staging is a subvolume
+// that ordinary removal cannot reap. Left behind, the next restore fails trying
+// the same cleanup.
+func TestRestoreWithSwapReapsAStubbornStagingSubvolumeOnFailure(t *testing.T) {
+	data := liveVolume(t)
+	boom := errors.New("archive was pruned mid-extract")
+
+	realRemove, realDelete, realIs := removeAllFn, deleteBtrfsSubvolume, isSubvolume
+	removeAllFn = func(path string) error {
+		if strings.Contains(path, stagingPrefix) {
+			return errors.New("rmdir: operation not permitted")
+		}
+		return realRemove(path)
+	}
+	isSubvolume = func(path string) (bool, error) { return strings.Contains(path, stagingPrefix), nil }
+	deleted := ""
+	deleteBtrfsSubvolume = func(path string) error { deleted = path; return realRemove(path) }
+	defer func() { removeAllFn, deleteBtrfsSubvolume, isSubvolume = realRemove, realDelete, realIs }()
+
+	err := restoreWithSwap(data, quietLogger(), false, func(string) error { return boom }, nil)
+	require.ErrorIs(t, err, boom)
+	assert.NotEmpty(t, deleted, "the staging subvolume was not handed to btrfs")
+	assert.Empty(t, stagingDirsFor(t, data), "and nothing was left behind")
+	assert.Equal(t, []string{"original.txt"}, names(t, data), "the volume is untouched")
+}

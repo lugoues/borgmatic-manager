@@ -1490,10 +1490,13 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	// the terminating ones a restore can realistically meet (Ctrl-C, Ctrl-\, a
 	// supervisor's terminate, a closing terminal) plus the job-control pair,
 	// which for the same reason no longer reaches borgmatic on its own.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals,
-		syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP,
-		syscall.SIGTSTP, syscall.SIGCONT)
+	// Room for every registered signal at once. signal.Notify sends without
+	// blocking and drops what it cannot deliver, so a one-slot channel lets a
+	// SIGCONT arriving as a suspended restore resumes displace a SIGTERM that
+	// was already waiting: the manager would forward only the continue and the
+	// extract would carry on through a termination that was asked for.
+	signals, forwarded := forwardedSignalChannel()
+	signal.Notify(signals, forwarded...)
 	defer signal.Stop(signals)
 
 	if err := cmd.Start(); err != nil {
@@ -1545,6 +1548,23 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 			return waitOrKill(cmd, exited, ctx.Err().Error())
 		}
 	}
+}
+
+// forwardedSignalChannel returns the channel the extract's signals arrive on and
+// the signals to register for it.
+//
+// The capacity is the point, and it is why this is a function rather than two
+// lines at the call site. signal.Notify sends without blocking and drops what it
+// cannot deliver, so a channel smaller than the number of registered signals can
+// lose one: a SIGCONT arriving as a suspended restore resumes can take the only
+// slot from a SIGTERM already waiting, and the manager then forwards the
+// continue and never the terminate.
+func forwardedSignalChannel() (chan os.Signal, []os.Signal) {
+	forwarded := []os.Signal{
+		syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP,
+		syscall.SIGTSTP, syscall.SIGCONT,
+	}
+	return make(chan os.Signal, len(forwarded)), forwarded
 }
 
 // suspendWithExtract stops the extract and then this process, so a Ctrl-Z
