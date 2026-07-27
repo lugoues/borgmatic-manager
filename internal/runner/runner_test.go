@@ -1861,3 +1861,32 @@ func TestUnresolvableRepositoriesRemainDistinct(t *testing.T) {
 	assert.Equal(t, config.UnknownRepoKey, repoIdentity("${NOT_SET_A}"))
 	assert.NotEqual(t, config.UnknownRepoKey, repoIdentity("/plain/path"))
 }
+
+// A validation the manager killed says nothing about the config. Recording
+// config-invalid for a hung validation sends an operator looking for a schema
+// error that may not exist, and the code already applies that reasoning to
+// cancellation.
+func TestAValidationTimeoutIsNotAConfigError(t *testing.T) {
+	fake := newFakeExecutor()
+	fake.validateScript = "sleep 30"
+	r := newTestRunner(t, fake, nil)
+	r.validateTimeout = 200 * time.Millisecond
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "slowgroup", config.GroupRunMeta{
+		Repositories: []config.RepoRef{{Path: "/mnt/local", Label: "local"}},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out")
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["slowgroup"]
+	assert.Equal(t, state.ResultTerminated, o.Result,
+		"the exit status is ours, not borgmatic's verdict on the config")
+	assert.NotEqual(t, "config-invalid", o.Result)
+	assert.Equal(t, []string{"local"}, o.ConfiguredRepositories)
+	assert.Empty(t, o.Repositories,
+		"an unfinished validation confirms nothing about any destination")
+}

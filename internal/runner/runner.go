@@ -65,7 +65,10 @@ type Runner struct {
 	borgmaticPath string
 	actions       []string
 	runTimeout    time.Duration
-	killGrace     time.Duration
+	// validateTimeout is a field only so tests can shorten it; production always
+	// takes defaultValidateTimeout.
+	validateTimeout time.Duration
+	killGrace       time.Duration
 
 	// locks holds named binary semaphores: "group:<name>" (try), "repo:<key>" and "snapshots" (blocking, ordered).
 	locks   map[string]chan struct{}
@@ -147,13 +150,14 @@ func NewRunner(logger *slog.Logger, configDir, borgmaticPath string, actions []s
 		actions = defaultActions
 	}
 	return &Runner{
-		logger:        logger,
-		configDir:     configDir,
-		borgmaticPath: borgmaticPath,
-		actions:       actions,
-		runTimeout:    runTimeout,
-		killGrace:     defaultKillGrace,
-		locks:         make(map[string]chan struct{}),
+		logger:          logger,
+		configDir:       configDir,
+		borgmaticPath:   borgmaticPath,
+		actions:         actions,
+		runTimeout:      runTimeout,
+		validateTimeout: defaultValidateTimeout,
+		killGrace:       defaultKillGrace,
+		locks:           make(map[string]chan struct{}),
 		execCommand: func(_ context.Context, name string, args ...string) *exec.Cmd {
 			// Not CommandContext: cancellation must SIGTERM the process group
 			// (borg releases repo locks), never SIGKILL outright.
@@ -341,9 +345,10 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 		waitErr, run, start, time.Since(start), timedOut.Load())
 }
 
-// validateTimeout bounds 'borgmatic config validate', which runs while holding
-// every lock TryRunGroup acquired: a hang here must not stall the scheduler.
-const validateTimeout = 2 * time.Minute
+// defaultValidateTimeout bounds 'borgmatic config validate', which runs while
+// holding every lock TryRunGroup acquired: a hang here must not stall the
+// scheduler.
+const defaultValidateTimeout = 2 * time.Minute
 
 // validateConfig gates each cycle on 'borgmatic config validate', turning schema
 // drift into a precise, recorded failure instead of a broken backup run.
@@ -364,10 +369,10 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 	var waitErr error
 	go func() { waitErr = cmd.Wait(); close(exited) }()
 
-	timer := time.NewTimer(validateTimeout)
+	timer := time.NewTimer(r.validateTimeout)
 	defer timer.Stop()
 
-	var interrupted bool
+	var interrupted, timedOut bool
 	select {
 	case <-exited:
 	case <-ctx.Done():
@@ -376,7 +381,8 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 		r.terminateGroup(cmd, exited, groupName)
 		<-exited
 	case <-timer.C:
-		r.logger.Error("config validation timed out: signalling borgmatic", "group", groupName, "timeout", validateTimeout)
+		timedOut = true
+		r.logger.Error("config validation timed out: signalling borgmatic", "group", groupName, "timeout", r.validateTimeout)
 		r.terminateGroup(cmd, exited, groupName)
 		<-exited
 	}
@@ -386,6 +392,14 @@ func (r *Runner) validateConfig(ctx context.Context, groupName, configPath strin
 	// config-invalid would leave the group falsely marked broken.
 	if interrupted {
 		return fmt.Errorf("config validation for group %s interrupted: %w", groupName, ctx.Err())
+	}
+	// The same reasoning for a validation that hung: the exit status is ours, not
+	// borgmatic's verdict. Recorded as terminated so status shows the group did
+	// not run, rather than as config-invalid, which sends an operator to look for
+	// a schema error that may not exist.
+	if timedOut {
+		r.recordValidationTimeout(groupName, repos)
+		return fmt.Errorf("config validation for group %s timed out after %s", groupName, r.validateTimeout)
 	}
 
 	if err != nil {
@@ -418,6 +432,23 @@ func (r *Runner) terminateGroup(cmd *exec.Cmd, exited <-chan struct{}, groupName
 // empty repository, which drops it out of every repository-filtered dashboard,
 // and the inventory cannot reconcile a destination added or removed in the same
 // edit that broke the config.
+// recordValidationTimeout records a validation the manager killed. The group did
+// not run and its config was never judged, so per-repository state is left
+// untouched: an unfinished validation confirms nothing about any destination.
+func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRef) {
+	if r.recorder == nil {
+		return
+	}
+	outcome := state.RunOutcome{
+		Finished: time.Now(),
+		Result:   state.ResultTerminated,
+	}
+	for _, ref := range repos {
+		outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
+	}
+	r.recorder.RecordRun(groupName, outcome)
+}
+
 func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRef) {
 	if r.recorder == nil {
 		return
