@@ -261,3 +261,84 @@ func TestRepositoryInfoCoversADestinationThatHasNeverSucceeded(t *testing.T) {
 	repo, _ := sg.DataPoints[0].Attributes.Value(attribute.Key("repository"))
 	assert.Equal(t, "local", repo.AsString())
 }
+
+// A timeout or a signal leaves no per-repository breakdown to attribute the run
+// to, but the configured destinations are still known. Counting those under an
+// empty repository label drops precisely the unsuccessful attempts out of every
+// repository-filtered dashboard.
+func TestTerminatedRunsCountAgainstEachConfiguredRepository(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	e.RecordRun("web", state.RunOutcome{
+		Result:                 state.ResultTerminated,
+		ConfiguredRepositories: []string{"local", "offsite"},
+		// Repositories is empty: the run was killed before anything could be judged.
+	})
+
+	sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
+	got := map[string]int64{}
+	for _, dp := range sum.DataPoints {
+		got[attr(dp.Attributes, "repository")+"/"+attr(dp.Attributes, "result")] = dp.Value
+	}
+	assert.Equal(t, map[string]int64{
+		"local/" + state.ResultTerminated:   1,
+		"offsite/" + state.ResultTerminated: 1,
+	}, got, "one sample per configured destination, none under an empty repository")
+}
+
+// The other half of the same branch: a config that never validated has no
+// repository set at all, so there is nothing to attribute the run to and the
+// group-level sample is the honest answer.
+func TestARunWithNoKnownRepositoriesStillCountsOnce(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	e.RecordRun("web", state.RunOutcome{Result: state.ResultFailed})
+
+	sum := findMetric(t, collect(t, reader), "backup_runs_total").Data.(metricdata.Sum[int64])
+	require.Len(t, sum.DataPoints, 1)
+	assert.Equal(t, int64(1), sum.DataPoints[0].Value)
+	assert.Empty(t, attr(sum.DataPoints[0].Attributes, "repository"))
+}
+
+// WithFromEnv advertises OTEL_SERVICE_NAME as the way to name a service, but a
+// static detector listed after it silently overwrote the operator's value, so
+// every manager instance reported under the same identity.
+func TestServiceNameCanBeOverriddenFromTheEnvironment(t *testing.T) {
+	serviceName := func(t *testing.T) string {
+		t.Helper()
+		reader := sdkmetric.NewManualReader()
+		e, err := newEmitter(context.Background(), reader, "test",
+			fakeSource{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = e.Shutdown(context.Background()) })
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, reader.Collect(context.Background(), &rm))
+		v, _ := rm.Resource.Set().Value("service.name")
+		return v.AsString()
+	}
+
+	t.Run("the built-in name is the default", func(t *testing.T) {
+		assert.Equal(t, "borgmatic-manager", serviceName(t))
+	})
+
+	t.Run("OTEL_SERVICE_NAME wins", func(t *testing.T) {
+		t.Setenv("OTEL_SERVICE_NAME", "backups-prod")
+		assert.Equal(t, "backups-prod", serviceName(t))
+	})
+
+	t.Run("service.name in OTEL_RESOURCE_ATTRIBUTES wins", func(t *testing.T) {
+		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.name=backups-dr,deployment.environment=dr")
+		assert.Equal(t, "backups-dr", serviceName(t))
+	})
+
+	t.Run("the version attribute survives an overridden name", func(t *testing.T) {
+		t.Setenv("OTEL_SERVICE_NAME", "backups-prod")
+		reader := sdkmetric.NewManualReader()
+		e, err := newEmitter(context.Background(), reader, "v9.9.9",
+			fakeSource{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = e.Shutdown(context.Background()) })
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, reader.Collect(context.Background(), &rm))
+		v, _ := rm.Resource.Set().Value("service.version")
+		assert.Equal(t, "v9.9.9", v.AsString())
+	})
+}

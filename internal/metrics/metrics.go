@@ -110,13 +110,19 @@ func countDataPoints(rm *metricdata.ResourceMetrics) int {
 // newEmitter wires the meter provider around any reader (an OTLP periodic reader
 // in production, a manual reader in tests) and registers the instruments.
 func newEmitter(ctx context.Context, reader sdkmetric.Reader, version string, source StateSource, logger *slog.Logger) (*Emitter, error) {
+	// Detector order is significant: later detectors override earlier ones. The
+	// built-in identity goes first so it acts as a default, and WithFromEnv last
+	// so OTEL_SERVICE_NAME and service.name in OTEL_RESOURCE_ATTRIBUTES actually
+	// take effect. Reversed, the static name silently overwrote the configured
+	// one and every manager instance reported as the same service. The version
+	// attribute survives unless the environment deliberately replaces it.
 	res, err := resource.New(ctx,
-		resource.WithFromEnv(), // OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME
 		resource.WithTelemetrySDK(),
 		resource.WithAttributes(
 			semconv.ServiceName("borgmatic-manager"),
 			semconv.ServiceVersion(version),
 		),
+		resource.WithFromEnv(), // OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME
 	)
 	if err != nil {
 		// A resource error is not worth aborting metrics over: fall back to the
@@ -273,8 +279,20 @@ func (e *Emitter) observe(o metric.Observer,
 func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 	ctx := context.Background()
 	if len(o.Repositories) == 0 {
-		// A group with no per-repository breakdown (e.g. a config-invalid record)
-		// still counts as one run at the group level.
+		// A timeout, a signal, or a failure that cannot be attributed leaves
+		// Repositories empty while ConfiguredRepositories still names every
+		// destination. Counting those under repository="" would drop exactly the
+		// unsuccessful attempts out of any repository-filtered dashboard, which
+		// is the opposite of what the counter is for.
+		if len(o.ConfiguredRepositories) > 0 {
+			for _, id := range o.ConfiguredRepositories {
+				e.runsTotal.Add(ctx, 1, metric.WithAttributes(
+					attribute.String("group", group), attribute.String("repository", id), attribute.String("result", o.Result)))
+			}
+			return
+		}
+		// Nothing to attribute it to: a config that failed to validate never
+		// produced a repository set. One group-level sample, empty repository.
 		e.runsTotal.Add(ctx, 1, metric.WithAttributes(
 			attribute.String("group", group), attribute.String("repository", ""), attribute.String("result", o.Result)))
 		return
