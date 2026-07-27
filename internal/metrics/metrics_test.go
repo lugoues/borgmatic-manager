@@ -1,10 +1,14 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -448,4 +452,120 @@ func TestTheReportedTransportIsTheOneTheExporterUses(t *testing.T) {
 	t.Run("an unset endpoint says so rather than logging an empty string", func(t *testing.T) {
 		assert.NotEmpty(t, EffectiveEndpoint(config.MetricsSettings{}))
 	})
+}
+
+// The export decorator is the only thing that tells an operator whether metrics
+// are actually reaching the collector: OTLP failures otherwise go to
+// OpenTelemetry's global error handler as unstructured stderr, and successes are
+// silent. It had no test at all.
+func TestExportOutcomesReachTheLogs(t *testing.T) {
+	newLogged := func(exportErr func() error) (*loggingExporter, *syncBuffer) {
+		var buf syncBuffer
+		return &loggingExporter{
+			Exporter: &stubExporter{err: exportErr},
+			logger:   slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		}, &buf
+	}
+	ctx := context.Background()
+	rm := &metricdata.ResourceMetrics{}
+
+	t.Run("a failure warns every time", func(t *testing.T) {
+		l, buf := newLogged(func() error { return errors.New("connection refused") })
+		require.Error(t, l.Export(ctx, rm))
+		require.Error(t, l.Export(ctx, rm))
+		assert.Equal(t, 2, strings.Count(buf.String(), "level=WARN"),
+			"a collector that stays down must keep saying so")
+		assert.Contains(t, buf.String(), "connection refused", "including why")
+	})
+
+	t.Run("the first success is announced once, later ones are debug", func(t *testing.T) {
+		l, buf := newLogged(func() error { return nil })
+		require.NoError(t, l.Export(ctx, rm))
+		require.NoError(t, l.Export(ctx, rm))
+		require.NoError(t, l.Export(ctx, rm))
+		assert.Equal(t, 1, strings.Count(buf.String(), "level=INFO"),
+			"metrics are flowing is news once, not every interval")
+		assert.Equal(t, 2, strings.Count(buf.String(), "level=DEBUG"))
+	})
+
+	t.Run("a recovery is announced, having been preceded by failures", func(t *testing.T) {
+		fail := true
+		l, buf := newLogged(func() error {
+			if fail {
+				return errors.New("down")
+			}
+			return nil
+		})
+		require.Error(t, l.Export(ctx, rm))
+		fail = false
+		require.NoError(t, l.Export(ctx, rm))
+		assert.Contains(t, buf.String(), "level=WARN")
+		assert.Contains(t, buf.String(), "level=INFO")
+	})
+}
+
+// The count is logged as "series", and an operator reads it to sanity-check that
+// what arrived is what they expect. Counting instruments instead reports 6 for a
+// fan-out exporting dozens of series, which is not a small inaccuracy: nearly
+// every metric here is per repository.
+func TestExportedSeriesAreCountedNotInstruments(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{snap: map[string]state.GroupRecord{
+		"web": {Repositories: map[string]state.RepoRecord{
+			"local":   {LastSuccess: time.Now(), LastStats: &state.RepoOutcome{Files: 1, OriginalBytes: 2, Measured: true}},
+			"offsite": {LastSuccess: time.Now(), LastStats: &state.RepoOutcome{Files: 3, OriginalBytes: 4, Measured: true}},
+		}},
+	}})
+	bs := models.NewBackupState()
+	bs.AddVolume("web", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
+	e.ObserveInventory(bs, nil)
+
+	rm := collect(t, reader)
+	instruments := 0
+	for _, sm := range rm.ScopeMetrics {
+		instruments += len(sm.Metrics)
+	}
+	series := countDataPoints(&rm)
+
+	assert.Greater(t, series, instruments,
+		"two repositories and three size kinds make many more series than instruments")
+	// backup_last_size_bytes alone is 2 repositories x 3 kinds.
+	assert.GreaterOrEqual(t, series, 6)
+
+	// An instrument whose aggregation the switch does not know counts as one
+	// rather than zero, so adding an instrument type undercounts the log line
+	// instead of making it disappear from it.
+	unknown := metricdata.ResourceMetrics{ScopeMetrics: []metricdata.ScopeMetrics{{
+		Metrics: []metricdata.Metrics{
+			{Name: "histogram-ish", Data: metricdata.Histogram[int64]{
+				DataPoints: []metricdata.HistogramDataPoint[int64]{{}, {}, {}},
+			}},
+		},
+	}}}
+	assert.Equal(t, 1, countDataPoints(&unknown))
+}
+
+// stubExporter is an sdkmetric.Exporter whose Export outcome the test controls.
+type stubExporter struct {
+	sdkmetric.Exporter
+	err func() error
+}
+
+func (s *stubExporter) Export(context.Context, *metricdata.ResourceMetrics) error { return s.err() }
+
+// syncBuffer is a bytes.Buffer safe for a logger writing from another goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
