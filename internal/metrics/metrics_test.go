@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -604,4 +605,77 @@ func TestTheCounterUsesItsDocumentedResultLabels(t *testing.T) {
 	// The detail is not lost, it just lives where the detail belongs.
 	assert.Equal(t, state.ResultTerminated, counterResult(state.ResultTerminated))
 	assert.Equal(t, state.ResultUnknown, counterResult(state.ResultUnknown))
+}
+
+// When create reaches every destination and a later prune, compact or check
+// fails, every per-repository sample is correctly ok and the run is still a
+// failure. Derived from the repository samples alone, a maintenance failure that
+// recurs forever is invisible to anything selecting failed runs.
+func TestAGroupFailureIsCountedEvenWhenEveryDestinationSucceeded(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	e.RecordRun("web", state.RunOutcome{
+		Result:          state.ResultFailed, // a later prune failed
+		CreateAttempted: true,
+		Repositories: []state.RepoOutcome{
+			{ID: "local", Result: state.ResultOK, Measured: true},
+			{ID: "offsite", Result: state.ResultOK, Measured: true},
+		},
+	})
+	rm := collect(t, reader)
+
+	perRepo := findMetric(t, rm, "backup_runs_total").Data.(metricdata.Sum[int64])
+	for _, dp := range perRepo.DataPoints {
+		assert.Equal(t, state.ResultOK, attr(dp.Attributes, "result"),
+			"both destinations did get their archive, so both are ok")
+	}
+
+	group := findMetric(t, rm, "backup_group_runs_total").Data.(metricdata.Sum[int64])
+	require.Len(t, group.DataPoints, 1, "one sample per run, not per destination")
+	assert.Equal(t, state.ResultFailed, attr(group.DataPoints[0].Attributes, "result"))
+	assert.Equal(t, "web", attr(group.DataPoints[0].Attributes, "group"))
+	_, hasRepo := group.DataPoints[0].Attributes.Value(attribute.Key("repository"))
+	assert.False(t, hasRepo, "the group counter carries no repository label to sum across")
+}
+
+// The maintenance rule applies to both counters, or the group counter reports
+// the successful backups a create-less cycle never took.
+func TestAMaintenanceOnlyCycleCountsInNeitherCounter(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	e.RecordRun("web", state.RunOutcome{
+		Result: state.ResultOK, CreateAttempted: false,
+		ConfiguredRepositories: []string{"local"},
+	})
+	rm := collect(t, reader)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			assert.NotContains(t, []string{"backup_runs_total", "backup_group_runs_total"}, m.Name,
+				"nothing was backed up, so no backup run happened at either level")
+		}
+	}
+}
+
+// A one-shot run is supported while the daemon is up, so two processes export
+// the same cumulative counter with the same attributes. Without a distinguishing
+// resource attribute a collector sees one stream from two producers, and reads
+// the manual run as a counter reset or drops it at the daemon's next push.
+func TestEachProcessExportsItsOwnCounterStream(t *testing.T) {
+	instanceOf := func(t *testing.T) string {
+		t.Helper()
+		reader := sdkmetric.NewManualReader()
+		e, err := newEmitter(context.Background(), reader, "test",
+			fakeSource{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = e.Shutdown(context.Background()) })
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, reader.Collect(context.Background(), &rm))
+		v, ok := rm.Resource.Set().Value("service.instance.id")
+		require.True(t, ok, "the resource must carry service.instance.id")
+		return v.AsString()
+	}
+
+	id := instanceOf(t)
+	assert.NotEmpty(t, id)
+	assert.Equal(t, id, instanceOf(t), "one identity per process, stable across emitters")
+	assert.Contains(t, id, fmt.Sprintf("%d", os.Getpid()),
+		"derived from the process, so a restart is distinguishable from its predecessor")
 }
