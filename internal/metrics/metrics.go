@@ -304,6 +304,24 @@ func (e *Emitter) observe(o metric.Observer,
 	e.mu.Unlock()
 }
 
+// counterResult maps a stored outcome onto the counter's documented label set.
+//
+// State keeps the specific status because status and inspect want the detail;
+// the counter has a fixed vocabulary that dashboards and alert rules select on.
+// Exporting a status like "config-invalid" raw means a rule matching
+// result="failed" silently misses exactly the runs that never got off the
+// ground, so anything outside the vocabulary lands on "failed": it did not
+// succeed, and being wrong about which kind of failure is far better than being
+// invisible.
+func counterResult(result string) string {
+	switch result {
+	case state.ResultOK, state.ResultFailed, state.ResultTerminated, state.ResultUnknown:
+		return result
+	default:
+		return state.ResultFailed
+	}
+}
+
 // RecordRun increments the run counter once per repository outcome, so a fan-out
 // with one failed destination records both an ok and a failed sample. It does
 // not persist anything: it composes with the schedule store as a Recorder.
@@ -330,7 +348,7 @@ func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 		if len(o.ConfiguredRepositories) > 0 {
 			for _, id := range o.ConfiguredRepositories {
 				e.runsTotal.Add(ctx, 1, metric.WithAttributes(
-					attribute.String("group", group), attribute.String("repository", id), attribute.String("result", o.Result)))
+					attribute.String("group", group), attribute.String("repository", id), attribute.String("result", counterResult(o.Result))))
 			}
 			return
 		}
@@ -340,14 +358,14 @@ func (e *Emitter) RecordRun(group string, o state.RunOutcome) {
 		// no usable repository set at all: generation itself failed, or the
 		// config named none.
 		e.runsTotal.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("group", group), attribute.String("repository", ""), attribute.String("result", o.Result)))
+			attribute.String("group", group), attribute.String("repository", ""), attribute.String("result", counterResult(o.Result))))
 		return
 	}
 	judged := make(map[string]bool, len(o.Repositories))
 	for _, ro := range o.Repositories {
 		judged[ro.ID] = true
 		e.runsTotal.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("group", group), attribute.String("repository", ro.ID), attribute.String("result", ro.Result)))
+			attribute.String("group", group), attribute.String("repository", ro.ID), attribute.String("result", counterResult(ro.Result))))
 	}
 	// A partly attributed failure: one destination is named in an error while
 	// another can be neither implicated nor confirmed. The run reached both, so
