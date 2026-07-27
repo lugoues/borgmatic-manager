@@ -53,6 +53,12 @@ type GroupRunMeta struct {
 	// RunID is minted fresh each generation and stamped onto dump helper
 	// containers so the runner reaps only this run's orphans.
 	RunID string
+	// ArchivePattern matches the archive names this group's config produces,
+	// with borg's date placeholders replaced by wildcards. Groups are allowed to
+	// share a repository, so "the newest archive here" is not the same question
+	// as "the newest archive this group wrote", and only the second one confirms
+	// that this group's backup reached this repository.
+	ArchivePattern string
 }
 
 // GeneratorOptions carries host-environment facts the generator needs.
@@ -257,6 +263,7 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		// Record the token before substitution: pass 2 needs the literal {group}, not a substring.
 		hasGroupToken := strings.Contains(format, groupTokenPlaceholder)
 		final["archive_name_format"] = strings.ReplaceAll(format, groupTokenPlaceholder, groupName)
+		archivePattern := archiveMatchPattern(final["archive_name_format"].(string))
 
 		snapshotHooks := hasSnapshotHooks(final)
 
@@ -265,10 +272,11 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			final:      final,
 			groupToken: hasGroupToken,
 			meta: GroupRunMeta{
-				Repos:         extractRepoKeys(final),
-				Repositories:  extractRepoRefs(final),
-				SnapshotHooks: snapshotHooks,
-				RunID:         runID,
+				Repos:          extractRepoKeys(final),
+				Repositories:   extractRepoRefs(final),
+				SnapshotHooks:  snapshotHooks,
+				ArchivePattern: archivePattern,
+				RunID:          runID,
 			},
 		})
 	}
@@ -698,6 +706,33 @@ func canonicalRepoKey(path string) string {
 		return resolved
 	}
 	return cleaned
+}
+
+// archiveMatchPattern turns an archive_name_format into a borg match pattern by
+// replacing every remaining {...} placeholder with a wildcard.
+//
+// The manager has already substituted {group}, so what is left is borg's own
+// runtime placeholders ({now}, {hostname}, {fqdn} and friends). Replacing them
+// gives a pattern matching exactly the archives this group's config writes,
+// which is what distinguishes this group's archives from another group's in a
+// shared repository.
+func archiveMatchPattern(format string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range format {
+		switch {
+		case r == '{':
+			if depth == 0 {
+				b.WriteByte('*')
+			}
+			depth++
+		case r == '}' && depth > 0:
+			depth--
+		case depth == 0:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // hasSnapshotHooks reports whether the config enables any filesystem snapshot

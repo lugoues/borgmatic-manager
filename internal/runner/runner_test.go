@@ -827,6 +827,7 @@ func TestPerRepoSuccess(t *testing.T) {
 type probeFake struct {
 	mu        sync.Mutex
 	listCalls []string
+	lastArgs  []string
 	out       map[string]string
 }
 
@@ -845,6 +846,7 @@ func (p *probeFake) exec(_ context.Context, _ string, args ...string) *exec.Cmd 
 	}
 	p.mu.Lock()
 	p.listCalls = append(p.listCalls, repo)
+	p.lastArgs = append([]string(nil), args...)
 	p.mu.Unlock()
 	if j := p.out[repo]; j != "" {
 		return exec.Command("/bin/sh", "-c", "cat <<'JSONEOF'\n"+j+"\nJSONEOF")
@@ -885,7 +887,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.")
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local}, run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local}, "", run, runStart)
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultFailed, out[0].Result)
 		assert.Empty(t, pf.probed(), "the implicated repo must not be probed")
@@ -897,7 +899,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.")
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
 		require.Len(t, out, 1)
 		assert.Equal(t, state.ResultOK, out[0].Result)
 		assert.Equal(t, []string{offA.Path}, pf.probed())
@@ -908,7 +910,7 @@ func TestPerRepoFailure(t *testing.T) {
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
 		assert.Nil(t, out, "no fresh archive and not implicated: neither advanced nor failed")
 	})
 
@@ -917,7 +919,7 @@ func TestPerRepoFailure(t *testing.T) {
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
 		assert.Nil(t, out)
 	})
 
@@ -930,7 +932,7 @@ func TestPerRepoFailure(t *testing.T) {
 		run := &runState{logger: r.logger, group: "g"}
 		run.recordErrorText("Repository /mnt/local does not exist.") // local failed
 
-		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local, offA, offB}, run, runStart)
+		out := r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{local, offA, offB}, "", run, runStart)
 		byID := map[string]state.RepoOutcome{}
 		for _, o := range out {
 			byID[o.ID] = o
@@ -949,7 +951,7 @@ func TestPerRepoFailure(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		out := r.perRepoFailure(ctx, "/cfg.yaml", []config.RepoRef{offA}, run, runStart)
+		out := r.perRepoFailure(ctx, "/cfg.yaml", []config.RepoRef{offA}, "", run, runStart)
 		assert.Nil(t, out)
 		assert.Empty(t, pf.probed(), "no borgmatic work is started during shutdown")
 	})
@@ -958,7 +960,7 @@ func TestPerRepoFailure(t *testing.T) {
 		pf := &probeFake{}
 		r := newRunner(pf)
 		run := &runState{logger: r.logger, group: "g"}
-		assert.Nil(t, r.perRepoFailure(context.Background(), "/cfg.yaml", nil, run, runStart))
+		assert.Nil(t, r.perRepoFailure(context.Background(), "/cfg.yaml", nil, "", run, runStart))
 	})
 }
 
@@ -982,4 +984,125 @@ func TestNewestArchiveAtOrAfter(t *testing.T) {
 	assert.False(t, newestArchiveAtOrAfter([]byte("not json"), runStart))
 	assert.True(t, newestArchiveAtOrAfter([]byte(fmt.Sprintf(`[{"archives":[{"time":%q}]}]`,
 		runStart.Add(time.Second).Format("2006-01-02T15:04:05"))), runStart), "falls back to time field and the no-microseconds layout")
+}
+
+func (p *probeFake) argsOfLastProbe() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.lastArgs...)
+}
+
+// Groups are allowed to share a repository, so the newest archive in one can
+// belong to a different group. Without scoping, that group's fresh archive
+// confirms this group's failed run as a success, advancing its last-success and
+// silencing the alert that should have fired.
+func TestProbeIsScopedToThisGroupsArchives(t *testing.T) {
+	runStart := time.Now().Add(-time.Hour)
+	offsite := config.RepoRef{Path: "ssh://borg@a/./r", Label: "offsite"}
+
+	pf := &probeFake{out: map[string]string{offsite.Path: listJSON(runStart.Add(30 * time.Minute))}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake", nil, 0)
+	r.execCommand = pf.exec
+
+	run := &runState{logger: r.logger, group: "g"}
+	run.recordErrorText("something else went wrong")
+
+	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+		[]config.RepoRef{offsite}, "host-g-*", run, runStart)
+	require.Len(t, out, 1)
+	assert.Equal(t, state.ResultOK, out[0].Result)
+
+	args := pf.argsOfLastProbe()
+	require.Contains(t, args, "--match-archives", "the probe must ask only for this group's archives")
+	for i, a := range args {
+		if a == "--match-archives" {
+			require.Less(t, i+1, len(args))
+			assert.Equal(t, "host-g-*", args[i+1])
+		}
+	}
+}
+
+// And with no pattern it must not pass an empty filter, which borg would read
+// as matching nothing.
+func TestProbeOmitsTheFilterWhenThereIsNoPattern(t *testing.T) {
+	runStart := time.Now().Add(-time.Hour)
+	offsite := config.RepoRef{Path: "ssh://borg@a/./r", Label: "offsite"}
+
+	pf := &probeFake{out: map[string]string{offsite.Path: listJSON(runStart.Add(30 * time.Minute))}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake", nil, 0)
+	r.execCommand = pf.exec
+
+	run := &runState{logger: r.logger, group: "g"}
+	run.recordErrorText("something else went wrong")
+
+	_ = r.perRepoFailure(context.Background(), "/cfg.yaml", []config.RepoRef{offsite}, "", run, runStart)
+	assert.NotContains(t, pf.argsOfLastProbe(), "--match-archives")
+}
+
+// Every one of this group's repository locks is still held while these probes
+// run, and another group sharing one is skipped for the whole time. Serially
+// that is probeTimeout per repository, so several unreachable destinations
+// could hold them for minutes; concurrently the worst case is one timeout no
+// matter how many there are.
+func TestProbesRunConcurrentlySoLocksAreNotHeldPerRepository(t *testing.T) {
+	runStart := time.Now().Add(-time.Hour)
+	repos := []config.RepoRef{
+		{Path: "ssh://borg@a/./r", Label: "a"},
+		{Path: "ssh://borg@b/./r", Label: "b"},
+		{Path: "ssh://borg@c/./r", Label: "c"},
+	}
+
+	var mu sync.Mutex
+	live, peak := 0, 0
+	gate := make(chan struct{})
+	counting := func(_ context.Context, _ string, args ...string) *exec.Cmd {
+		isList := false
+		for _, a := range args {
+			if a == "list" {
+				isList = true
+			}
+		}
+		if !isList {
+			return exec.Command("/bin/sh", "-c", "exit 0")
+		}
+		mu.Lock()
+		live++
+		if live > peak {
+			peak = live
+		}
+		reached := live == len(repos)
+		mu.Unlock()
+		if reached {
+			close(gate) // every probe is in flight at once
+		}
+		<-gate
+		mu.Lock()
+		live--
+		mu.Unlock()
+		return exec.Command("/bin/sh", "-c", "exit 1")
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake", nil, 0)
+	r.execCommand = counting
+
+	run := &runState{logger: r.logger, group: "g"}
+	run.recordErrorText("a hook failed before any repository ran")
+
+	done := make(chan struct{})
+	go func() {
+		_ = r.perRepoFailure(context.Background(), "/cfg.yaml", repos, "", run, runStart)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("probes did not all run: serial probing cannot reach the gate")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, len(repos), peak, "each repository must be probed while the others are in flight")
 }
