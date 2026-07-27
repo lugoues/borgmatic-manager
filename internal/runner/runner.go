@@ -648,7 +648,16 @@ func refID(ref config.RepoRef) string {
 	if ref.Label != "" {
 		return ref.Label
 	}
-	return resolvedRepoPath(ref)
+	// Canonical, because for an unlabelled repository the path is the key. A
+	// spelling change that SameDestination would forgive on a labelled
+	// repository becomes a different record here, and since repository settings
+	// do not make a group due, the old history is suppressed and the new id
+	// reports as never completed until the next scheduled run.
+	path := resolvedRepoPath(ref)
+	if key := config.CanonicalRepoKey(path); key != config.UnknownRepoKey {
+		return key
+	}
+	return path
 }
 
 // resolvedRepoPath is the destination borg will actually write to.

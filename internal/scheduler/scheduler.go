@@ -170,7 +170,11 @@ func repoID(ref config.RepoRef) string {
 	if ref.Label != "" {
 		return ref.Label
 	}
-	return resolvedRepoPath(ref)
+	path := resolvedRepoPath(ref)
+	if key := config.CanonicalRepoKey(path); key != config.UnknownRepoKey {
+		return key
+	}
+	return path
 }
 
 // resolvedRepoPath mirrors the runner's notion of where a repository actually
