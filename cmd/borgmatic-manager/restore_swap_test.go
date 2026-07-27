@@ -1459,33 +1459,41 @@ func parentOf(pid int) (int, error) {
 }
 
 // A project id is inode state reached by ioctl, so none of the copying carries
-// it and the replacement starts at project 0. The warning is all this promises,
-// so it has to be accurate in both directions: silent where there is no quota
-// to lose, and specific where there is.
-func TestProjectQuotaWarningOnlyFiresWhenThereIsOneToLose(t *testing.T) {
+// it and the replacement inherits the parent's instead. The warning is all this
+// promises, so it has to be accurate in both directions: silent when the
+// replacement lands in the same project, specific when it does not.
+func TestProjectQuotaWarningComparesTheReplacementWithTheVolume(t *testing.T) {
 	dir := t.TempDir()
 	model := filepath.Join(dir, "_data")
 	require.NoError(t, os.Mkdir(model, 0o755))
+	staging := filepath.Join(dir, "staging")
+	require.NoError(t, os.Mkdir(staging, 0o755))
 
 	realID := projectQuotaID
 	defer func() { projectQuotaID = realID }()
 
 	for name, tc := range map[string]struct {
-		id       uint64
-		known    bool
-		wantWarn bool
+		volume, replacement uint64
+		known               bool
+		wantWarn            bool
 	}{
-		"under a project quota":         {id: 4242, known: true, wantWarn: true},
-		"project zero, nothing to lose": {id: 0, known: true, wantWarn: false},
-		"filesystem cannot say":         {id: 0, known: false, wantWarn: false},
+		"the same project":          {volume: 4242, replacement: 4242, known: true},
+		"escaping a quota":          {volume: 4242, replacement: 0, known: true, wantWarn: true},
+		"inheriting someone else's": {volume: 0, replacement: 77, known: true, wantWarn: true},
+		"neither is under a quota":  {volume: 0, replacement: 0, known: true},
+		"the filesystem cannot say": {volume: 4242, replacement: 0, known: false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			projectQuotaID = func(string) (uint64, bool) { return tc.id, tc.known }
+			projectQuotaID = func(path string) (uint64, bool) {
+				if path == model {
+					return tc.volume, tc.known
+				}
+				return tc.replacement, tc.known
+			}
 			logs, logger := capturedWarnLogger()
-			warnAboutProjectQuota(model, logger)
+			warnAboutProjectQuota(model, staging, logger)
 			if tc.wantWarn {
 				assert.Contains(t, logs.String(), "project quota")
-				assert.Contains(t, logs.String(), "4242", "the id is named so it can be set again")
 			} else {
 				assert.Empty(t, logs.String())
 			}
@@ -1795,6 +1803,9 @@ func TestRecoverInterruptedSwapKeepsAndReportsDisplacedDataBesideALiveVolume(t *
 	leftover := data + oldPrefix + "9001"
 	require.NoError(t, os.Mkdir(leftover, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(leftover, "something.txt"), []byte("x"), 0o644))
+	if !markAsOurs(leftover) {
+		t.Skip("this filesystem cannot hold the marker")
+	}
 
 	logs, logger := capturedWarnLogger()
 	require.NoError(t, recoverInterruptedSwap(data, logger))
@@ -2352,4 +2363,111 @@ func TestSwapByRenamePairWarnsWhenItCannotClaimTheVolume(t *testing.T) {
 	require.NoError(t, err, "the restore is still worth doing; the recovery is manual, not impossible")
 	assert.Contains(t, logs.String(), "put back by hand")
 	assert.Equal(t, []string{"restored.txt"}, names(t, data))
+}
+
+// Asking whether a directory is empty needs permission to read it. An
+// application-owned one this user cannot read would otherwise abort every
+// restore before the ownership check that would have dismissed it ever ran.
+func TestRecoverInterruptedSwapSkipsAnUnreadableStrangerBesideALiveVolume(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads regardless of the directory mode")
+	}
+	data := liveVolume(t)
+	stranger := data + oldPrefix + "1234"
+	require.NoError(t, os.Mkdir(stranger, 0o755))
+	require.NoError(t, os.Chmod(stranger, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(stranger, 0o755) })
+
+	logs, logger := capturedWarnLogger()
+	require.NoError(t, recoverInterruptedSwap(data, logger),
+		"an unreadable stranger must not abort a restore of a healthy volume")
+	assert.Contains(t, logs.String(), "carries no mark")
+	assert.Equal(t, []string{"original.txt"}, names(t, data))
+}
+
+// The exchange sends the live inode to the staging name, and that inode was
+// never this tool's. Without a claim it arrives there unprovable, and a kill
+// before cleanup leaves a volume-sized directory no later run will remove.
+func TestTheDisplacedInodeIsProvableAfterAnExchange(t *testing.T) {
+	data := liveVolume(t)
+	staging, err := createStagingLike(data, quietLogger())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "restored.txt"), []byte("restored"), 0o644))
+	if ours, _, oErr := provablyOurs(staging); oErr == nil && !ours {
+		t.Skip("this filesystem cannot hold the marker")
+	}
+
+	displaced, err := swapIntoPlace(staging, data, quietLogger())
+	require.NoError(t, err)
+	if displaced != staging {
+		t.Skip("this filesystem used the rename-pair fallback, which is covered separately")
+	}
+
+	ours, known, err := provablyOurs(displaced)
+	require.NoError(t, err)
+	require.True(t, known)
+	assert.True(t, ours, "the displaced original cannot be cleaned up by a later run")
+	assert.Equal(t, []string{"restored.txt"}, names(t, data))
+}
+
+// On a labelled filesystem a fresh directory is given a context by policy. The
+// label copying only ever applies one the model already carries, so an
+// unlabelled volume could be replaced by a labelled root and quietly gain or
+// lose access.
+func TestCreateStagingLikeClearsALabelTheVolumeDoesNotHave(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	removed := map[string]bool{}
+	restore := swapXattrSeams(t,
+		func(string) ([]string, error) { return nil, nil },
+		func(path, attr string) ([]byte, bool, error) {
+			// The volume carries no label; the fresh staging directory does.
+			if attr == seLinuxAttr && path != model {
+				return []byte("system_u:object_r:container_file_t:s0"), true, nil
+			}
+			return nil, false, nil
+		},
+		func(string, string, []byte, int) error { return nil })
+	defer restore()
+	realRemove := removeXattr
+	removeXattr = func(_, attr string) error { removed[attr] = true; return nil }
+	defer func() { removeXattr = realRemove }()
+
+	_, err := createStagingLike(model, quietLogger())
+	require.NoError(t, err)
+	assert.True(t, removed[seLinuxAttr], "the inherited label was left on the replacement")
+}
+
+// And a label that cannot be removed is reported rather than failing a restore
+// that has otherwise succeeded.
+func TestCreateStagingLikeWarnsWhenAnInheritedLabelCannotBeCleared(t *testing.T) {
+	dir := t.TempDir()
+	model := filepath.Join(dir, "_data")
+	require.NoError(t, os.Mkdir(model, 0o755))
+
+	restore := swapXattrSeams(t,
+		func(string) ([]string, error) { return nil, nil },
+		func(path, attr string) ([]byte, bool, error) {
+			if attr == seLinuxAttr && path != model {
+				return []byte("system_u:object_r:container_file_t:s0"), true, nil
+			}
+			return nil, false, nil
+		},
+		func(string, string, []byte, int) error { return nil })
+	defer restore()
+	realRemove := removeXattr
+	removeXattr = func(_, attr string) error {
+		if attr == seLinuxAttr {
+			return unix.EPERM
+		}
+		return nil
+	}
+	defer func() { removeXattr = realRemove }()
+
+	logs, logger := capturedWarnLogger()
+	_, err := createStagingLike(model, logger)
+	require.NoError(t, err, "a label that cannot be cleared must not fail the restore")
+	assert.Contains(t, logs.String(), "carry a label the original did not")
 }
