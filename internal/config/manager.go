@@ -85,15 +85,47 @@ func (m MetricsSettings) Validate() error {
 		return fmt.Errorf("metrics.protocol %q is invalid (want \"http\" or \"grpc\"); the OTLP URL belongs in metrics.endpoint", m.Protocol)
 	}
 	if m.Endpoint != "" {
+		// Reported redacted: a rejected endpoint is as likely to carry a
+		// credential as an accepted one, and this error is logged as "startup
+		// failed" to the same journal the successful startup line goes to. A
+		// scheme typo in an authenticated URL is precisely how a password ends
+		// up there.
+		shown := RedactEndpoint(m.Endpoint)
 		u, err := url.Parse(m.Endpoint)
 		switch {
 		case err != nil || u.Host == "":
-			return fmt.Errorf("metrics.endpoint %q is not a valid URL (want e.g. \"https://collector.example/v1/metrics\")", m.Endpoint)
+			return fmt.Errorf("metrics.endpoint %q is not a valid URL (want e.g. \"https://collector.example/v1/metrics\")", shown)
 		case u.Scheme != "http" && u.Scheme != "https":
-			return fmt.Errorf("metrics.endpoint %q must use http or https", m.Endpoint)
+			return fmt.Errorf("metrics.endpoint %q must use http or https", shown)
 		}
 	}
 	return nil
+}
+
+// RedactEndpoint strips userinfo and query values from an endpoint, leaving the
+// parts that identify where metrics are going.
+//
+// It lives here, next to the validation, because this is the first place the
+// configured value is handled and both the rejection and the startup log need
+// the same treatment. A value that does not parse is reported as unprintable
+// rather than guessed at: a malformed endpoint can still hold a secret, and a
+// typo in the scheme is one of the ways it gets malformed.
+func RedactEndpoint(endpoint string) string {
+	if endpoint == "" || !strings.Contains(endpoint, "//") {
+		return endpoint
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "(unparsable endpoint)"
+	}
+	if u.User != nil {
+		u.User = url.User("redacted")
+	}
+	if u.RawQuery != "" {
+		u.RawQuery = "redacted"
+	}
+	u.Fragment = ""
+	return u.String()
 }
 
 // GroupOverride is one groups/{group}.yaml overlay: the same manager+borgmatic

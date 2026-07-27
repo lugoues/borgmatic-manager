@@ -81,3 +81,34 @@ func TestLoadConfigRejectsBadMetricsProtocol(t *testing.T) {
 	require.Error(t, err, "a swapped endpoint/protocol must fail startup, not silently disable metrics")
 	assert.Contains(t, err.Error(), "metrics.protocol")
 }
+
+// A rejected endpoint is as likely to carry a credential as an accepted one, and
+// this error is logged as "startup failed" to the same journal the successful
+// startup line goes to. A scheme typo in an authenticated URL is exactly how a
+// password gets there.
+func TestValidationErrorsCarryNoCredential(t *testing.T) {
+	for _, tc := range []struct{ name, endpoint string }{
+		{name: "a bad scheme", endpoint: "ftp://user:password@collector.example/v1"},
+		{name: "a bad scheme with a query token", endpoint: "ftp://collector.example/v1?token=s3cret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := config.MetricsSettings{Enabled: true, Endpoint: tc.endpoint}.Validate()
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "password")
+			assert.NotContains(t, err.Error(), "s3cret")
+			assert.Contains(t, err.Error(), "collector.example",
+				"the operator still needs to recognize which endpoint was rejected")
+		})
+	}
+
+	t.Run("an unparsable endpoint is not echoed", func(t *testing.T) {
+		err := config.MetricsSettings{Enabled: true, Endpoint: "ht tp://u:pw@ho st/x"}.Validate()
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "pw")
+	})
+
+	t.Run("a valid endpoint is still accepted", func(t *testing.T) {
+		require.NoError(t, config.MetricsSettings{Enabled: true,
+			Endpoint: "https://user:password@collector.example/v1/metrics"}.Validate())
+	})
+}
