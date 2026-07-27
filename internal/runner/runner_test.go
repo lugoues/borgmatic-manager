@@ -2133,3 +2133,52 @@ func TestRecordedOutcomesSayWhetherTheInventoryWasKnown(t *testing.T) {
 	defer rec.mu.Unlock()
 	assert.True(t, rec.outcomes["g"].RepositoriesKnown)
 }
+
+// A labelled repository keeps its id across a repoint by design, so the stored
+// path is the only thing that can notice the change. Storing the configured
+// expression means it never does: "${BORG_REPO}" is the same string whatever it
+// points at, so the new destination inherits the old one's history.
+func TestALabelledEnvironmentPathPersistsItsDestination(t *testing.T) {
+	t.Setenv("BORG_REPO", "/srv/borg/old")
+	ref := config.RepoRef{Path: "${BORG_REPO}", Label: "offsite"}
+
+	assert.Equal(t, "offsite", refID(ref), "the label is still the id")
+	assert.Equal(t, "/srv/borg/old", resolvedRepoPath(ref),
+		"but the persisted path is where borg will write")
+
+	t.Setenv("BORG_REPO", "/srv/borg/new")
+	assert.Equal(t, "/srv/borg/new", resolvedRepoPath(ref),
+		"so a repoint is visible to the reconciliation that compares them")
+
+	t.Run("an ordinary path is unchanged", func(t *testing.T) {
+		assert.Equal(t, "/mnt/local", resolvedRepoPath(config.RepoRef{Path: "/mnt/local"}))
+	})
+	t.Run("an unset variable keeps the expression", func(t *testing.T) {
+		t.Setenv("BORG_REPO", "")
+		assert.Equal(t, "${BORG_REPO}", resolvedRepoPath(config.RepoRef{Path: "${BORG_REPO}"}))
+	})
+}
+
+// End to end: the outcome and the reconciliation both carry the destination, so
+// a repoint is noticed whether or not the run managed to judge the repository.
+func TestARepointedLabelledEnvironmentPathIsRecordedByDestination(t *testing.T) {
+	t.Setenv("BORG_REPO", "/srv/borg/new")
+	fake := newFakeExecutor()
+	fake.runScript = `echo '{"levelname":"CRITICAL","message":"before_backup hook failed","name":"borgmatic"}' >&2; exit 1`
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", []string{actionCreate}, 0)
+	r.execCommand = fake.exec
+	rec := &recordingStore{}
+	r.SetRecorder(rec)
+
+	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
+		Repositories: []config.RepoRef{{Path: "${BORG_REPO}", Label: "offsite"}},
+	})
+	require.Error(t, err)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	o := rec.outcomes["g"]
+	assert.Equal(t, map[string]string{"offsite": "/srv/borg/new"}, o.ConfiguredRepositoryPaths,
+		"the reconciliation compares destinations, so it must be given one")
+}

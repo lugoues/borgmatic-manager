@@ -455,7 +455,7 @@ func (r *Runner) recordValidationTimeout(groupName string, repos []config.RepoRe
 			if outcome.ConfiguredRepositoryPaths == nil {
 				outcome.ConfiguredRepositoryPaths = map[string]string{}
 			}
-			outcome.ConfiguredRepositoryPaths[id] = ref.Path
+			outcome.ConfiguredRepositoryPaths[id] = resolvedRepoPath(ref)
 		}
 	}
 	r.recorder.RecordRun(groupName, outcome)
@@ -478,7 +478,7 @@ func (r *Runner) recordValidationFailure(groupName string, repos []config.RepoRe
 			if outcome.ConfiguredRepositoryPaths == nil {
 				outcome.ConfiguredRepositoryPaths = map[string]string{}
 			}
-			outcome.ConfiguredRepositoryPaths[id] = ref.Path
+			outcome.ConfiguredRepositoryPaths[id] = resolvedRepoPath(ref)
 		}
 	}
 	r.recorder.RecordRun(groupName, outcome)
@@ -537,7 +537,7 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 				if outcome.ConfiguredRepositoryPaths == nil {
 					outcome.ConfiguredRepositoryPaths = map[string]string{}
 				}
-				outcome.ConfiguredRepositoryPaths[id] = ref.Path
+				outcome.ConfiguredRepositoryPaths[id] = resolvedRepoPath(ref)
 			}
 		}
 		r.recorder.RecordRun(groupName, outcome)
@@ -645,6 +645,18 @@ func refID(ref config.RepoRef) string {
 	if ref.Label != "" {
 		return ref.Label
 	}
+	return resolvedRepoPath(ref)
+}
+
+// resolvedRepoPath is the destination borg will actually write to.
+//
+// Everywhere a path is persisted it has to be this rather than the configured
+// expression, because "${BORG_REPO}" is the same string whatever it points at.
+// A labelled repository keeps its id across a repoint by design, so the stored
+// path is the only thing that can notice the change, and storing the unexpanded
+// expression means it never does: the new destination inherits the old one's
+// last success and statistics and reports as previously successful.
+func resolvedRepoPath(ref config.RepoRef) string {
 	if strings.Contains(ref.Path, "${") {
 		if expanded := os.ExpandEnv(ref.Path); expanded != "" && expanded != ref.Path {
 			return expanded
@@ -843,7 +855,7 @@ func (r *Runner) perRepoSuccess(configured []config.RepoRef, results []createRes
 	matched := matchResults(configured, results)
 	out := make([]state.RepoOutcome, 0, len(configured))
 	for i, ref := range configured {
-		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultOK}
+		ro := state.RepoOutcome{ID: refID(ref), Path: resolvedRepoPath(ref), Result: state.ResultOK}
 		if res, ok := matched[i]; ok {
 			applyStats(&ro, res)
 		}
@@ -876,7 +888,7 @@ func measuredOutcomes(configured []config.RepoRef, results []createResult) []sta
 		if !ok {
 			continue
 		}
-		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultOK}
+		ro := state.RepoOutcome{ID: refID(ref), Path: resolvedRepoPath(ref), Result: state.ResultOK}
 		applyStats(&ro, res)
 		out = append(out, ro)
 	}
@@ -965,7 +977,7 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 
 	out := make([]state.RepoOutcome, 0, len(configured))
 	for i, ref := range configured {
-		ro := state.RepoOutcome{ID: refID(ref), Path: ref.Path, Result: state.ResultFailed}
+		ro := state.RepoOutcome{ID: refID(ref), Path: resolvedRepoPath(ref), Result: state.ResultFailed}
 		switch {
 		case hasResult(measured, i):
 			ro.Result = state.ResultOK
