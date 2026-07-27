@@ -121,6 +121,13 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 // export was non-empty.
 // urlInText matches a URL in a message, quoted or bare, in one alternation.
 //
+// Matched on "://" rather than on a spelled-out scheme, because an endpoint
+// whose scheme is malformed still carries its query: an exporter rejecting
+// "ht!tp://collector/path?token=..." returns the whole value, and a pattern
+// anchored on "https?://" walked straight past it. RedactEndpoint handles a
+// value it cannot parse by refusing to print it, so widening what reaches it is
+// safe in the direction that matters.
+//
 // The quoted form comes first so a URL the transport wrapped in quotes is
 // bounded by its closing quote, which is the shape Go's net/http errors use:
 // Post "https://host/path?query": ... The bare form ends only at whitespace,
@@ -132,7 +139,7 @@ func (l *loggingExporter) Export(ctx context.Context, rm *metricdata.ResourceMet
 // One alternation rather than two passes, because a second pass re-matches what
 // the first already redacted and eats the closing quote with it, taking the rest
 // of the message's punctuation along.
-var urlInText = regexp.MustCompile(`"https?://[^"]*"|https?://\S+`)
+var urlInText = regexp.MustCompile(`"[^"\s]*://[^"]*"|\S*://\S+`)
 
 // RedactErrorText strips credentials from any URL inside an error message, for
 // callers that log an error this package returned before it reached a decorator.
@@ -417,6 +424,11 @@ func (e *Emitter) observe(o metric.Observer,
 			// A repository removed from a group the group still has. The record
 			// survives until the next run reconciles it, and that run may be a
 			// whole period away, so the reconciliation has to happen here too.
+			repoAttrs := metric.WithAttributes(
+				attribute.String("group", group),
+				attribute.String("repository", id),
+			)
+			repointed := false
 			if configured, ok := configuredRepos[group]; ok {
 				path, stillConfigured := configured[id]
 				if !stillConfigured {
@@ -425,14 +437,16 @@ func (e *Emitter) observe(o metric.Observer,
 				// The id survives a repoint but the history does not belong to
 				// the new destination. Until a run reconciles the record, its
 				// stored path is what says which one these numbers describe.
-				if path != "" && rr.Path != "" && !state.SameDestination(rr.Path, path) {
-					continue
-				}
+				repointed = path != "" && rr.Path != "" && !state.SameDestination(rr.Path, path)
 			}
-			repoAttrs := metric.WithAttributes(
-				attribute.String("group", group),
-				attribute.String("repository", id),
-			)
+			if repointed {
+				// The numbers are the old destination's, but the repository is
+				// configured and has never completed, which is precisely what the
+				// documented join exists to report. Suppressing the whole record
+				// hid it behind a sibling's info series until the next run.
+				o.ObserveInt64(repoInfo, 1, repoAttrs)
+				continue
+			}
 			// last_* reflect the most recent successful backup: a failed run
 			// carries no stats, so reporting its zeros would read as a shrink.
 			// Read from the last outcome that measured something, not the last
