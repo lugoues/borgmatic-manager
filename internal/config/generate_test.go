@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -958,14 +959,41 @@ func TestACollisionThatOnlyExistsInSomeMonthsIsStillFound(t *testing.T) {
 	defer config.SetSampleHostname("myhost")()
 
 	names := config.ArchiveSampleNamesForTest("x-{now:%m}-prod-{now}")
-	require.Len(t, names, 12, "one rendering per month")
-	assert.Contains(t, names, "x-07-prod-2026-07-08T14:28:35",
-		"July is among them, and that is the month this collision exists in")
+
+	// Every month is rendered, so the check does not depend on when it runs.
+	for m := 1; m <= 12; m++ {
+		prefix := fmt.Sprintf("x-%02d-prod-", m)
+		found := false
+		for _, name := range names {
+			if strings.HasPrefix(name, prefix) {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "month %02d must be represented", m)
+	}
 
 	assert.True(t, config.PatternsCollideForTest(
 		"x-07-*", config.ArchiveSampleNamesForTest("x-{group}-{now}"),
 		"x-*-prod-*", names),
 		`the group named "07" claims the July archives of its sibling`)
+
+	// The same for a day-of-month format, which twelve monthly samples missed:
+	// they only ever rendered days 2 to 13.
+	assert.True(t, config.PatternsCollideForTest(
+		"x-31-*", config.ArchiveSampleNamesForTest("x-{group}-{now}"),
+		"x-*-prod-*", config.ArchiveSampleNamesForTest("x-{now:%d}-prod-{now}")),
+		`the group named "31" claims what its sibling writes on the 31st`)
+
+	// And for hours, minutes and seconds, whose domains are larger still.
+	for _, tc := range []struct{ group, directive string }{
+		{"23", "%H"}, {"59", "%M"}, {"07", "%S"},
+	} {
+		assert.True(t, config.PatternsCollideForTest(
+			"x-"+tc.group+"-*", config.ArchiveSampleNamesForTest("x-{group}-{now}"),
+			"x-*-prod-*", config.ArchiveSampleNamesForTest("x-{now:"+tc.directive+"}-prod-{now}")),
+			"a group named %q collides with a sibling formatting %s", tc.group, tc.directive)
+	}
 }
 
 // The collision the digits-only stand-in hid: with this hostname, group "prod"
@@ -1096,4 +1124,80 @@ func TestAGroupNamedLikeADateCollidesWithAFormattedTimestamp(t *testing.T) {
 	assert.NotEmpty(t, meta["07"].AmbiguousRepos,
 		`"x-07-*" claims the archives prod writes every July`)
 	assert.NotEmpty(t, meta["prod"].AmbiguousRepos)
+}
+
+// A year is as plausible a group name as a month, and the check runs for years
+// on end, so both the current year and the next one are covered.
+func TestSampleInstantsCoverEveryDirectiveValue(t *testing.T) {
+	seen := func(format string) map[string]bool {
+		out := map[string]bool{}
+		for _, name := range config.ArchiveSampleNamesForTest(format) {
+			out[name] = true
+		}
+		return out
+	}
+
+	months := seen("{now:%m}")
+	for m := 1; m <= 12; m++ {
+		assert.True(t, months[fmt.Sprintf("%02d", m)], "month %02d", m)
+	}
+	days := seen("{now:%d}")
+	for d := 1; d <= 31; d++ {
+		assert.True(t, days[fmt.Sprintf("%02d", d)], "day %02d", d)
+	}
+	hours := seen("{now:%H}")
+	for h := 0; h < 24; h++ {
+		assert.True(t, hours[fmt.Sprintf("%02d", h)], "hour %02d", h)
+	}
+	minutes := seen("{now:%M}")
+	for m := 0; m < 60; m++ {
+		assert.True(t, minutes[fmt.Sprintf("%02d", m)], "minute %02d", m)
+	}
+	seconds := seen("{now:%S}")
+	for s := 0; s < 60; s++ {
+		assert.True(t, seconds[fmt.Sprintf("%02d", s)], "second %02d", s)
+	}
+
+	years := seen("{now:%Y}")
+	now := time.Now()
+	assert.True(t, years[fmt.Sprintf("%d", now.Year())], "the current year")
+	assert.True(t, years[fmt.Sprintf("%d", now.Year()+1)], "and the next one")
+
+	// A format with no time placeholder renders once, not hundreds of times: the
+	// collision check is quadratic in the sample count.
+	assert.Len(t, config.ArchiveSampleNamesForTest("x-{hostname}-y"), 1)
+}
+
+// An at-sign in a local path is not a remote repository. Treating it as one
+// skipped the cleaning and symlink resolution that make two spellings compare
+// equal, so two groups writing to the same repository got different lock keys:
+// they could run against one Borg repository concurrently, and generation's
+// shared-repository archive checks never fired.
+func TestLocalPathsWithAtSignsAreNotRemote(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(dir+"/backups@local/repo", 0o755))
+
+	assert.Equal(t,
+		config.CanonicalRepoKey(dir+"/backups@local/repo"),
+		config.CanonicalRepoKey(dir+"/backups@local/./repo"),
+		"two spellings of one local repository must share a key, at-sign or not")
+
+	// The genuinely remote forms are unaffected.
+	assert.Equal(t, "ssh://borg@host/./repo", config.CanonicalRepoKey("ssh://borg@host/./repo/"))
+	assert.Equal(t, "borg@host:/srv/repo", config.CanonicalRepoKey("borg@host:/srv/repo"))
+	assert.Equal(t, "host:/srv/repo", config.CanonicalRepoKey("host:/srv/repo"),
+		"borg accepts host:path with no user")
+
+	// An absolute path is never remote, whatever it contains, so it is still
+	// cleaned rather than passed through as a host spec.
+	assert.Equal(t, "/srv/a@b:c/repo", config.CanonicalRepoKey("/srv/a@b:c/./repo"))
+
+	// A relative path with no host separator is local too, and cleaning it is
+	// what tells the two spellings apart from a remote spec passed through whole.
+	assert.Equal(t, "repo@dir/x", config.CanonicalRepoKey("repo@dir/./x"))
+	assert.Equal(t, "repo@dir/x", config.CanonicalRepoKey("repo@dir/y/../x"))
+
+	// A colon with nothing usable in front of it is not a host spec either, so
+	// it is still cleaned like the local path it is.
+	assert.Equal(t, "8080/repo", config.CanonicalRepoKey(":8080/../8080/repo"))
 }
