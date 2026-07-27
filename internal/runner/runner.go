@@ -39,9 +39,10 @@ func (r *Runner) actionsInclude(name string) bool {
 const (
 	actionCreate = "create"
 	actionPrune  = "prune"
+	actionCheck  = "check"
 )
 
-var defaultActions = []string{actionCreate, actionPrune, "compact", "check"}
+var defaultActions = []string{actionCreate, actionPrune, "compact", actionCheck}
 
 // defaultKillGrace is the SIGTERM-to-SIGKILL grace after a run timeout fires.
 const defaultKillGrace = 60 * time.Second
@@ -462,6 +463,7 @@ func (r *Runner) interpretResult(ctx context.Context, groupName, configPath stri
 			outcome.DeduplicatedBytes = rep.Archive.Stats.DeduplicatedSize
 		}
 		outcome.Repositories = repoOutcomes
+		outcome.CreateAttempted = r.actionsInclude(actionCreate)
 		for _, ref := range repos {
 			outcome.ConfiguredRepositories = append(outcome.ConfiguredRepositories, refID(ref))
 		}
@@ -657,6 +659,7 @@ func hasResult(measured map[int]createResult, i int) bool {
 }
 
 func applyStats(ro *state.RepoOutcome, res createResult) {
+	ro.Measured = true
 	ro.Files = res.Archive.Stats.NFiles
 	ro.OriginalBytes = res.Archive.Stats.OriginalSize
 	ro.CompressedBytes = res.Archive.Stats.CompressedSize
@@ -775,13 +778,50 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 // mentionedInErrors reports whether repoPath appears as a path token in any
 // error message, boundary-checked so "/data" does not match "/data2" or
 // "/srv/data".
+// mentionedInErrors reports whether any error message names this repository.
+//
+// borg reports the location it resolved, not the string the config held, so the
+// literal spelling is only one of the ways the same repository can appear: a
+// configured "/mnt/repo/" is reported as "/mnt/repo", a relative or symlinked
+// path arrives resolved. matchResults already canonicalizes on the success side;
+// leaving this side literal meant a destination that borg named as failed went
+// unrecognized, was dropped from persisted state entirely, and in a mixed
+// fan-out was counted as unknown rather than failed: the one outcome an operator
+// most needs to see, reported as the one thing it definitely was not.
 func mentionedInErrors(repoPath string, errText []string) bool {
-	for _, msg := range errText {
-		if containsPathToken(msg, repoPath) {
-			return true
+	for _, spelling := range repoSpellings(repoPath) {
+		for _, msg := range errText {
+			if containsPathToken(msg, spelling) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// repoSpellings lists the forms a repository path may take in borg's output:
+// as configured, with a trailing separator trimmed, and canonicalized. Duplicates
+// and the unresolvable key are dropped, so a runtime-expanded path contributes
+// only its literal form rather than matching every other unresolvable path.
+func repoSpellings(repoPath string) []string {
+	if repoPath == "" {
+		return nil
+	}
+	out := []string{repoPath}
+	add := func(s string) {
+		if s == "" || s == config.UnknownRepoKey {
+			return
+		}
+		for _, seen := range out {
+			if seen == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	add(strings.TrimRight(repoPath, "/"))
+	add(config.CanonicalRepoKey(repoPath))
+	return out
 }
 
 // containsPathToken reports whether path occurs in msg as a whole path, not as a

@@ -1137,7 +1137,7 @@ func TestMaintenanceOnlyRunRecordsNoRepositorySuccess(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	maintenance := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake",
-		[]string{actionPrune, "compact", "check"}, 0)
+		[]string{actionPrune, "compact", actionCheck}, 0)
 	assert.Nil(t, maintenance.perRepoSuccess(configured, nil),
 		"a cycle without create backed nothing up, so no repository succeeded")
 
@@ -1414,4 +1414,121 @@ func TestALaterActionFailureKeepsTheCreateMeasurements(t *testing.T) {
 		assert.Zero(t, out[1].Files, "a probe proves an archive exists, not how big it is")
 		assert.Equal(t, []string{offsite.Path}, pf.probed(), "and only it is probed")
 	})
+}
+
+// borg names the location it resolved, not the string the config held, so a
+// failure attribution that compares the literal spelling misses. The
+// consequence is the worst of the three: the destination borg said failed is
+// dropped from persisted state entirely, and in a mixed fan-out is counted as
+// unknown rather than failed.
+func TestFailureAttributionRecognizesNormalizedRepositoryPaths(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(dir+"/repo", 0o755))
+
+	for _, tc := range []struct {
+		name       string
+		configured string
+		message    string
+		want       bool
+	}{
+		{name: "as configured", configured: "/mnt/repo",
+			message: "Error: Repository /mnt/repo does not exist.", want: true},
+		{name: "trailing separator trimmed by borg", configured: "/mnt/repo/",
+			message: "Error: Repository /mnt/repo does not exist.", want: true},
+		// The other direction needs no normalization: the token-boundary check
+		// already treats a separator as a delimiter rather than part of the name.
+		{name: "reported with the separator the config omitted", configured: "/mnt/repo",
+			message: "Error: Repository /mnt/repo/ does not exist.", want: true},
+		{name: "relative path resolved", configured: dir + "/./repo",
+			message: "Error: Repository " + dir + "/repo is locked.", want: true},
+		{name: "a different repository is not implicated", configured: "/mnt/repo",
+			message: "Error: Repository /mnt/other does not exist.", want: false},
+		{name: "a longer path is not a prefix match", configured: "/mnt/repo",
+			message: "Error: Repository /mnt/repository does not exist.", want: false},
+		{name: "an unresolvable path matches only its literal form", configured: "${BORG_REPO}",
+			message: "Error: Repository ${BORG_REPO} does not exist.", want: true},
+		{name: "and does not match some other unresolvable path", configured: "${BORG_REPO}",
+			message: "Error: Repository ${OTHER_REPO} does not exist.", want: false},
+		// CanonicalRepoKey returns the literal string "unknown" for a path it
+		// cannot resolve. Letting that into the spellings would make any message
+		// containing "unknown" as a path token implicate every unresolvable
+		// repository in the group.
+		{name: "the unresolvable-path key is not a spelling to match on", configured: "${BORG_REPO}",
+			message: "Error: Repository /mnt/unknown does not exist.", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, mentionedInErrors(tc.configured, []string{tc.message}))
+		})
+	}
+}
+
+// The end-to-end shape: a destination borg names under its normalized spelling
+// must be recorded as failed, not silently omitted.
+func TestANormalizedFailureIsRecordedAgainstTheRightRepository(t *testing.T) {
+	runStart := time.Now().Add(-time.Minute)
+	offsite := config.RepoRef{Path: "/mnt/offsite/", Label: "offsite"}
+	pf := &probeFake{}
+	r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+		"/usr/bin/borgmatic-fake", nil, 0)
+	r.execCommand = pf.exec
+	run := &runState{logger: r.logger, group: "g"}
+	run.recordErrorText("Error: Repository /mnt/offsite does not exist.")
+
+	out := r.perRepoFailure(context.Background(), "/cfg.yaml",
+		[]config.RepoRef{offsite}, nil, "", run, runStart)
+
+	require.Len(t, out, 1, "the implicated destination must be recorded, not dropped")
+	assert.Equal(t, state.ResultFailed, out[0].Result)
+	assert.Empty(t, pf.probed(), "and it must not be probed")
+}
+
+// CreateAttempted is what stops a maintenance-only cycle being counted as a
+// backup per destination, and it can only be answered by the runner: state and
+// metrics see the outcome, not the actions. Measured is the same shape of
+// question one level down, distinguishing "borgmatic reported this archive"
+// from "a probe found one", which an empty archive cannot answer by its numbers.
+func TestRecordedOutcomesCarryTheCreateAndMeasurementSignals(t *testing.T) {
+	t.Run("a backup run is marked attempted and its stats measured", func(t *testing.T) {
+		fake := newFakeExecutor()
+		fake.runScript = `echo '[{"repository":{"location":"/repo","label":"local"},"archive":{"name":"a","stats":{"nfiles":0,"original_size":0}}}]'; exit 0`
+		r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+			"/usr/bin/borgmatic-fake", []string{actionCreate}, 0)
+		r.execCommand = fake.exec
+		rec := &recordingStore{}
+		r.SetRecorder(rec)
+
+		_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
+			Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
+		})
+		require.NoError(t, err)
+
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		o := rec.outcomes["files"]
+		assert.True(t, o.CreateAttempted, "the run wrote an archive")
+		require.Len(t, o.Repositories, 1)
+		assert.True(t, o.Repositories[0].Measured,
+			"an all-zero archive borgmatic reported is measured, and only this flag says so")
+	})
+
+	t.Run("a maintenance-only cycle is marked as not attempting a backup", func(t *testing.T) {
+		fake := newFakeExecutor()
+		r := NewRunner(slog.New(slog.NewTextHandler(io.Discard, nil)), t.TempDir(),
+			"/usr/bin/borgmatic-fake", []string{actionPrune, actionCheck}, 0)
+		r.execCommand = fake.exec
+		rec := &recordingStore{}
+		r.SetRecorder(rec)
+
+		_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
+			Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
+		})
+		require.NoError(t, err)
+
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		o := rec.outcomes["files"]
+		assert.False(t, o.CreateAttempted, "prune and check back nothing up")
+		assert.Empty(t, o.Repositories)
+	})
+
 }
