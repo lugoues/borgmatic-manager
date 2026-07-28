@@ -140,7 +140,9 @@ func TestObservableGaugesReadFromState(t *testing.T) {
 	assert.Equal(t, []string{"local"}, repos, "a never-succeeded repo has no staleness value")
 }
 
-func TestOfflineVolumesGauge(t *testing.T) {
+// The count that used to be its own gauge is now a sum over the per-volume
+// series, which carries the same number and says which volume it is.
+func TestOfflineVolumesAreCountableFromThePerVolumeSeries(t *testing.T) {
 	bs := models.NewBackupState()
 	bs.AddVolume("web", models.VolumeInfo{Name: "up", HostPath: "/mnt/up"})
 	bs.AddVolume("web", models.VolumeInfo{Name: "down", HostPath: "/mnt/down"})
@@ -149,10 +151,23 @@ func TestOfflineVolumesGauge(t *testing.T) {
 	e, reader := newTestEmitter(t, fakeSource{})
 	e.ObserveInventory(bs, off)
 
-	g := findMetric(t, collect(t, reader), "backup_offline_volumes").Data.(metricdata.Gauge[int64])
-	require.Len(t, g.DataPoints, 1)
-	assert.Equal(t, "web", attr(g.DataPoints[0].Attributes, "group"))
-	assert.Equal(t, int64(1), g.DataPoints[0].Value, "one of two volumes is offline")
+	rm := collect(t, reader)
+	g := findMetric(t, rm, "backup_volume_offline").Data.(metricdata.Gauge[int64])
+	require.Len(t, g.DataPoints, 2, "one series per discovered volume")
+
+	var offlineCount int64
+	byVolume := map[string]int64{}
+	for _, dp := range g.DataPoints {
+		assert.Equal(t, "web", attr(dp.Attributes, "group"))
+		byVolume[attr(dp.Attributes, "volume")] = dp.Value
+		offlineCount += dp.Value
+	}
+	assert.Equal(t, int64(1), offlineCount, "one of two volumes is offline")
+	assert.Equal(t, map[string]int64{"up": 0, "down": 1}, byVolume, "and it can be named")
+
+	total := findMetric(t, rm, "backup_volumes").Data.(metricdata.Gauge[int64])
+	require.Len(t, total.DataPoints, 1)
+	assert.Equal(t, int64(2), total.DataPoints[0].Value, "out of two")
 }
 
 func TestNewExporterProtocol(t *testing.T) {
@@ -1354,11 +1369,11 @@ func TestVolumeInventoryIsReportedByNameAndTotal(t *testing.T) {
 		"app/data": 0, "app/cache": 1, "app/uploads": 0, "db/pgdata": 0,
 	}, byVolume, "one series per volume, so the offline one can be named")
 
-	// The existing count still agrees with the per-volume series.
-	counts := findMetric(t, rm, "backup_offline_volumes").Data.(metricdata.Gauge[int64])
-	for _, dp := range counts.DataPoints {
-		if attr(dp.Attributes, "group") == "app" {
-			assert.Equal(t, int64(1), dp.Value)
+	// The group-level count is gone: summing the per-volume series gives it back,
+	// and keeping both meant two sources for one number.
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			assert.NotEqual(t, "backup_offline_volumes", m.Name)
 		}
 	}
 }
