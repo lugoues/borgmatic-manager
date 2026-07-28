@@ -1318,3 +1318,86 @@ func TestTheErrorReturnedToTheReaderIsRedacted(t *testing.T) {
 	assert.Contains(t, err.Error(), "collector.example")
 	assert.Contains(t, err.Error(), "refused")
 }
+
+// The offline count is a numerator with no denominator: three offline says
+// nothing about whether that is the whole group or a tenth of it, and a group
+// quietly shrinking from many volumes to few never reports one as offline at
+// all.
+func TestVolumeInventoryIsReportedByNameAndTotal(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+
+	bs := models.NewBackupState()
+	bs.AddVolume("app", models.VolumeInfo{Name: "data", HostPath: "/mnt/data"})
+	bs.AddVolume("app", models.VolumeInfo{Name: "cache", HostPath: "/mnt/cache"})
+	bs.AddVolume("app", models.VolumeInfo{Name: "uploads", HostPath: "/mnt/uploads"})
+	bs.AddVolume("db", models.VolumeInfo{Name: "pgdata", HostPath: "/mnt/pg"})
+
+	off := &state.Offline{Volumes: map[string]map[string]bool{"app": {"cache": true}}}
+	e.ObserveInventory(bs, off)
+
+	rm := collect(t, reader)
+
+	totals := findMetric(t, rm, "backup_volumes").Data.(metricdata.Gauge[int64])
+	byGroup := map[string]int64{}
+	for _, dp := range totals.DataPoints {
+		byGroup[attr(dp.Attributes, "group")] = dp.Value
+	}
+	assert.Equal(t, map[string]int64{"app": 3, "db": 1}, byGroup,
+		"the denominator the offline count needs")
+
+	states := findMetric(t, rm, "backup_volume_offline").Data.(metricdata.Gauge[int64])
+	byVolume := map[string]int64{}
+	for _, dp := range states.DataPoints {
+		byVolume[attr(dp.Attributes, "group")+"/"+attr(dp.Attributes, "volume")] = dp.Value
+	}
+	assert.Equal(t, map[string]int64{
+		"app/data": 0, "app/cache": 1, "app/uploads": 0, "db/pgdata": 0,
+	}, byVolume, "one series per volume, so the offline one can be named")
+
+	// The existing count still agrees with the per-volume series.
+	counts := findMetric(t, rm, "backup_offline_volumes").Data.(metricdata.Gauge[int64])
+	for _, dp := range counts.DataPoints {
+		if attr(dp.Attributes, "group") == "app" {
+			assert.Equal(t, int64(1), dp.Value)
+		}
+	}
+}
+
+// A volume that comes back has to say so. A series that appears only while
+// something is wrong cannot be told from one that stopped being reported.
+func TestAVolumeComingBackReportsZeroRatherThanDisappearing(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	bs := models.NewBackupState()
+	bs.AddVolume("app", models.VolumeInfo{Name: "data", HostPath: "/mnt/data"})
+
+	off := &state.Offline{Volumes: map[string]map[string]bool{"app": {"data": true}}}
+	e.ObserveInventory(bs, off)
+	states := findMetric(t, collect(t, reader), "backup_volume_offline").Data.(metricdata.Gauge[int64])
+	require.Len(t, states.DataPoints, 1)
+	assert.Equal(t, int64(1), states.DataPoints[0].Value)
+
+	e.ObserveInventory(bs, &state.Offline{})
+	states = findMetric(t, collect(t, reader), "backup_volume_offline").Data.(metricdata.Gauge[int64])
+	require.Len(t, states.DataPoints, 1, "the volume is still discovered")
+	assert.Equal(t, int64(0), states.DataPoints[0].Value, "and is explicitly back")
+}
+
+// A group removed from the inventory drops its volume series with everything
+// else, or the two levels contradict each other.
+func TestVolumeSeriesFollowTheInventory(t *testing.T) {
+	e, reader := newTestEmitter(t, fakeSource{})
+	bs := models.NewBackupState()
+	bs.AddVolume("app", models.VolumeInfo{Name: "data", HostPath: "/mnt/data"})
+	e.ObserveInventory(bs, nil)
+	require.Len(t, findMetric(t, collect(t, reader), "backup_volumes").
+		Data.(metricdata.Gauge[int64]).DataPoints, 1)
+
+	e.ObserveInventory(models.NewBackupState(), nil)
+	rm := collect(t, reader)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			assert.NotContains(t, []string{"backup_volumes", "backup_volume_offline"}, m.Name,
+				"%s must not outlive the group", m.Name)
+		}
+	}
+}
