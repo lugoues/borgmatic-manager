@@ -57,8 +57,7 @@ type Emitter struct {
 
 	// inventory is the latest cycle's per-group offline volume count and the
 	// set of known groups (so an all-online group still reports 0). Guarded.
-	mu      sync.Mutex
-	offline map[string]int
+	mu sync.Mutex
 	// volumes is each group's discovered volumes and whether each is currently
 	// offline, so the inventory can be reported by name rather than only counted.
 	volumes   map[string]map[string]bool
@@ -282,7 +281,7 @@ func newEmitter(ctx context.Context, reader sdkmetric.Reader, version string, so
 		logger:    logger,
 		source:    source,
 		now:       time.Now,
-		offline:   map[string]int{},
+		volumes:   map[string]map[string]bool{},
 		allGroups: map[string]struct{}{},
 	}
 	if err := e.register(provider.Meter(meterName)); err != nil {
@@ -346,14 +345,9 @@ func (e *Emitter) register(m metric.Meter) error {
 	if err != nil {
 		return err
 	}
-	offlineVolumes, err := m.Int64ObservableGauge("backup_offline_volumes",
-		metric.WithDescription("Number of a group's volumes whose container is currently offline."))
-	if err != nil {
-		return fmt.Errorf("creating backup_offline_volumes: %w", err)
-	}
 	volumesTotal, err := m.Int64ObservableGauge("backup_volumes",
 		metric.WithDescription("Number of volumes discovered for a group. The denominator "+
-			"backup_offline_volumes lacks: three offline means nothing without it, and a group "+
+			"the offline count lacks: three offline means nothing without it, and a group "+
 			"shrinking from forty volumes to four shows up here and nowhere else."))
 	if err != nil {
 		return fmt.Errorf("creating backup_volumes: %w", err)
@@ -367,10 +361,10 @@ func (e *Emitter) register(m metric.Meter) error {
 
 	_, err = m.RegisterCallback(
 		func(_ context.Context, o metric.Observer) error {
-			e.observe(o, lastSize, lastFiles, offlineVolumes, groupInfo, repoInfo, volumesTotal, volumeOffline, lastDuration, staleness)
+			e.observe(o, lastSize, lastFiles, groupInfo, repoInfo, volumesTotal, volumeOffline, lastDuration, staleness)
 			return nil
 		},
-		lastSize, lastDuration, lastFiles, staleness, offlineVolumes, groupInfo, repoInfo,
+		lastSize, lastDuration, lastFiles, staleness, groupInfo, repoInfo,
 		volumesTotal, volumeOffline,
 	)
 	if err != nil {
@@ -382,7 +376,7 @@ func (e *Emitter) register(m metric.Meter) error {
 // observe pulls current state and reports every gauge. Called by the SDK at
 // each collection.
 func (e *Emitter) observe(o metric.Observer,
-	lastSize, lastFiles, offlineVolumes, groupInfo, repoInfo, volumesTotal, volumeOffline metric.Int64Observable,
+	lastSize, lastFiles, groupInfo, repoInfo, volumesTotal, volumeOffline metric.Int64Observable,
 	lastDuration, staleness metric.Float64Observable,
 ) {
 	now := e.now()
@@ -408,10 +402,6 @@ func (e *Emitter) observe(o metric.Observer,
 	known := make(map[string]struct{}, len(e.allGroups))
 	for g := range e.allGroups {
 		known[g] = struct{}{}
-	}
-	offline := make(map[string]int, len(e.offline))
-	for g, n := range e.offline {
-		offline[g] = n
 	}
 	e.mu.Unlock()
 
@@ -535,8 +525,6 @@ func (e *Emitter) observe(o metric.Observer,
 		// that was deleted, and an alert on "no recent backup" cannot fire for
 		// the group that most needs it.
 		o.ObserveInt64(groupInfo, 1, metric.WithAttributes(attribute.String("group", group)))
-		o.ObserveInt64(offlineVolumes, int64(offline[group]),
-			metric.WithAttributes(attribute.String("group", group)))
 		o.ObserveInt64(volumesTotal, int64(len(volumes[group])),
 			metric.WithAttributes(attribute.String("group", group)))
 		for name, isOffline := range volumes[group] {
@@ -660,29 +648,23 @@ func (e *Emitter) ObserveInventory(bs *models.BackupState, off *state.Offline) {
 	if bs == nil {
 		return
 	}
-	counts := make(map[string]int, len(bs.Groups))
 	groups := make(map[string]struct{}, len(bs.Groups))
-	// Volume names as well as the count. The count alone is a numerator with no
-	// denominator: three offline says nothing about whether that is the whole
-	// group or a tenth of it, and it cannot show a group quietly shrinking from
-	// forty discovered volumes to four while never reporting one as offline.
+	// Volume names and their state, rather than a count. A count is a numerator
+	// with no denominator: three offline says nothing about whether that is the
+	// whole group or a tenth of it, and it cannot show a group quietly shrinking
+	// from forty discovered volumes to four while never reporting one as
+	// offline. Summing the per-volume series gives the count back.
 	volumes := make(map[string]map[string]bool, len(bs.Groups))
 	for name, g := range bs.Groups {
 		groups[name] = struct{}{}
 		byVolume := make(map[string]bool, len(g.Volumes))
-		n := 0
 		for _, v := range g.Volumes {
-			isOffline := off != nil && off.VolumeOffline(name, v.Name)
-			byVolume[v.Name] = isOffline
-			if isOffline {
-				n++
-			}
+			byVolume[v.Name] = off != nil && off.VolumeOffline(name, v.Name)
 		}
 		volumes[name] = byVolume
-		counts[name] = n
 	}
 	e.mu.Lock()
-	e.offline, e.volumes, e.allGroups, e.observed = counts, volumes, groups, true
+	e.volumes, e.allGroups, e.observed = volumes, groups, true
 	e.mu.Unlock()
 }
 

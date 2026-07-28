@@ -338,8 +338,7 @@ manager:
 | `backup_last_files` | gauge | `group`, `repository` | File count in the last successful archive. |
 | `backup_last_duration_seconds` | gauge | `group`, `repository` | Duration of the last successful backup. |
 | `backup_seconds_since_last_success` | gauge | `group`, `repository` | Staleness. Absent until a repository has succeeded once. |
-| `backup_offline_volumes` | gauge | `group` | Volumes discovered but not currently present. |
-| `backup_volumes` | gauge | `group` | Volumes discovered for the group. The denominator `backup_offline_volumes` needs, and the only series that shows a group quietly shrinking. |
+| `backup_volumes` | gauge | `group` | Volumes discovered for the group. The denominator an offline count needs, and the only series that shows a group quietly shrinking. |
 | `backup_volume_offline` | gauge | `group`, `volume` | 1 when a volume's container is offline, 0 when it is not. One series per discovered volume, so the offline ones can be named rather than counted. |
 
 `backup_group_info` exists because every other series here appears only after a
@@ -374,14 +373,18 @@ Alert on maintenance failures with the group counter, not the repository one:
 rate(backup_group_runs_total{result="failed"}[1h]) > 0
 ```
 
-Volume coverage needs both numbers. `backup_offline_volumes` alone is a
-numerator: three offline means something different in a group of three than in a
-group of forty, and a group that stops discovering most of its volumes never
-reports one as offline at all.
+Volume coverage needs both numbers. An offline count alone is a numerator: three
+offline means something different in a group of three than in a group of forty,
+and a group that stops discovering most of its volumes never reports one as
+offline at all. The count is a sum over the per-volume series rather than its own
+metric, so there is one source for it.
 
 ```promql
+# how many of a group's volumes are offline
+sum by (group) (backup_volume_offline)
+
 # most of a group's volumes are not currently present
-backup_offline_volumes / backup_volumes > 0.5
+sum by (group) (backup_volume_offline) / backup_volumes > 0.5
 
 # a group lost volumes without any of them going offline: they stopped being
 # discovered, which is a labelling or container problem rather than an outage
