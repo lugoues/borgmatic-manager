@@ -333,6 +333,11 @@ func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, vol
 			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				return nil, fmt.Errorf("container %s: sqlite database %q path %q escapes volume %q", c.Name, db.Name, db.Path, db.Volume)
 			}
+			// The lexical check above cannot see symlinks the container planted
+			// inside its volume, and this path is read by root at backup time.
+			if err := checkNoSymlinkEscape(vol.Mountpoint, joined); err != nil {
+				return nil, fmt.Errorf("container %s: sqlite database %q path %q: %w", c.Name, db.Name, db.Path, err)
+			}
 			db.Path = joined
 		}
 
@@ -342,6 +347,43 @@ func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, vol
 		return nil, nil
 	}
 	return result, nil
+}
+
+// checkNoSymlinkEscape rejects a path whose resolved location leaves the
+// volume: the lexical Rel check is blind to symlinks the container created
+// inside its own volume (link -> /etc, then path "link/shadow"). The deepest
+// existing ancestor is resolved so a database file that does not exist yet is
+// still accepted, like the lexical check accepted it. TOCTOU remains (the
+// container can swap in a symlink after discovery), but a labeled path that
+// points outside the volume at discovery time is refused loudly.
+func checkNoSymlinkEscape(mountpoint, path string) error {
+	root, err := filepath.EvalSymlinks(mountpoint)
+	if err != nil {
+		// An unresolvable mountpoint (absent volume, non-root discover run)
+		// has nothing inside it we could follow; the lexical check stands.
+		return nil
+	}
+	probe := path
+	for {
+		resolved, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			rel, relErr := filepath.Rel(root, resolved)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("resolves to %q outside volume mountpoint %q", resolved, mountpoint)
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			// A path we cannot resolve (loop, permissions) is one the backup
+			// cannot read either; only a successful resolution can escape.
+			return nil
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return nil // walked to the root without finding anything: nothing to follow
+		}
+		probe = parent
+	}
 }
 
 // defaultIsMountPoint checks /proc/self/mountinfo.
