@@ -1,7 +1,7 @@
 {
   "title": "Borgmatic Manager — Backups",
   "uid": "borgmatic-manager",
-  "description": "Backup health for borgmatic-manager. Sources the OpenTelemetry metrics exported over OTLP (backup_runs_total, backup_last_size_bytes, backup_last_duration_seconds, backup_last_files, backup_seconds_since_last_success, backup_offline_volumes) from a Prometheus-compatible datasource. The last_* gauges reflect the most recent successful backup; a repository that has never succeeded appears only in backup_runs_total.",
+  "description": "Backup health for borgmatic-manager. Sources the OpenTelemetry metrics exported over OTLP (backup_runs_total, backup_last_size_bytes, backup_last_duration_seconds, backup_last_files, backup_seconds_since_last_success, backup_volume_offline) from a Prometheus-compatible datasource. The last_* gauges reflect the most recent successful backup; a repository that has never succeeded appears only in backup_runs_total.",
   "tags": ["borgmatic", "backups", "otel"],
   "timezone": "browser",
   "editable": true,
@@ -26,7 +26,7 @@
         "label": "Group",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "query": { "query": "label_values(backup_runs_total, group)", "refId": "groupVar" },
+        "query": { "query": "label_values(backup_group_info, group)", "refId": "groupVar" },
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -39,7 +39,7 @@
         "label": "Repository",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "query": { "query": "label_values(backup_runs_total{group=~\"$group\"}, repository)", "refId": "repoVar" },
+        "query": { "query": "label_values(backup_repository_info{group=~\"$group\"}, repository)", "refId": "repoVar" },
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -197,7 +197,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(backup_offline_volumes{group=~\"$group\"}) or vector(0)",
+          "expr": "sum(backup_volume_offline{group=~\"$group\"}) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -439,7 +439,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "backup_offline_volumes{group=~\"$group\"}",
+          "expr": "sum by (group) (backup_volume_offline{group=~\"$group\"})",
           "legendFormat": "{{group}}",
           "range": true
         }
