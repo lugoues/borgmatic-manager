@@ -280,13 +280,15 @@ func (s *ScheduleStore) update(mutate func(*scheduleFile) (changed bool)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// A lock we cannot take is not worth failing a backup over: warn and
-	// proceed, which is no worse than the single-process behavior.
-	if lock, err := lockfile.Exclusive(s.lockPath); err != nil {
-		s.logger.Warn("cannot lock schedule state; proceeding unlocked", "path", s.lockPath, "error", err)
-	} else {
-		defer lock.Release()
+	// An unlocked read-modify-write can silently erase another process's
+	// records (a daemon and an ad-hoc run racing), which is worse than losing
+	// this one update: skip it, like the group cache does when it cannot lock.
+	lock, err := lockfile.Exclusive(s.lockPath)
+	if err != nil {
+		s.logger.Warn("cannot lock schedule state; skipping this update so concurrent processes cannot overwrite each other", "path", s.lockPath, "error", err)
+		return
 	}
+	defer lock.Release()
 
 	f, err := s.readFile()
 	corrupt := false
