@@ -36,14 +36,16 @@ func newMockGroupRunner() *mockGroupRunner {
 	}
 }
 
-func (m *mockGroupRunner) TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, error) {
+func (m *mockGroupRunner) TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, groupName)
+	// Zero start time: the scheduler falls back to its own (test-controlled)
+	// clock, keeping the fake-time due-gating tests deterministic.
 	if r, ok := m.results[groupName]; ok {
-		return r.acquired, r.err
+		return r.acquired, time.Time{}, r.err
 	}
-	return true, nil
+	return true, time.Time{}, nil
 }
 
 func (m *mockGroupRunner) getCalls() []string {

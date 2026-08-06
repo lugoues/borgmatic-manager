@@ -35,7 +35,7 @@ const discoverTimeout = 2 * time.Minute
 
 // GroupRunner abstracts runner.Runner for testability.
 type GroupRunner interface {
-	TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, error)
+	TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, time.Time, error)
 }
 
 // Scheduler drives discover -> generate -> run cycles, running each group only
@@ -360,7 +360,7 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 		go func(groupName, fingerprint string, m config.GroupRunMeta, prevAttempt time.Time, hadAttempt bool) {
 			defer wg.Done()
 
-			acquired, err := s.runner.TryRunGroup(ctx, groupName, m)
+			acquired, started, err := s.runner.TryRunGroup(ctx, groupName, m)
 			switch {
 			case errors.Is(err, runner.ErrLockedByAnotherProcess):
 				// Keep the attempt mark (else NextWake spins at minWake) but schedule a
@@ -391,7 +391,13 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 
 			default:
 				if s.store != nil {
-					s.store.MarkSuccess(groupName, fingerprint, now)
+					// Anchor to the run's own start (post lock wait), not the
+					// cycle's: a group serialized behind a shared repository
+					// would otherwise look overdue as soon as it finished.
+					if started.IsZero() {
+						started = now
+					}
+					s.store.MarkSuccess(groupName, fingerprint, started)
 				}
 				s.mu.Lock()
 				delete(s.lockedRetry, groupName)
