@@ -363,6 +363,9 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	// pipeDrainTimeout the read ends are force-closed rather than letting the
 	// run (and its group and repo locks) wedge until the manager restarts.
 	waitErr := cmd.Wait()
+	// The process is reaped: stop the signal watchdog now, before the drain
+	// wait, or a late timeout/shutdown could signal a recycled process group.
+	close(done)
 	drained := make(chan struct{})
 	go func() { wg.Wait(); close(drained) }()
 	drainTimer := time.NewTimer(pipeDrainTimeout)
@@ -375,7 +378,6 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 		_ = stderr.Close()
 		<-drained
 	}
-	close(done)
 
 	return r.interpretResult(ctx, groupName, configPath, meta.Repositories, meta.RepositoriesKnown,
 		newArchiveScope(meta),
