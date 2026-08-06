@@ -87,17 +87,14 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 		// it. ExecReady, not Running: Running deliberately includes paused and
 		// restarting for restore safety. Leaving those databases out lets
 		// cache reconciliation mark them offline (the broken-label validation
-		// above still ran).
-		//
-		// SQLite is exempt: its dump reads the database file from the volume's
-		// host path and never touches the container, so the file is at rest
-		// and dumpable exactly like the volume data backed up alongside it.
+		// above still ran). Dumps that never touch the container are kept: see
+		// needsContainerNamespace.
 		if len(dbs) > 0 {
 			dumpable := dbs
 			if !c.ExecReady {
 				dumpable = nil
 				for _, db := range dbs {
-					if db.Type == dbTypeSQLite {
+					if !needsContainerNamespace(db) {
 						dumpable = append(dumpable, db)
 					}
 				}
@@ -374,6 +371,16 @@ func finalizeDatabases(dbs []models.DatabaseConfig, c runtime.ContainerInfo, vol
 		return nil, nil
 	}
 	return result, nil
+}
+
+// needsContainerNamespace reports whether this database's dump execs into the
+// labeled container or joins its namespaces, and therefore needs the container
+// executing. SQLite reads the database file from the volume's host path, and a
+// hostname-mode entry is dumped by a host-side client over the network; both
+// work with the container stopped, and dropping them there would silently omit
+// a logical dump the backup could have taken.
+func needsContainerNamespace(db models.DatabaseConfig) bool {
+	return db.Type != dbTypeSQLite && db.Hostname == ""
 }
 
 // checkNoSymlinkEscape rejects a path whose resolved location leaves the

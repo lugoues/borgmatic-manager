@@ -453,11 +453,12 @@ func TestDiscoverSQLitePathResolution(t *testing.T) {
 	assert.Equal(t, "/var/lib/docker/volumes/app-data/_data/db/app.sqlite3", dbs[0].Path)
 }
 
-// A sqlite dump reads the database file from the volume's host path and never
-// touches the container, so it stays dumpable when the container is stopped,
-// exactly like the volume data backed up alongside it. Only dumps that exec
-// into the container or join its namespaces sit the cycle out.
-func TestDiscoverStoppedContainerKeepsSQLiteDropsNamespaceDumps(t *testing.T) {
+// A sqlite dump reads the database file from the volume's host path, and a
+// hostname-mode dump runs a host-side client over the network: neither touches
+// the container, so both stay dumpable when it is stopped, exactly like the
+// volume data backed up alongside them. Only dumps that exec into the
+// container or join its namespaces sit the cycle out.
+func TestDiscoverStoppedContainerKeepsNamespaceFreeDumps(t *testing.T) {
 	stubProbes(t)
 	rt := mockLists(
 		[]runtime.VolumeInfo{volumeFixture("app-data")},
@@ -476,6 +477,10 @@ func TestDiscoverStoppedContainerKeepsSQLiteDropsNamespaceDumps(t *testing.T) {
 					"borgmatic-manager.db.1.type":     "postgresql",
 					"borgmatic-manager.db.1.name":     "appdb",
 					"borgmatic-manager.db.1.username": "admin",
+					"borgmatic-manager.db.2.type":     "postgresql",
+					"borgmatic-manager.db.2.name":     "remotedb",
+					"borgmatic-manager.db.2.username": "admin",
+					"borgmatic-manager.db.2.hostname": "db.internal",
 				},
 			},
 		},
@@ -485,9 +490,11 @@ func TestDiscoverStoppedContainerKeepsSQLiteDropsNamespaceDumps(t *testing.T) {
 	require.NoError(t, err)
 
 	dbs := state.Groups["myapp"].Databases
-	require.Len(t, dbs, 1, "the postgres dump needs the container's namespace and is skipped")
+	require.Len(t, dbs, 2, "only the namespace-joining postgres dump is skipped")
 	assert.Equal(t, "sqlite", dbs[0].Type)
 	assert.Equal(t, "/var/lib/docker/volumes/app-data/_data/db/app.sqlite3", dbs[0].Path)
+	assert.Equal(t, "remotedb", dbs[1].Name,
+		"a hostname-mode dump is a host-side client over the network; the container's state is irrelevant to it")
 }
 
 func TestDiscoverSQLiteUnknownVolumeFailsDiscovery(t *testing.T) {
