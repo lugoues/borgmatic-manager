@@ -228,7 +228,14 @@ func (d *DockerRuntime) EventStream(ctx context.Context) (<-chan Event, <-chan e
 				}
 				return
 
-			case msg := <-dockerMsgCh:
+			case msg, ok := <-dockerMsgCh:
+				if !ok {
+					// The SDK is not supposed to close this channel, but a
+					// closed one would otherwise spin zero-value receives
+					// forever; surface it as a disconnect instead.
+					errCh <- fmt.Errorf("docker event stream closed")
+					return
+				}
 				if !relevantActions[string(msg.Action)] {
 					continue
 				}
