@@ -178,7 +178,7 @@ func TestGenerateHelperModeDatabases(t *testing.T) {
 	maria := parsed["mariadb_databases"].([]interface{})[0].(map[string]interface{})
 	assert.Equal(t, "environment", maria["password_transport"],
 		"a defaults-file pipe cannot cross the container boundary")
-	assert.Equal(t, helper+" -v /run/borgmatic-manager:/run/borgmatic-manager --network container:maria-svc --env MYSQL_PWD mariadb:11 mariadb-dump", maria["mariadb_dump_command"],
+	assert.Equal(t, helper+" -v '/run/borgmatic-manager':'/run/borgmatic-manager' --network container:maria-svc --env MYSQL_PWD mariadb:11 mariadb-dump", maria["mariadb_dump_command"],
 		"the runtime dir mount lets the client reach borgmatic's dump FIFO")
 	assert.Equal(t, 3306, maria["port"])
 

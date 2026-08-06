@@ -623,8 +623,11 @@ func (g *Generator) buildContainerClientEntry(entry map[string]interface{}, db m
 		run := fmt.Sprintf("%s run --rm --init --label %s=%s --label %s=%s",
 			cli, models.HelperGroupLabel, groupName, models.HelperRunLabel, runID)
 		if db.Type == dbTypeMySQL || db.Type == dbTypeMariaDB {
-			// Mount the runtime dir at the identical path so the client reaches borgmatic's dump FIFO.
-			run += fmt.Sprintf(" -v %s:%s", g.opts.RuntimeDir, g.opts.RuntimeDir)
+			// Mount the runtime dir at the identical path so the client reaches
+			// borgmatic's dump FIFO. Shell-quoted: borgmatic word-splits these
+			// commands, and a runtime dir with spaces would shred the argument.
+			quoted := shellQuote(g.opts.RuntimeDir)
+			run += fmt.Sprintf(" -v %s:%s", quoted, quoted)
 		}
 		envFlag := "--env PGPASSWORD"
 		if db.Type != dbTypePostgres {
@@ -1205,6 +1208,12 @@ func extractRepoRefs(final map[string]interface{}) (refs []RepoRef, understood b
 		}
 	}
 	return refs, true
+}
+
+// shellQuote single-quotes s for a command line that borgmatic will
+// word-split, escaping any embedded single quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // UnknownRepoKey is the lock key for a repository path the manager cannot
