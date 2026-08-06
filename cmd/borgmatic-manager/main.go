@@ -1368,14 +1368,38 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if err != nil {
 		return err
 	}
-	if _, _, genErr := e.newGenerator(configsDir, logger).Generate(backupState); genErr != nil {
+	meta, _, genErr := e.newGenerator(configsDir, logger).Generate(backupState)
+	if genErr != nil {
 		return genErr
+	}
+	// A refused group has no generated config; say so before any preparation
+	// rather than failing later with a missing-file error.
+	groupMeta, ok := meta[group]
+	if !ok {
+		return fmt.Errorf("group %q was refused during generation (see the warnings above); fix its configuration before restoring", group)
 	}
 
 	borgmaticPath, err := resolveBorgmatic(e.cfg)
 	if err != nil {
 		return err
 	}
+
+	// Exclude concurrent backups: take the same cross-process locks the
+	// runner's backups take, so a scheduled run cannot archive the volume
+	// mid-wipe or hold the borg repository lock against the extract. The
+	// extract runs as a supervised child, so the flocks outlast it; they are
+	// held from here through every destructive step below.
+	for _, key := range append([]string{runner.GroupLockKey(group)}, repoLockKeys(groupMeta.Repos)...) {
+		lock, acquired, lockErr := runner.TryCrossLock(e.locksDir(), key)
+		if lockErr != nil {
+			return fmt.Errorf("taking cross-process lock %s: %w", key, lockErr)
+		}
+		if !acquired {
+			return fmt.Errorf("a backup involving group %q or its repository is running; retry when it finishes", group)
+		}
+		defer lock.Release()
+	}
+
 	configPath := filepath.Join(configsDir, group+".yaml")
 
 	// Mirror mode destroys the target before borgmatic has proven it can refill
@@ -1574,6 +1598,15 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		}
 		return restoreWithSwap(plan.targetData, logger, archivedEmpty, extract, stillSafe)
 	}
+}
+
+// repoLockKeys maps a group's canonical repository keys to runner lock keys.
+func repoLockKeys(repos []string) []string {
+	keys := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		keys = append(keys, runner.RepoLockKey(repo))
+	}
+	return keys
 }
 
 // extractKillGrace is how long borgmatic gets to stop cleanly after a
