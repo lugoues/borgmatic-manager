@@ -648,7 +648,9 @@ func TestGenerateGroupTokenAllowedOnSharedRepo(t *testing.T) {
 		"each group's archives carry its own name, so prune stays scoped")
 }
 
-func TestGeneratePrefixGroupNamesWarnOnSharedRepo(t *testing.T) {
+func TestGeneratePrefixGroupNamesRefuseOnSharedRepo(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
 	state := models.NewBackupState()
 	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
 	state.AddVolume("app-prod", models.VolumeInfo{Name: "b", HostPath: "/mnt/b"})
@@ -664,11 +666,14 @@ func TestGeneratePrefixGroupNamesWarnOnSharedRepo(t *testing.T) {
 	g := config.NewGenerator(cfg, nil, t.TempDir(), config.GeneratorOptions{}, logger)
 	g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
 
-	meta, _, err := g.Generate(state)
+	meta, refusals, err := g.Generate(state)
 	require.NoError(t, err)
 
-	assert.Len(t, meta, 2, "prefix collisions warn, they do not refuse")
-	assert.Contains(t, buf.String(), "retention can cross group boundaries")
+	require.NotContains(t, meta, "app",
+		"the prefix group's retention would prune app-prod's archives, so it is refused")
+	require.Contains(t, meta, "app-prod")
+	require.Len(t, refusals, 1)
+	assert.Contains(t, buf.String(), "retention for this group would prune the sibling's backups")
 }
 
 // A run id scopes dump-helper reaping to one actual run. Plan and RenderGroup
@@ -713,6 +718,62 @@ func TestPlanAndRenderGroupDoNotMintRealRunIDs(t *testing.T) {
 	assert.Regexp(t, `^[0-9a-f]{16}$`, gen["db-group"].RunID)
 }
 
+func TestGenerateIdenticalResolvedFormatsBothRefused(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("app-prod", models.VolumeInfo{Name: "b", HostPath: "/mnt/b"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+		},
+	}
+	// Both formats resolve to "app-prod-{now}": the archives would be
+	// indistinguishable and either group's retention would prune the other's.
+	overrides := map[string]map[string]interface{}{
+		"app":      {"archive_name_format": "{group}-prod-{now}"},
+		"app-prod": {"archive_name_format": "{group}-{now}"},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	meta, refusals, err := g.Generate(state)
+	require.NoError(t, err)
+
+	assert.Empty(t, meta, "identical resolved formats leave either group able to prune the other; both must be refused")
+	assert.Len(t, refusals, 2)
+}
+
+func TestGenerateWildcardBacktrackOverlapRefused(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	state := models.NewBackupState()
+	state.AddVolume("app", models.VolumeInfo{Name: "a", HostPath: "/mnt/a"})
+	state.AddVolume("data", models.VolumeInfo{Name: "b", HostPath: "/mnt/b"})
+
+	cfg := &config.ManagerConfig{
+		Borgmatic: map[string]interface{}{
+			"repositories":        []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+			"archive_name_format": "{hostname}-{group}-{now}",
+		},
+	}
+	// data's format resolves to "{hostname}-data-app-{now}"; app's pattern
+	// "*-app-*" matches it by letting the hostname wildcard absorb "-data".
+	overrides := map[string]map[string]interface{}{
+		"data": {"archive_name_format": "{hostname}-{group}-app-{now}"},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	meta, refusals, err := g.Generate(state)
+	require.NoError(t, err)
+
+	require.NotContains(t, meta, "app", "app's wildcard pattern reaches data's archives via backtracking and must be refused")
+	require.Contains(t, meta, "data", "the narrower group keeps running")
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "app", refusals[0].Group)
+}
+
 func TestGenerateExtractsRepositoryRefsWithLabels(t *testing.T) {
 	state := models.NewBackupState()
 	state.AddVolume("app", models.VolumeInfo{Name: "v", HostPath: "/mnt/v"})
@@ -752,11 +813,12 @@ func TestArchiveMatchPatternReplacesBorgPlaceholders(t *testing.T) {
 	}
 }
 
-// Generation warns about groups whose names prefix one another sharing a
-// repository and keeps both, so the overlap has to be reported to the runner:
-// "app"'s pattern matches "app-prod"'s archives, and a probe using it cannot
-// tell whose backup it found.
-func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
+// Generation refuses a group whose name prefixes a sibling's when they share a
+// repository: "app"'s pattern matches "app-prod"'s archives, so app's retention
+// would prune backups it does not own. The refusal is directional: app-prod's
+// own pattern would need the literal "prod-" to come out of a timestamp, so the
+// narrower group keeps running.
+func TestPrefixOvermatchingGroupIsRefused(t *testing.T) {
 	// The default format contains {hostname}, so an unpinned hostname makes the
 	// assertions depend on the machine: a host named after one of these groups
 	// creates a collision that has nothing to do with what is being tested.
@@ -775,17 +837,19 @@ func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, _, err := g.Generate(state)
+	meta, refusals, err := g.Generate(state)
 	require.NoError(t, err)
 
-	assert.NotEmpty(t, meta["app"].AmbiguousRepos,
-		"the prefix matches the longer group's archives")
-	assert.NotEmpty(t, meta["app-prod"].AmbiguousRepos,
-		"and it shares a repository with a group whose retention crosses into its own")
-	assert.Empty(t, meta["other"].AmbiguousRepos,
-		"a group no other name prefixes keeps a usable pattern")
-	assert.NotEmpty(t, meta["app"].ArchivePattern,
-		"the pattern is still produced; it is retention that still needs it")
+	require.NotContains(t, meta, "app",
+		"the prefix group's pattern matches the longer group's archives")
+	require.Contains(t, meta, "app-prod",
+		"the narrower group cannot claim the prefix group's archives and runs")
+	require.Contains(t, meta, "other",
+		"a group no other name prefixes is untouched")
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "app", refusals[0].Group)
+	assert.Contains(t, refusals[0].Reason, "app-prod",
+		"the reason names the sibling whose archives would be pruned")
 }
 
 // Overlap is a property of the names a format generates, not of the group names
@@ -794,7 +858,7 @@ func TestPrefixCollidingGroupsAreMarkedAmbiguous(t *testing.T) {
 // every pair of groups a collision, because "*-app-*" and "*-other-*" both match
 // "x-app--other-y".
 func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
-	generate := func(t *testing.T, format string, groups ...string) map[string]config.GroupRunMeta {
+	generate := func(t *testing.T, format string, groups ...string) (map[string]config.GroupRunMeta, []config.Refusal) {
 		t.Helper()
 		// Pinned for the {hostname} cases: the machine's own name must not
 		// decide whether these patterns collide.
@@ -808,69 +872,71 @@ func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
 			"archive_name_format": format,
 		}}
 		g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-		meta, _, err := g.Generate(st)
+		meta, refusals, err := g.Generate(st)
 		require.NoError(t, err)
-		return meta
+		return meta, refusals
 	}
 
 	t.Run("no separator before the timestamp still collides", func(t *testing.T) {
-		meta := generate(t, "{group}{now}", "app", "apple")
-		assert.NotEmpty(t, meta["app"].AmbiguousRepos,
+		meta, refusals := generate(t, "{group}{now}", "app", "apple")
+		require.NotContains(t, meta, "app",
 			`"app*" matches the archives "apple" writes`)
-		assert.NotEmpty(t, meta["apple"].AmbiguousRepos)
+		require.Contains(t, meta, "apple",
+			`"apple*" needs the letters "le" where app's names put a digit, so only the prefix group is refused`)
+		require.Len(t, refusals, 1)
 	})
 
 	t.Run("a trailing group name cannot collide", func(t *testing.T) {
-		meta := generate(t, "{now}-{group}", "app", "apple")
-		assert.Empty(t, meta["app"].AmbiguousRepos,
+		meta, refusals := generate(t, "{now}-{group}", "app", "apple")
+		require.Contains(t, meta, "app",
 			`no name ends in both "-app" and "-apple"`)
-		assert.Empty(t, meta["apple"].AmbiguousRepos)
+		require.Contains(t, meta, "apple")
+		assert.Empty(t, refusals)
 	})
 
 	t.Run("unrelated groups sharing a repository are not collisions", func(t *testing.T) {
-		meta := generate(t, "{hostname}-{group}-{now}", "app", "other", "third")
+		meta, refusals := generate(t, "{hostname}-{group}-{now}", "app", "other", "third")
 		for _, name := range []string{"app", "other", "third"} {
-			assert.Empty(t, meta[name].AmbiguousRepos,
+			require.Contains(t, meta, name,
 				"%s shares a repository but its archives are distinguishable", name)
 		}
+		assert.Empty(t, refusals)
 	})
 
 	t.Run("the prefix shape is still caught", func(t *testing.T) {
-		meta := generate(t, "{hostname}-{group}-{now}", "app", "app-prod")
-		assert.NotEmpty(t, meta["app"].AmbiguousRepos)
-		assert.NotEmpty(t, meta["app-prod"].AmbiguousRepos)
+		meta, refusals := generate(t, "{hostname}-{group}-{now}", "app", "app-prod")
+		require.NotContains(t, meta, "app")
+		require.Contains(t, meta, "app-prod")
+		require.Len(t, refusals, 1)
 	})
 }
 
-func TestPatternsCollide(t *testing.T) {
+func TestPatternOvermatches(t *testing.T) {
 	defer config.SetSampleHostname("myhost")()
 
-	// Both directions, because the two groups' formats need not be the same: a
-	// per-group override can give one group a format whose literal text is the
-	// other group's whole name. Only the second direction sees that, and group
-	// order is alphabetical, which always puts a prefix before its extension.
-	t.Run("a collision only the second direction sees", func(t *testing.T) {
-		assert.False(t, config.PatternMatchesFormatForTest("alpha", "alpha{now}"),
+	// The decision is directional, because the two groups' formats need not be
+	// the same: a per-group override can give one group a format whose literal
+	// text is the other group's whole name. Only one direction sees that, and
+	// only the group whose pattern reaches into the sibling's names is refused.
+	t.Run("an overlap only one direction sees", func(t *testing.T) {
+		assert.False(t, config.PatternOvermatchesForTest("alpha", "alpha{now}"),
 			"alpha's own pattern does not match beta's names")
-		assert.True(t, config.PatternsCollideForTest(
-			"alpha", "{group}", // group alpha, whose name is the whole format
-			"alpha*", "alpha{now}"), // group beta, whose literal text is alpha's name
+		assert.True(t, config.PatternOvermatchesForTest("alpha*", "alpha"),
 			"but beta's pattern claims alpha's archives")
 	})
 
-	t.Run("distinguishable patterns do not collide", func(t *testing.T) {
-		assert.False(t, config.PatternsCollideForTest(
-			"*-app-*", "{hostname}-app-{now}",
-			"*-other-*", "{hostname}-other-{now}"))
+	t.Run("distinguishable patterns do not overmatch in either direction", func(t *testing.T) {
+		assert.False(t, config.PatternOvermatchesForTest("*-app-*", "{hostname}-other-{now}"))
+		assert.False(t, config.PatternOvermatchesForTest("*-other-*", "{hostname}-app-{now}"))
 	})
 
 	// Unreachable through generation today, because a shared-repo group whose
 	// archive_name_format lacks the {group} token is refused before this runs.
 	// Kept because "nothing is known about this group's archive names" must not
 	// read as "its archives are distinguishable" if that ever changes.
-	t.Run("an unknown pattern is treated as colliding", func(t *testing.T) {
-		assert.True(t, config.PatternsCollideForTest("", "", "*-app-*", "x-app-{now}"))
-		assert.True(t, config.PatternsCollideForTest("*-app-*", "x-app-{now}", "", ""))
+	t.Run("an unknown pattern or format is treated as over-matching", func(t *testing.T) {
+		assert.True(t, config.PatternOvermatchesForTest("", "x-app-{now}"))
+		assert.True(t, config.PatternOvermatchesForTest("*-app-*", ""))
 	})
 }
 
@@ -890,10 +956,13 @@ func TestDirectiveCombinationsAreMatched(t *testing.T) {
 	assert.False(t, config.PatternMatchesFormatForTest("x-02-60-*", "x-{now:%m}-{now:%S}-prod-{now}"),
 		"nor a sixtieth second")
 
-	// Through the collision decision, in both directions.
-	assert.True(t, config.PatternsCollideForTest(
-		"x-02-59-*", "x-{group}-{now}",
-		"x-*-*-prod-*", "x-{now:%m}-{now:%S}-prod-{now}"))
+	// Through the refusal decision, which is directional: the pattern that
+	// reaches into the sibling's names over-matches; the sibling's own pattern
+	// would need "prod" to come out of a timestamp, and does not.
+	assert.True(t, config.PatternOvermatchesForTest(
+		"x-02-59-*", "x-{now:%m}-{now:%S}-prod-{now}"))
+	assert.False(t, config.PatternOvermatchesForTest(
+		"x-*-*-prod-*", "x-02-59-{now}"))
 
 	// Single directives still work, including the earlier month and day cases.
 	assert.True(t, config.PatternMatchesFormatForTest("x-07-*", "x-{now:%m}-prod-{now}"))
@@ -961,7 +1030,8 @@ func TestFormatDirectiveDomains(t *testing.T) {
 }
 
 // The collision the digits-only stand-in hid: with this hostname, group "prod"
-// writes "db-app-node-prod-..." and group "app" claims it with "*-app-*".
+// writes "db-app-node-prod-..." and group "app" claims it with "*-app-*", so
+// app is refused. prod's own pattern finds no "prod" in app's names and runs.
 func TestAHostnameCanCreateACollision(t *testing.T) {
 	defer config.SetSampleHostname("db-app-node")()
 
@@ -973,12 +1043,14 @@ func TestAHostnameCanCreateACollision(t *testing.T) {
 	}}
 
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, _, err := g.Generate(st)
+	meta, refusals, err := g.Generate(st)
 	require.NoError(t, err)
 
-	assert.NotEmpty(t, meta["app"].AmbiguousRepos,
+	require.NotContains(t, meta, "app",
 		`"*-app-*" matches "db-app-node-prod-..." through the hostname`)
-	assert.NotEmpty(t, meta["prod"].AmbiguousRepos)
+	require.Contains(t, meta, "prod")
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "app", refusals[0].Group)
 }
 
 // The control: an ordinary hostname leaves those same two groups distinguishable.
@@ -993,17 +1065,19 @@ func TestAnOrdinaryHostnameLeavesGroupsDistinguishable(t *testing.T) {
 	}}
 
 	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	meta, _, err := g.Generate(st)
+	meta, refusals, err := g.Generate(st)
 	require.NoError(t, err)
 
-	assert.Empty(t, meta["app"].AmbiguousRepos)
-	assert.Empty(t, meta["prod"].AmbiguousRepos)
+	require.Contains(t, meta, "app")
+	require.Contains(t, meta, "prod")
+	assert.Empty(t, refusals)
 }
 
-// Ambiguity belongs to a repository, not to a group. A group sharing one
-// destination with a colliding sibling and holding another to itself keeps
-// confirmation on the second: nothing else writes there.
-func TestAmbiguityNamesOnlyTheSharedRepository(t *testing.T) {
+// The refusal is of the whole group even when only one of its repositories is
+// contested. Silently dropping just the shared destination would change where
+// the group's backups land without anyone deciding that; stopping loudly is
+// recoverable, a repository quietly missing backups is not.
+func TestOvermatchInOneRepositoryRefusesTheWholeGroup(t *testing.T) {
 	defer config.SetSampleHostname("backup01")()
 
 	st := models.NewBackupState()
@@ -1022,23 +1096,25 @@ func TestAmbiguityNamesOnlyTheSharedRepository(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	meta, _, err := g.Generate(st)
+	meta, refusals, err := g.Generate(st)
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{config.CanonicalRepoKey("/mnt/shared")}, meta["app"].AmbiguousRepos,
-		"only the destination it shares with the colliding sibling")
-	assert.NotContains(t, meta["app"].AmbiguousRepos, config.CanonicalRepoKey("/mnt/app-only"),
-		"the repository it has to itself can still confirm")
-	assert.Equal(t, []string{config.CanonicalRepoKey("/mnt/shared")}, meta["app-prod"].AmbiguousRepos)
+	require.NotContains(t, meta, "app",
+		"contested in the shared repository, so the group does not run at all")
+	require.Contains(t, meta, "app-prod",
+		"the narrower sibling keeps the shared repository")
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "app", refusals[0].Group)
+	assert.Len(t, refusals[0].Repositories, 2,
+		"the refusal reports every destination the group would have written")
 }
 
 // A group refused for lacking the {group} token never runs, so it writes nothing
-// that could contaminate a survivor's repository. Judging collisions against the
-// pre-refusal set instead punished the survivor twice: the refused group has no
-// pattern, which reads as "cannot be distinguished", so the survivor lost
-// success confirmation in a repository it now has entirely to itself, and warned
-// about a conflict with a group that is not running.
-func TestARefusedGroupDoesNotMakeASurvivorAmbiguous(t *testing.T) {
+// that could contaminate a survivor's repository. Judging overlaps against the
+// pre-refusal set instead would punish the survivor twice: the refused group has
+// no pattern, which reads as "cannot be distinguished", so the survivor would be
+// refused over a conflict with a group that is not running.
+func TestARefusedGroupDoesNotRefuseASurvivor(t *testing.T) {
 	defer config.SetSampleHostname("backup01")()
 
 	st := models.NewBackupState()
@@ -1055,13 +1131,14 @@ func TestARefusedGroupDoesNotMakeASurvivorAmbiguous(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	meta, _, err := g.Generate(st)
+	meta, refusals, err := g.Generate(st)
 	require.NoError(t, err)
 
 	require.NotContains(t, meta, "bad", "the group without the token is refused")
-	require.Contains(t, meta, "good")
-	assert.Empty(t, meta["good"].AmbiguousRepos,
-		"the survivor has the repository to itself and can still confirm its backups")
+	require.Contains(t, meta, "good",
+		"the survivor has the repository to itself and keeps running")
+	require.Len(t, refusals, 1, "only the tokenless group is refused")
+	assert.Equal(t, "bad", refusals[0].Group)
 }
 
 // The end-to-end shape of the same collision, through generation: a group named
@@ -1082,12 +1159,15 @@ func TestAGroupNamedLikeADateCollidesWithAFormattedTimestamp(t *testing.T) {
 	}
 
 	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
-	meta, _, err := g.Generate(st)
+	meta, refusals, err := g.Generate(st)
 	require.NoError(t, err)
 
-	assert.NotEmpty(t, meta["07"].AmbiguousRepos,
+	require.NotContains(t, meta, "07",
 		`"x-07-*" claims the archives prod writes every July`)
-	assert.NotEmpty(t, meta["prod"].AmbiguousRepos)
+	require.Contains(t, meta, "prod",
+		`prod's own pattern needs the literal "prod", which no timestamp produces`)
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "07", refusals[0].Group)
 }
 
 // An at-sign in a local path is not a remote repository. Treating it as one
@@ -1147,10 +1227,9 @@ func TestYearsOutsideAnyWindowStillCollide(t *testing.T) {
 	assert.True(t, config.PatternMatchesFormatForTest("x-99-*", "x-{now:%y}-prod-{now}"))
 	assert.False(t, config.PatternMatchesFormatForTest("x-999-*", "x-{now:%y}-prod-{now}"))
 
-	// And through the collision decision, which is where it matters.
-	assert.True(t, config.PatternsCollideForTest(
-		"x-2020-*", "x-{group}-{now}",
-		"x-*-prod-*", "x-{now:%Y}-prod-{now}"))
+	// And through the refusal decision, which is where it matters.
+	assert.True(t, config.PatternOvermatchesForTest(
+		"x-2020-*", "x-{now:%Y}-prod-{now}"))
 }
 
 // Two groups pointing at different environment-backed destinations do not share
@@ -1214,10 +1293,9 @@ func TestGlobMetacharactersInAPatternAreMatchedAsBorgMatchesThem(t *testing.T) {
 			"letters cannot be a year")
 	})
 
-	// Through the collision decision, which is the point.
-	assert.True(t, config.PatternsCollideForTest(
-		"snap?app-*", "snap?{group}-{now}",
-		"snapXapp-*", "snapXapp-{now}"))
+	// Through the refusal decision, which is the point.
+	assert.True(t, config.PatternOvermatchesForTest(
+		"snap?app-*", "snapXapp-{now}"))
 }
 
 // The fully qualified and reverse names come from resolver configuration and a
@@ -1263,11 +1341,10 @@ func TestGlobWildcardsMatchWholeCharacters(t *testing.T) {
 			"but a negated one does")
 	})
 
-	// Through the collision decision, where it decides whether retention can
+	// Through the refusal decision, where it decides whether retention can
 	// cross the boundary.
-	assert.True(t, config.PatternsCollideForTest(
-		"snap?app-*", "snap?{group}-{now}",
-		"snapéapp-*", "snapéapp-{now}"))
+	assert.True(t, config.PatternOvermatchesForTest(
+		"snap?app-*", "snapéapp-{now}"))
 }
 
 // borg reads a leading "re:", "sh:" or "pp:" as a syntax selector, so a format
@@ -1386,8 +1463,8 @@ func TestLocaleDependentDirectivesAreNotModelledInEnglishOnly(t *testing.T) {
 	assert.True(t, config.PatternMatchesFormatForTest("x-07-*", "x-{now:%m}-prod-{now}"))
 	assert.False(t, config.PatternMatchesFormatForTest("x-13-*", "x-{now:%m}-prod-{now}"))
 
-	// And through the collision decision.
-	assert.True(t, config.PatternsCollideForTest(
-		"Juli-*", "{group}-{now}",
-		"*-other", "{now:%B}-{group}"))
+	// And through the refusal decision: an unpredictable month name must not
+	// rule the overlap out.
+	assert.True(t, config.PatternOvermatchesForTest(
+		"Juli-*", "{now:%B}-other"))
 }

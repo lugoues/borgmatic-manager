@@ -39,10 +39,11 @@ func FormatAlternativesForTest(format string) [][]string {
 	return out
 }
 
-// PatternsCollideForTest exposes the collision decision so the asymmetric and
-// degenerate cases can be stated directly rather than reached through a config.
-func PatternsCollideForTest(patternA, formatA, patternB, formatB string) bool {
-	return patternsCollide(patternA, archiveFormatSegments(formatA), patternB, archiveFormatSegments(formatB))
+// PatternOvermatchesForTest exposes the directional overmatch decision so the
+// asymmetric and degenerate cases can be stated directly rather than reached
+// through a config.
+func PatternOvermatchesForTest(pattern, format string) bool {
+	return patternOvermatches(pattern, archiveFormatSegments(format))
 }
 
 // SetSampleHostname pins the hostname the decomposition uses, so a collision
