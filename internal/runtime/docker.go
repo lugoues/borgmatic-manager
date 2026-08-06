@@ -129,16 +129,21 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 			})
 		}
 		infos = append(infos, ContainerInfo{
-			ID:      c.ID,
-			Name:    name,
-			Image:   c.Image,
-			Labels:  c.Labels,
-			Mounts:  mounts,
-			Running: containerHoldsMounts(c.State),
+			ID:        c.ID,
+			Name:      name,
+			Image:     c.Image,
+			Labels:    c.Labels,
+			Mounts:    mounts,
+			Running:   containerHoldsMounts(c.State),
+			ExecReady: c.State == containerStateRunning,
 		})
 	}
 	return infos, nil
 }
+
+// containerStateRunning is the one state in which a container's processes
+// execute: the only state a dump can exec into or join.
+const containerStateRunning = "running"
 
 // containerHoldsMounts reports whether a container in this state still has its
 // volumes attached to a process that can write to them. "paused" and
@@ -149,7 +154,7 @@ func (d *DockerRuntime) ListContainers(ctx context.Context) ([]ContainerInfo, er
 // fresh when it does; "exited", "dead", and "removing" have no process at all.
 func containerHoldsMounts(state string) bool {
 	switch state {
-	case "running", "paused", "restarting":
+	case containerStateRunning, "paused", "restarting":
 		return true
 	default:
 		return false

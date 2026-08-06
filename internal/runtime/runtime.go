@@ -46,6 +46,12 @@ type ContainerInfo struct {
 	// process still exists and resumes holding the inode it had, so replacing
 	// that inode leaves it writing into an orphaned mount.
 	Running bool
+	// ExecReady is true only when the container is actually executing: a dump
+	// can exec into it or join its namespaces. Running is the wrong question
+	// for that. A paused container holds its mounts (Running) but its
+	// processes are frozen, so an exec is rejected and a helper joining its
+	// network namespace hangs until timeout.
+	ExecReady bool
 }
 
 // VolumeMount is a named volume attached to a container.

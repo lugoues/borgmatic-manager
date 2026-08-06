@@ -51,7 +51,7 @@ func backupContainer(name, group string, mounts ...runtime.VolumeMount) runtime.
 		ID:      "id-" + name,
 		Name:    name,
 		Image:   "example/" + name + ":1",
-		Running: true,
+		Running: true, ExecReady: true,
 		Labels: map[string]string{
 			"borgmatic-manager.enable": "true",
 			"borgmatic-manager.group":  group,
@@ -319,7 +319,7 @@ func TestDiscoverContainerDatabases(t *testing.T) {
 			ID:      "abc123",
 			Name:    "postgres-svc",
 			Image:   "postgres:17-alpine",
-			Running: true,
+			Running: true, ExecReady: true,
 			Labels: map[string]string{
 				"borgmatic-manager.group":         "myapp",
 				"borgmatic-manager.db.0.type":     "postgresql",
@@ -339,6 +339,40 @@ func TestDiscoverContainerDatabases(t *testing.T) {
 	assert.Equal(t, "postgres-svc", dbs[0].Container)
 	assert.Equal(t, "postgres:17-alpine", dbs[0].Image,
 		"discovery must record the image so helper dumps match the server version")
+}
+
+// A paused container is the sharper case: it holds its mounts (Running is
+// deliberately true for restore safety) but its processes are frozen, so an
+// exec is rejected and a helper joining its network namespace hangs until
+// timeout, failing the whole group backup.
+func TestDiscoverPausedContainerDatabasesSkipped(t *testing.T) {
+	stubProbes(t)
+	rt := mockLists([]runtime.VolumeInfo{volumeFixture("pgdata")}, []runtime.ContainerInfo{
+		{
+			ID:        "abc124",
+			Name:      "postgres-svc",
+			Image:     "postgres:17-alpine",
+			Running:   true,
+			ExecReady: false,
+			Labels: map[string]string{
+				"borgmatic-manager.enable":        "true",
+				"borgmatic-manager.group":         "myapp",
+				"borgmatic-manager.db.0.type":     "postgresql",
+				"borgmatic-manager.db.0.name":     "appdb",
+				"borgmatic-manager.db.0.username": "admin",
+			},
+			Mounts: []runtime.VolumeMount{mountFixture("pgdata", "/var/lib/postgresql/data")},
+		},
+	})
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+
+	require.Contains(t, state.Groups, "myapp")
+	assert.Empty(t, state.Groups["myapp"].Databases,
+		"a frozen namespace hangs a dump helper; the database must sit this cycle out")
+	assert.NotEmpty(t, state.Groups["myapp"].Volumes,
+		"the volume data is at rest and stays backed up")
 }
 
 func TestDiscoverStoppedContainerDatabasesSkipped(t *testing.T) {
@@ -399,7 +433,7 @@ func TestDiscoverSQLitePathResolution(t *testing.T) {
 				ID:      "c1",
 				Name:    "app",
 				Image:   "example/app:1",
-				Running: true,
+				Running: true, ExecReady: true,
 				Labels: map[string]string{
 					"borgmatic-manager.group":       "myapp",
 					"borgmatic-manager.db.0.type":   "sqlite",
@@ -585,7 +619,7 @@ func TestDiscoverSpecLabel(t *testing.T) {
 		ID:      "id-web",
 		Name:    "web",
 		Image:   "example/web:1",
-		Running: true,
+		Running: true, ExecReady: true,
 		Labels: map[string]string{
 			"borgmatic-manager.spec": spec,
 		},
@@ -723,7 +757,7 @@ func TestDiscoverSpecDatabaseValidationShared(t *testing.T) {
 	// mariadb with mode=exec must fall back to helper, same as flat labels.
 	spec := `{"group": "g", "db": [{"type": "mariadb", "name": "db", "username": "u", "mode": "exec"}]}`
 	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
-		{ID: "c1", Name: "maria", Image: "mariadb:11", Running: true, Labels: map[string]string{"borgmatic-manager.spec": spec}},
+		{ID: "c1", Name: "maria", Image: "mariadb:11", Running: true, ExecReady: true, Labels: map[string]string{"borgmatic-manager.spec": spec}},
 	})
 
 	state, err := discovery.Discover(context.Background(), rt, logger)
