@@ -1345,10 +1345,30 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if genErr != nil {
 		return genErr
 	}
-	// A refused group has no generated config; say so before any preparation
-	// rather than failing later with a missing-file error.
+	// A group refused only for archive-pattern overlap can still restore: an
+	// extract of an explicitly named archive neither prunes nor creates, so
+	// the overlap that stops its scheduled backups does not make its archives
+	// unrestorable, and demanding a rename before disaster recovery could
+	// change which archives its pattern selects. Its config is rendered here,
+	// into this restore's private dir only; the daemon's configs are untouched
+	// and its backups stay refused. Every other refusal still stands.
 	if _, ok := meta[group]; !ok {
-		return fmt.Errorf("group %q was refused during generation (see the warnings above); fix its configuration before restoring", group)
+		yamlStr, gm, reason, rErr := e.newGenerator(configsDir, logger).RenderGroupForRestore(backupState, group)
+		if rErr != nil {
+			return rErr
+		}
+		if yamlStr == "" {
+			if reason != "" {
+				return fmt.Errorf("group %q was refused during generation: %s; fix its configuration before restoring", group, reason)
+			}
+			return fmt.Errorf("group %q was refused during generation (see the warnings above); fix its configuration before restoring", group)
+		}
+		logger.Warn("group is refused for scheduled backups (archive pattern overlap); rendering a restore-only config, an extract of a named archive neither prunes nor creates",
+			"group", group)
+		if wErr := os.WriteFile(filepath.Join(configsDir, group+".yaml"), []byte(yamlStr), 0o600); wErr != nil {
+			return fmt.Errorf("writing restore-only config for group %s: %w", group, wErr)
+		}
+		meta[group] = gm
 	}
 
 	borgmaticPath, err := resolveBorgmatic(e.cfg)
