@@ -323,9 +323,15 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 		return fmt.Errorf("starting borgmatic for group %s: %w", groupName, err)
 	}
 	// The child holds its own copies; the parent's write ends must close now or
-	// the consumers would never see EOF.
+	// the consumers would never see EOF. The read ends close when the run
+	// returns (drained EOF leaves them open otherwise, leaking two descriptors
+	// per run); the force-close in the drain timeout branch just happens early.
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
+	defer func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+	}()
 
 	run := &runState{logger: r.logger, group: groupName}
 	var wg sync.WaitGroup
