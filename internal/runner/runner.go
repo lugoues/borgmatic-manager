@@ -224,15 +224,24 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 	}
 	defer release()
 
-	// Cross-process layer: same keys as non-blocking flocks, taken with the
+	// Cross-process layer: the same keys as non-blocking flocks, taken with the
 	// in-process locks held. Held by another process means skip, never wait.
+	//
+	// The group key is flocked here too, although in-process it is only the
+	// semaphore above: a restore serializes against this group's backups by
+	// holding this flock, and the repository keys alone cannot carry that. The
+	// two processes may derive different repository keys for the same group
+	// (the configuration can change between their generations), and the group
+	// name is the one identity both sides always agree on. It goes into the
+	// flock list only; as an in-process key it would self-deadlock against the
+	// semaphore already held.
 	var heldLocks []*lockfile.Lock
 	releaseLocks := func() {
 		for i := len(heldLocks) - 1; i >= 0; i-- {
 			heldLocks[i].Release()
 		}
 	}
-	for _, key := range keys {
+	for _, key := range append([]string{GroupLockKey(groupName)}, keys...) {
 		lock, acquired, err := tryCrossLock(r.lockDir, key)
 		if err != nil {
 			releaseLocks()
