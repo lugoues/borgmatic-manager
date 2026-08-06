@@ -80,8 +80,18 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			specErrs = append(specErrs, err)
 			continue
 		}
+		// A stopped container's databases cannot be dumped: the helper would
+		// try to join a namespace that is not running and fail every cycle.
+		// Leaving them out lets cache reconciliation mark them offline (the
+		// broken-label validation above still ran). Volumes stay: their data
+		// is at rest and safe to back up.
 		if len(dbs) > 0 {
-			state.AddDatabases(intent.group, dbs)
+			if c.Running {
+				state.AddDatabases(intent.group, dbs)
+			} else {
+				logger.Info("container is not running; skipping its databases this cycle",
+					"container", c.Name, "group", intent.group, "databases", len(dbs))
+			}
 		}
 
 		if intent.config != nil {
