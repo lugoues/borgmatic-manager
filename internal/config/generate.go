@@ -54,18 +54,6 @@ type GroupRunMeta struct {
 	// RunID is minted fresh each generation and stamped onto dump helper
 	// containers so the runner reaps only this run's orphans.
 	RunID string
-	// AmbiguousRepos are the canonical keys of repositories this group shares
-	// with a group whose archive pattern overlaps its own: this group's
-	// "*-app-*" also matches "*-app-prod-*". The pattern stays correct for
-	// retention (borgmatic's own concern) but in those repositories it cannot
-	// answer "did this group write an archive here", so it must not be used to
-	// confirm a success there.
-	//
-	// Per repository, not per group. A group can have a destination it shares
-	// with a colliding sibling and another that is its own, and the second one's
-	// probe is unaffected: nothing else writes to it, so an archive found there
-	// is this group's.
-	AmbiguousRepos []string
 	// RepositoriesKnown records that the repository list was understood in full,
 	// as opposed to being absent, malformed, or holding an entry this code could
 	// not read. An empty Repositories means nothing on its own.

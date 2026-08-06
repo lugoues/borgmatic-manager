@@ -752,48 +752,23 @@ func repoIdentity(path string) string {
 	return config.UnknownRepoKey
 }
 
-// archiveScope is how the probe identifies this group's archives, and whether it
-// can be trusted to.
+// archiveScope is how the probe identifies this group's archives.
 //
 // An empty pattern means the group's config names no archive format to match on;
 // the probe then asks "is there a fresh archive here at all", which is the same
 // question only when no other group shares the repository. Generation refuses a
 // shared-repo group whose archive_name_format lacks the {group} token, so a
-// shared repository always yields a pattern.
-//
-// ambiguous is the case a pattern alone cannot express: the pattern exists and
-// is correct for retention, but another group sharing the repository has a name
-// this one prefixes, so "*-app-*" also matches "*-app-prod-*". It cannot confirm
-// that this group wrote anything.
+// shared repository always yields a pattern. It also refuses a group whose
+// pattern claims a sibling's archives, so a pattern that reaches this code can
+// be trusted in every repository it runs against: any archive it matches is
+// this group's.
 type archiveScope struct {
 	pattern string
-	// ambiguous holds the canonical keys of the repositories where another
-	// group's archives also match this pattern. Per repository, because a group
-	// can share one destination with a colliding sibling and have another to
-	// itself, and only the shared one is in question.
-	ambiguous map[string]bool
 }
-
-// canConfirm reports whether a probe against this repository proves this group's
-// backup reached it, rather than merely proving that some archive is there.
-func (a archiveScope) canConfirm(repoPath string) bool {
-	return !a.ambiguous[config.CanonicalRepoKey(repoPath)]
-}
-
-// anyAmbiguous reports whether any repository in this run lost confirmation, for
-// the one warning emitted per run rather than per repository.
-func (a archiveScope) anyAmbiguous() bool { return len(a.ambiguous) > 0 }
 
 // newArchiveScope builds the scope for a group's run.
 func newArchiveScope(meta config.GroupRunMeta) archiveScope {
-	scope := archiveScope{pattern: meta.ArchivePattern}
-	if len(meta.AmbiguousRepos) > 0 {
-		scope.ambiguous = make(map[string]bool, len(meta.AmbiguousRepos))
-		for _, key := range meta.AmbiguousRepos {
-			scope.ambiguous[key] = true
-		}
-	}
-	return scope
+	return archiveScope{pattern: meta.ArchivePattern}
 }
 
 // matchResults pairs each configured repository with the create result borgmatic
@@ -979,11 +954,6 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	}
 	errText := run.errorMessages()
 
-	if scope.anyAmbiguous() && len(results) == 0 {
-		r.logger.Warn("cannot confirm which destinations this group reached: its archive pattern also matches another group's archives; rename a group or split repositories",
-			"group", run.group, "pattern", scope.pattern)
-	}
-
 	// A create result is direct evidence: borgmatic reported the archive it
 	// wrote, with its measurements. A run can still fail afterwards, when a
 	// later action such as prune, compact or check exits nonzero, and rebuilding
@@ -1017,15 +987,6 @@ func (r *Runner) perRepoFailure(ctx context.Context, configPath string, configur
 	for i, ref := range configured {
 		if _, ok := measured[i]; ok {
 			continue // borgmatic already reported its archive; nothing to probe
-		}
-		if !scope.canConfirm(resolvedRepoPath(ref)) {
-			// The pattern also matches a sibling group's archives, so a probe
-			// answers a different question from the one being asked: a sibling
-			// backup landing in the same whole second would confirm a success
-			// this group never had. Refusing to confirm leaves the repository
-			// untouched, which is wrong in a way that shows up as a stale
-			// last-success rather than as a false fresh one.
-			continue
 		}
 		if ref.Path == "" || implicated[i] {
 			continue // named in an error: it failed, and probing it is pointless
