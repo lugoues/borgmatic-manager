@@ -1333,39 +1333,6 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		return orphanErr
 	}
 
-	// A previous restore killed between the two renames leaves the data under a
-	// suffixed name and nothing at targetData. Put it back before concluding the
-	// volume has no data directory.
-	if recErr := recoverInterruptedSwap(plan.targetData, logger); recErr != nil {
-		return recErr
-	}
-	// Reclaim this tool's own leftovers before anything asks the filesystem for
-	// room. A killed restore can leave a staging tree the size of the volume, and
-	// the staging probe then fails with ENOSPC or EDQUOT on space the manager is
-	// itself holding, so every retry aborts without ever reaching the cleanup
-	// that would free it. Merge and in-place restores never reach that cleanup
-	// at all, so they kept it indefinitely.
-	//
-	// Under the restore lock, and only removes directories provably this tool's,
-	// so there is nothing here that a later stage would have removed more safely.
-	if clearErr := clearStagingLeftovers(plan.targetData, logger); clearErr != nil {
-		return clearErr
-	}
-
-	if dirErr := checkVolumeDataDir(plan.targetData, plan.targetVolume); dirErr != nil {
-		return dirErr
-	}
-
-	// Extracting into a volume a running container writes races those writes.
-	// A stopped or removed container is safe.
-	running, err := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume, plan.targetData)
-	if err != nil {
-		return err
-	}
-	if running && !force {
-		return fmt.Errorf("a running container is using volume %q; stop it first, or pass --force to extract into a live volume", plan.targetVolume)
-	}
-
 	configsDir, err := e.privateConfigDir("restore")
 	if err != nil {
 		return err
@@ -1399,6 +1366,10 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// the volume being written: --into can point the restore at a volume owned
 	// by a different group entirely, and it is that group's scheduled backup
 	// that must not archive the volume mid-wipe.
+	//
+	// Taken before interrupted-swap recovery and staging cleanup below, not
+	// after: recovery renames data back into the source path, and doing that
+	// while a backup traverses the tree hands borg an inconsistent archive.
 	for _, key := range restoreLockKeys(backupState, meta, group, plan.targetVolume) {
 		lock, acquired, lockErr := runner.TryCrossLock(e.locksDir(), key)
 		if lockErr != nil {
@@ -1408,6 +1379,39 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 			return fmt.Errorf("a backup involving group %q, the target volume's group, or their repositories is running; retry when it finishes", group)
 		}
 		defer lock.Release()
+	}
+
+	// A previous restore killed between the two renames leaves the data under a
+	// suffixed name and nothing at targetData. Put it back before concluding the
+	// volume has no data directory.
+	if recErr := recoverInterruptedSwap(plan.targetData, logger); recErr != nil {
+		return recErr
+	}
+	// Reclaim this tool's own leftovers before anything asks the filesystem for
+	// room. A killed restore can leave a staging tree the size of the volume, and
+	// the staging probe then fails with ENOSPC or EDQUOT on space the manager is
+	// itself holding, so every retry aborts without ever reaching the cleanup
+	// that would free it. Merge and in-place restores never reach that cleanup
+	// at all, so they kept it indefinitely.
+	//
+	// Under the restore lock, and only removes directories provably this tool's,
+	// so there is nothing here that a later stage would have removed more safely.
+	if clearErr := clearStagingLeftovers(plan.targetData, logger); clearErr != nil {
+		return clearErr
+	}
+
+	if dirErr := checkVolumeDataDir(plan.targetData, plan.targetVolume); dirErr != nil {
+		return dirErr
+	}
+
+	// Extracting into a volume a running container writes races those writes.
+	// A stopped or removed container is safe.
+	running, err := volumeHasRunningContainer(ctx, e.rt, plan.targetVolume, plan.targetData)
+	if err != nil {
+		return err
+	}
+	if running && !force {
+		return fmt.Errorf("a running container is using volume %q; stop it first, or pass --force to extract into a live volume", plan.targetVolume)
 	}
 
 	configPath := filepath.Join(configsDir, group+".yaml")
@@ -1631,15 +1635,16 @@ func restoreLockKeys(backupState *models.BackupState, meta map[string]config.Gro
 	seen := map[string]bool{}
 	var groupKeys, repoKeys []string
 	for name := range groups {
-		gm, ok := meta[name]
-		if !ok && name != sourceGroup {
-			continue // refused during generation: it never runs, nothing to exclude
-		}
+		// The group key is taken even for a group this generation refused:
+		// refusal only speaks for the configuration as it is now, and a daemon
+		// can still be finishing a backup generated before the change. The
+		// group flock is the identity both generations share. Only the
+		// repository keys depend on meta, and a refused group has none here.
 		if key := runner.GroupLockKey(name); !seen[key] {
 			seen[key] = true
 			groupKeys = append(groupKeys, key)
 		}
-		for _, repo := range gm.Repos {
+		for _, repo := range meta[name].Repos {
 			if key := runner.RepoLockKey(repo); !seen[key] {
 				seen[key] = true
 				repoKeys = append(repoKeys, key)
