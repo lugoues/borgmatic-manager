@@ -178,15 +178,24 @@ func (d *DockerRuntime) RemoveContainersByLabel(ctx context.Context, key, value 
 	var removed []string
 	for _, c := range list {
 		if err := d.client.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
-			return removed, fmt.Errorf("removing container %s: %w", c.ID[:12], err)
+			return removed, fmt.Errorf("removing container %s: %w", shortID(c.ID), err)
 		}
-		name := c.ID[:12]
+		name := shortID(c.ID)
 		if len(c.Names) > 0 {
 			name = strings.TrimPrefix(c.Names[0], "/")
 		}
 		removed = append(removed, name)
 	}
 	return removed, nil
+}
+
+// shortID abbreviates a container ID for messages; a runtime may hand back an
+// ID shorter than the usual 64 hex chars, so the slice must not assume length.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // EventStream cancels a child context on every exit path: the Docker SDK never
