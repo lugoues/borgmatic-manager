@@ -182,15 +182,16 @@ func (r *Runner) sem(key string) chan struct{} {
 	return s
 }
 
-// TryRunGroup runs a backup for the group, returning (false, nil) if an
+// TryRunGroup runs a backup for the group, returning the moment the run
+// actually started (after any lock waits), or (false, zero, nil) if an
 // overlapping cycle already holds it. Snapshot and repo locks are then taken
 // blocking in one global order: groups sharing a repo serialize, not skip.
-func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, error) {
-	groupSem := r.sem("group:" + groupName)
+func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.GroupRunMeta) (bool, time.Time, error) {
+	groupSem := r.sem(GroupLockKey(groupName))
 	select {
 	case groupSem <- struct{}{}:
 	default:
-		return false, nil
+		return false, time.Time{}, nil
 	}
 	defer func() { <-groupSem }()
 
@@ -218,7 +219,7 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 			held = append(held, s)
 		case <-ctx.Done():
 			release()
-			return true, ctx.Err()
+			return true, time.Time{}, ctx.Err()
 		}
 	}
 	defer release()
@@ -235,18 +236,23 @@ func (r *Runner) TryRunGroup(ctx context.Context, groupName string, meta config.
 		lock, acquired, err := tryCrossLock(r.lockDir, key)
 		if err != nil {
 			releaseLocks()
-			return false, fmt.Errorf("acquiring cross-process lock %q for group %s: %w", key, groupName, err)
+			return false, time.Time{}, fmt.Errorf("acquiring cross-process lock %q for group %s: %w", key, groupName, err)
 		}
 		if !acquired {
 			releaseLocks()
 			r.logger.Info("skipping group: another process holds its lock", "group", groupName, "lock", key)
-			return false, ErrLockedByAnotherProcess
+			return false, time.Time{}, ErrLockedByAnotherProcess
 		}
 		heldLocks = append(heldLocks, lock)
 	}
 	defer releaseLocks()
 
-	return true, r.runGroup(ctx, groupName, meta)
+	// The run's start is stamped after the lock waits above: a group serialized
+	// behind a shared repository starts when its turn comes, and anchoring the
+	// schedule to the cycle's start instead would mark it overdue the moment a
+	// long sibling backup finished.
+	started := time.Now()
+	return true, started, r.runGroup(ctx, groupName, meta)
 }
 
 // runGroup validates the group's generated config, then executes borgmatic.

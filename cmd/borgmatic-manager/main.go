@@ -748,7 +748,6 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		emitter.ObserveRepositories(scheduler.RepositoryInventory(meta, refusalsFromGen))
 	}
 
-	now := time.Now()
 	var failed, locked, unattempted []string
 	for i, name := range targets {
 		// An interrupt between groups stops the loop; nothing from here ran.
@@ -756,11 +755,14 @@ func runAdhoc(ctx context.Context, groups []string) error {
 			unattempted = append(unattempted, targets[i:]...)
 			break
 		}
-		acquired, runErr := r.TryRunGroup(ctx, name, meta[name])
+		acquired, started, runErr := r.TryRunGroup(ctx, name, meta[name])
 
 		switch classifyAdhocOutcome(acquired, runErr, ctx.Err() != nil) {
 		case adhocSuccess:
-			store.MarkSuccess(name, scheduler.GroupFingerprint(backupState.Groups[name]), now)
+			// Anchored to this group's own start (after any lock waits), not the
+			// loop's: serialized shared-repo groups would otherwise be overdue
+			// the moment a long sibling finished ahead of them.
+			store.MarkSuccess(name, scheduler.GroupFingerprint(backupState.Groups[name]), started)
 		case adhocLocked:
 			locked = append(locked, name)
 		case adhocNotRun:

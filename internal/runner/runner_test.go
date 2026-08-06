@@ -95,7 +95,7 @@ func TestTryRunGroup_Success(t *testing.T) {
 	fake := newFakeExecutor()
 	r := newTestRunner(t, fake, nil)
 
-	ran, err := r.TryRunGroup(context.Background(), "mygroup", config.GroupRunMeta{})
+	ran, _, err := r.TryRunGroup(context.Background(), "mygroup", config.GroupRunMeta{})
 	require.NoError(t, err)
 	assert.True(t, ran)
 
@@ -120,7 +120,7 @@ func TestTryRunGroup_CustomActions(t *testing.T) {
 	r := NewRunner(logger, t.TempDir(), "/usr/bin/borgmatic-fake", []string{"create"}, 0)
 	r.execCommand = fake.exec
 
-	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
 	require.NoError(t, err)
 
 	run := strings.Join(fake.callArgs()[1], " ")
@@ -133,7 +133,7 @@ func TestTryRunGroup_ValidationGate(t *testing.T) {
 	var buf syncBuffer
 	r := newTestRunner(t, fake, &buf)
 
-	ran, err := r.TryRunGroup(context.Background(), "badgroup", config.GroupRunMeta{})
+	ran, _, err := r.TryRunGroup(context.Background(), "badgroup", config.GroupRunMeta{})
 	assert.True(t, ran)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "validation failed")
@@ -148,14 +148,14 @@ func TestTryRunGroup_MutexSkip(t *testing.T) {
 	r := newTestRunner(t, fake, nil)
 
 	go func() {
-		_, _ = r.TryRunGroup(context.Background(), "mygroup", config.GroupRunMeta{})
+		_, _, _ = r.TryRunGroup(context.Background(), "mygroup", config.GroupRunMeta{})
 	}()
 	// Wait until the first run holds the group lock (validate + run started).
 	require.Eventually(t, func() bool {
 		return len(fake.callArgs()) >= 2
 	}, 2*time.Second, 10*time.Millisecond)
 
-	ran, err := r.TryRunGroup(context.Background(), "mygroup", config.GroupRunMeta{})
+	ran, _, err := r.TryRunGroup(context.Background(), "mygroup", config.GroupRunMeta{})
 	require.NoError(t, err)
 	assert.False(t, ran, "overlapping run of the same group must be skipped, not queued")
 }
@@ -165,7 +165,7 @@ func TestTryRunGroup_ExitCodeError(t *testing.T) {
 	fake.runScript = "echo boom >&2; exit 1"
 	r := newTestRunner(t, fake, nil)
 
-	ran, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	ran, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
 	assert.True(t, ran)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exit 1")
@@ -181,7 +181,7 @@ exit 0`
 	var buf syncBuffer
 	r := newTestRunner(t, fake, &buf)
 
-	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
 	require.NoError(t, err)
 
 	out := buf.String()
@@ -199,9 +199,9 @@ func TestRunGroup_RepoMissingHintOnce(t *testing.T) {
 	var buf syncBuffer
 	r := newTestRunner(t, fake, &buf)
 
-	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
 	require.Error(t, err)
-	_, err = r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	_, _, err = r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
 	require.Error(t, err)
 
 	out := buf.String()
@@ -254,7 +254,7 @@ func TestSharedRepoGroupsSerialize(t *testing.T) {
 		wg.Add(1)
 		go func(g string) {
 			defer wg.Done()
-			ran, err := r.TryRunGroup(context.Background(), g, meta)
+			ran, _, err := r.TryRunGroup(context.Background(), g, meta)
 			assert.True(t, ran, "shared-repo groups must queue (blocking), not skip, skipping starves them")
 			assert.NoError(t, err)
 		}(group)
@@ -279,7 +279,7 @@ func TestSnapshotGroupsSerialize(t *testing.T) {
 		go func(g, repo string) {
 			defer wg.Done()
 			meta := config.GroupRunMeta{Repos: []string{repo}, SnapshotHooks: true}
-			_, err := r.TryRunGroup(context.Background(), g, meta)
+			_, _, err := r.TryRunGroup(context.Background(), g, meta)
 			assert.NoError(t, err)
 		}(fmt.Sprintf("group-%d", i), repo)
 	}
@@ -333,7 +333,7 @@ exit 0`, dir, self, other)
 		wg.Add(1)
 		go func(i int, g, repo string) {
 			defer wg.Done()
-			_, errs[i] = r.TryRunGroup(context.Background(), g, config.GroupRunMeta{Repos: []string{repo}})
+			_, _, errs[i] = r.TryRunGroup(context.Background(), g, config.GroupRunMeta{Repos: []string{repo}})
 		}(i, g, "/mnt/repo-"+g)
 	}
 	wg.Wait()
@@ -357,7 +357,7 @@ exit 0`, marker, dir)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := r.TryRunGroup(ctx, "g", config.GroupRunMeta{})
+		_, _, err := r.TryRunGroup(ctx, "g", config.GroupRunMeta{})
 		done <- err
 	}()
 
@@ -392,7 +392,7 @@ while [ $n -lt 400 ]; do n=$((n+1)); sleep 0.05; done`
 	r.execCommand = fake.exec
 
 	start := time.Now()
-	ran, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	ran, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
 	elapsed := time.Since(start)
 
 	assert.True(t, ran)
@@ -406,7 +406,7 @@ func TestGroupLockReleasedAfterRun(t *testing.T) {
 	r := newTestRunner(t, fake, nil)
 
 	for i := 0; i < 3; i++ {
-		ran, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{Repos: []string{"/r"}, SnapshotHooks: true})
+		ran, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{Repos: []string{"/r"}, SnapshotHooks: true})
 		require.NoError(t, err, "iteration %d", i)
 		require.True(t, ran, "all locks must be released between sequential runs (iteration %d)", i)
 	}
@@ -437,7 +437,7 @@ func TestTryRunGroup_RecordsOutcome(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	ran, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	ran, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.NoError(t, err)
 	require.True(t, ran)
 
@@ -458,7 +458,7 @@ func TestTryRunGroup_JSONBoundToCreateOnly(t *testing.T) {
 	fake := newFakeExecutor()
 	r := newTestRunner(t, fake, nil)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.NoError(t, err)
 
 	run := strings.Join(fake.callArgs()[1], " ")
@@ -473,7 +473,7 @@ func TestTryRunGroup_RecordsFailureOutcome(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.Error(t, err)
 
 	rec.mu.Lock()
@@ -495,7 +495,7 @@ exit 1`
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.Error(t, err)
 
 	rec.mu.Lock()
@@ -514,7 +514,7 @@ func TestTryRunGroup_SuccessHasNoReason(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.NoError(t, err)
 
 	rec.mu.Lock()
@@ -534,7 +534,7 @@ exit 0`
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.NoError(t, err)
 
 	rec.mu.Lock()
@@ -558,7 +558,7 @@ func TestTryRunGroup_SkipsWhenRepoLockedByAnotherProcess(t *testing.T) {
 	require.True(t, ok)
 	defer held.Release()
 
-	ran, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/shared"}})
+	ran, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/shared"}})
 	require.ErrorIs(t, err, ErrLockedByAnotherProcess,
 		"a held cross-process lock must be reported distinctly: the scheduler backs off on it, rather than re-attempting every minWake")
 	assert.False(t, ran, "the group must be skipped while another process holds its repo lock")
@@ -570,7 +570,7 @@ func TestTryRunGroup_RunsWhenLockFree(t *testing.T) {
 	r := newTestRunner(t, fake, nil)
 	r.SetLockDir(t.TempDir())
 
-	ran, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/free"}})
+	ran, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/free"}})
 	require.NoError(t, err)
 	assert.True(t, ran, "with the lock free, the group runs")
 	assert.NotEmpty(t, fake.callArgs(), "borgmatic is invoked")
@@ -587,7 +587,7 @@ func TestTryRunGroup_SignalDeathRecordsTerminated(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.Error(t, err)
 
 	rec.mu.Lock()
@@ -608,7 +608,7 @@ func TestTryRunGroup_ExternalSigkillRecordsFailed(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "killed", "the error must name the abnormal kill")
 
@@ -635,7 +635,7 @@ func TestValidateConfig_ShutdownDoesNotMarkConfigInvalid(t *testing.T) {
 	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
 
 	start := time.Now()
-	_, err := r.TryRunGroup(ctx, "wedged", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(ctx, "wedged", config.GroupRunMeta{})
 	require.Error(t, err, "a hung validate must fail the group, not stall it")
 	assert.Less(t, time.Since(start), 10*time.Second, "validate must be interruptible while holding locks")
 
@@ -652,7 +652,7 @@ func TestValidateConfig_FailureRecordedForStatus(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "bad", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "bad", config.GroupRunMeta{})
 	require.Error(t, err)
 
 	rec.mu.Lock()
@@ -692,7 +692,7 @@ func TestHelperReapLifecycle(t *testing.T) {
 	h := &helperReapHarness{}
 	r.SetHelperReaper(h, h.reap)
 
-	ran, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-1"})
+	ran, _, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-1"})
 	require.NoError(t, err)
 	require.True(t, ran)
 
@@ -709,7 +709,7 @@ func TestHelperReapRunsOnFailureToo(t *testing.T) {
 	h := &helperReapHarness{}
 	r.SetHelperReaper(h, h.reap)
 
-	_, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-2"})
+	_, _, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-2"})
 	require.Error(t, err)
 
 	h.mu.Lock()
@@ -724,7 +724,7 @@ func TestHelperReapSkippedWithoutRunID(t *testing.T) {
 	h := &helperReapHarness{}
 	r.SetHelperReaper(h, h.reap)
 
-	_, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{})
 	require.NoError(t, err)
 
 	h.mu.Lock()
@@ -754,7 +754,7 @@ func TestRunHoldsAndReleasesLivenessLock(t *testing.T) {
 	}
 	r.SetHelperReaper(h, reap)
 
-	ran, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-live"})
+	ran, _, err := r.TryRunGroup(context.Background(), "db", config.GroupRunMeta{RunID: "run-live"})
 	require.NoError(t, err)
 	require.True(t, ran)
 
@@ -1500,7 +1500,7 @@ func TestRecordedOutcomesCarryTheCreateAndMeasurementSignals(t *testing.T) {
 		rec := &recordingStore{}
 		r.SetRecorder(rec)
 
-		_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
+		_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
 			Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
 		})
 		require.NoError(t, err)
@@ -1522,7 +1522,7 @@ func TestRecordedOutcomesCarryTheCreateAndMeasurementSignals(t *testing.T) {
 		rec := &recordingStore{}
 		r.SetRecorder(rec)
 
-		_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
+		_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
 			Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
 		})
 		require.NoError(t, err)
@@ -1548,7 +1548,7 @@ func TestAValidationFailureIsAttributedToTheConfiguredRepositories(t *testing.T)
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "badgroup", config.GroupRunMeta{
+	_, _, err := r.TryRunGroup(context.Background(), "badgroup", config.GroupRunMeta{
 		Repositories: []config.RepoRef{
 			{Path: "/mnt/local", Label: "local"},
 			{Path: "ssh://borg@a/./r"},
@@ -1679,7 +1679,7 @@ func TestTheTimeoutBranchRecordsMeasuredDestinations(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
+	_, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{
 		Repositories: []config.RepoRef{{Path: "/repo", Label: "local"}},
 	})
 	require.Error(t, err, "the run timed out")
@@ -1879,7 +1879,7 @@ func TestAValidationTimeoutIsNotAConfigError(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "slowgroup", config.GroupRunMeta{
+	_, _, err := r.TryRunGroup(context.Background(), "slowgroup", config.GroupRunMeta{
 		Repositories: []config.RepoRef{{Path: "/mnt/local", Label: "local"}},
 	})
 	require.Error(t, err)
@@ -2078,7 +2078,7 @@ func TestAnUnjudgedRepointedRepositoryIsStillReconciled(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
+	_, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
 		Repositories: []config.RepoRef{{Path: "/mnt/new", Label: "offsite"}},
 	})
 	require.Error(t, err)
@@ -2126,7 +2126,7 @@ func TestRecordedOutcomesSayWhetherTheInventoryWasKnown(t *testing.T) {
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
+	_, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
 		Repositories:      []config.RepoRef{{Path: "/repo", Label: "local"}},
 		RepositoriesKnown: true,
 	})
@@ -2141,7 +2141,7 @@ func TestRecordedOutcomesSayWhetherTheInventoryWasKnown(t *testing.T) {
 	// deletes every persisted record for a group whose config is mid-edit.
 	rec2 := &recordingStore{}
 	r.SetRecorder(rec2)
-	_, err = r.TryRunGroup(context.Background(), "h", config.GroupRunMeta{
+	_, _, err = r.TryRunGroup(context.Background(), "h", config.GroupRunMeta{
 		Repositories:      []config.RepoRef{{Path: "/repo", Label: "local"}},
 		RepositoriesKnown: false,
 	})
@@ -2190,7 +2190,7 @@ func TestARepointedLabelledEnvironmentPathIsRecordedByDestination(t *testing.T) 
 	rec := &recordingStore{}
 	r.SetRecorder(rec)
 
-	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
+	_, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{
 		Repositories: []config.RepoRef{{Path: "${BORG_REPO}", Label: "offsite"}},
 	})
 	require.Error(t, err)
@@ -2273,7 +2273,7 @@ func TestAnUnreadableRepositoryListIsNotAKnownEmptyOne(t *testing.T) {
 
 	// Generation could not read the list, so it reports neither repositories nor
 	// a claim to have understood them.
-	_, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
+	_, _, err := r.TryRunGroup(context.Background(), "g", config.GroupRunMeta{})
 	require.Error(t, err)
 
 	rec.mu.Lock()
