@@ -1380,8 +1380,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	}
 	// A refused group has no generated config; say so before any preparation
 	// rather than failing later with a missing-file error.
-	groupMeta, ok := meta[group]
-	if !ok {
+	if _, ok := meta[group]; !ok {
 		return fmt.Errorf("group %q was refused during generation (see the warnings above); fix its configuration before restoring", group)
 	}
 
@@ -1395,13 +1394,18 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// mid-wipe or hold the borg repository lock against the extract. The
 	// extract runs as a supervised child, so the flocks outlast it; they are
 	// held from here through every destructive step below.
-	for _, key := range append([]string{runner.GroupLockKey(group)}, repoLockKeys(groupMeta.Repos)...) {
+	//
+	// The keys cover the archive's source group and every group that backs up
+	// the volume being written: --into can point the restore at a volume owned
+	// by a different group entirely, and it is that group's scheduled backup
+	// that must not archive the volume mid-wipe.
+	for _, key := range restoreLockKeys(backupState, meta, group, plan.targetVolume) {
 		lock, acquired, lockErr := runner.TryCrossLock(e.locksDir(), key)
 		if lockErr != nil {
 			return fmt.Errorf("taking cross-process lock %s: %w", key, lockErr)
 		}
 		if !acquired {
-			return fmt.Errorf("a backup involving group %q or its repository is running; retry when it finishes", group)
+			return fmt.Errorf("a backup involving group %q, the target volume's group, or their repositories is running; retry when it finishes", group)
 		}
 		defer lock.Release()
 	}
@@ -1606,13 +1610,45 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	}
 }
 
-// repoLockKeys maps a group's canonical repository keys to runner lock keys.
-func repoLockKeys(repos []string) []string {
-	keys := make([]string, 0, len(repos))
-	for _, repo := range repos {
-		keys = append(keys, runner.RepoLockKey(repo))
+// restoreLockKeys is every cross-process lock a restore must hold: the group
+// and repository keys of the archive's source group, and of each group that
+// backs up the target volume. The runner flocks the same group and repository
+// keys for its backups, so holding these excludes them.
+//
+// The target volume's groups are found by membership rather than assumed to be
+// the source group, because --into can write a volume the source group does
+// not own. A group absent from meta was refused during generation and never
+// runs, so it has no keys to take.
+func restoreLockKeys(backupState *models.BackupState, meta map[string]config.GroupRunMeta, sourceGroup, targetVolume string) []string {
+	groups := map[string]bool{sourceGroup: true}
+	for name, g := range backupState.Groups {
+		for _, v := range g.Volumes {
+			if v.Name == targetVolume {
+				groups[name] = true
+			}
+		}
 	}
-	return keys
+	seen := map[string]bool{}
+	var groupKeys, repoKeys []string
+	for name := range groups {
+		gm, ok := meta[name]
+		if !ok && name != sourceGroup {
+			continue // refused during generation: it never runs, nothing to exclude
+		}
+		if key := runner.GroupLockKey(name); !seen[key] {
+			seen[key] = true
+			groupKeys = append(groupKeys, key)
+		}
+		for _, repo := range gm.Repos {
+			if key := runner.RepoLockKey(repo); !seen[key] {
+				seen[key] = true
+				repoKeys = append(repoKeys, key)
+			}
+		}
+	}
+	sort.Strings(groupKeys)
+	sort.Strings(repoKeys)
+	return append(groupKeys, repoKeys...)
 }
 
 // extractKillGrace is how long borgmatic gets to stop cleanly after a
