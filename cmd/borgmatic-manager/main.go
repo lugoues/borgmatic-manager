@@ -2121,5 +2121,10 @@ func runTimeoutFromConfig(cfg *config.ManagerConfig) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid manager.run_timeout %q: %w", cfg.Manager.RunTimeout, err)
 	}
+	// A negative duration would silently disable the timeout the operator
+	// clearly meant to set.
+	if d < 0 {
+		return 0, fmt.Errorf("manager.run_timeout %q is negative; use a positive duration, or 0 / empty for no timeout", cfg.Manager.RunTimeout)
+	}
 	return d, nil
 }
