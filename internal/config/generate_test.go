@@ -911,6 +911,83 @@ func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
 	})
 }
 
+// A pattern-overlap refusal stops a group's scheduled backups but must not
+// strand its existing archives: an extract of an explicitly named archive
+// neither prunes nor creates, and demanding a rename before disaster recovery
+// could change which archives the pattern selects. Refusals that mean "this
+// config is wrong" still stand.
+func TestRenderGroupForRestoreKeepsOverlapRefusedGroups(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("app-prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+	}}
+
+	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	meta, _, err := g.Generate(st)
+	require.NoError(t, err)
+	require.NotContains(t, meta, "app", "the prefix group is refused for scheduled backups")
+
+	yamlStr, gm, reason, err := g.RenderGroupForRestore(st, "app")
+	require.NoError(t, err)
+	assert.Empty(t, reason, "the overlap refusal does not apply to a restore")
+	require.NotEmpty(t, yamlStr, "the restore still gets a config to extract with")
+	assert.Contains(t, yamlStr, "archive_name_format")
+	assert.NotEmpty(t, gm.Repos, "and the metadata to lock its repositories")
+
+	t.Run("other refusals still stand", func(t *testing.T) {
+		overrides := map[string]map[string]interface{}{
+			"app": {"archive_name_format": "{hostname}-fixed-{now}"},
+		}
+		g2, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+		yamlStr, _, reason, err := g2.RenderGroupForRestore(st, "app")
+		require.NoError(t, err)
+		assert.Empty(t, yamlStr)
+		assert.Contains(t, reason, "{group}",
+			"a shared-repo config without the token is wrong for restores too")
+	})
+}
+
+// A cycle plus a one-way predecessor: app and app-prod resolve to the same
+// format and refuse each other; app-p's pattern reaches into their names but
+// nothing claims app-p's own archives. Refusing every offender would take
+// app-p down with the cycle it merely points into; removing only the cycle
+// leaves app-p with no surviving victim, so it runs.
+func TestAGroupPointingIntoARefusedCycleSurvives(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("app-prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	st.AddVolume("app-p", models.VolumeInfo{Name: "v3", HostPath: "/mnt/v3"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+	}}
+	// app and app-prod both resolve to "app-prod-{now}": indistinguishable,
+	// mutual, both must go. app-p resolves to "app-p-{now}", whose pattern
+	// "app-p-*" also matches "app-prod-…" but is matched by neither.
+	overrides := map[string]map[string]interface{}{
+		"app":      {"archive_name_format": "{group}-prod-{now}"},
+		"app-prod": {"archive_name_format": "{group}-{now}"},
+		"app-p":    {"archive_name_format": "{group}-{now}"},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	meta, refusals, err := g.Generate(st)
+	require.NoError(t, err)
+
+	require.Contains(t, meta, "app-p",
+		"its only victims are the refused cycle, which never runs")
+	require.NotContains(t, meta, "app")
+	require.NotContains(t, meta, "app-prod")
+	require.Len(t, refusals, 2)
+}
+
 // A refused group never runs, so it must not condemn anyone else. Here "app"
 // over-matches "app-prod" in one repository and is refused for it; "ap"
 // over-matches only "app", in a repository the two of them alone share. A
@@ -974,6 +1051,18 @@ func TestPatternOvermatches(t *testing.T) {
 	t.Run("an unknown pattern or format is treated as over-matching", func(t *testing.T) {
 		assert.True(t, config.PatternOvermatchesForTest("", "x-app-{now}"))
 		assert.True(t, config.PatternOvermatchesForTest("*-app-*", ""))
+	})
+
+	// An unknown placeholder can be any string, but that is not a free pass:
+	// the literal text after it still has to be accounted for. Refusing "foo"
+	// against a sibling whose names provably end in "-bar" would stop a backup
+	// over a name it can never match.
+	t.Run("an unknown placeholder still honours the text after it", func(t *testing.T) {
+		assert.False(t, config.PatternMatchesFormatForTest("foo", "{fqdn}-bar"),
+			`whatever {fqdn} resolves to, the name ends in "-bar", which "foo" cannot`)
+		assert.True(t, config.PatternMatchesFormatForTest("*-bar", "{fqdn}-bar"))
+		assert.True(t, config.PatternMatchesFormatForTest("literally-anything-*", "{something-new}"),
+			"with nothing after it, an unknown placeholder really can be anything")
 	})
 }
 

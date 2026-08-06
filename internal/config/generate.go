@@ -89,6 +89,12 @@ type Generator struct {
 
 	// lookPath is an exec.LookPath seam for testing host-dependency warnings.
 	lookPath func(string) (string, error)
+
+	// keepOvermatched skips the archive-pattern overlap refusal (pass 3).
+	// Only RenderGroupForRestore sets it: an extract of an explicitly named
+	// archive neither prunes nor creates, so the overlap that stops a group's
+	// scheduled backups does not make its archives unrestorable.
+	keepOvermatched bool
 }
 
 // NewGenerator creates a Generator. Generated files are written atomically to
@@ -209,6 +215,37 @@ func (g *Generator) RenderGroup(state *models.BackupState, groupName string) (co
 		return headerComment + string(data), "", nil
 	}
 	return "", "", nil
+}
+
+// RenderGroupForRestore renders one group's config for a restore, keeping a
+// group that Generate refuses only for archive-pattern overlap: an extract of
+// an explicitly named archive neither prunes nor creates, so that overlap does
+// not make the group's existing archives unrestorable, and requiring a rename
+// before disaster recovery could change which archives its pattern selects.
+// Every other refusal still stands and comes back as the reason.
+func (g *Generator) RenderGroupForRestore(state *models.BackupState, groupName string) (configYAML string, meta GroupRunMeta, reason string, err error) {
+	gg := *g
+	gg.keepOvermatched = true
+	entries, refusals, err := gg.plan(state, sortedGroupNames(state), placeholderRunIDFunc)
+	if err != nil {
+		return "", GroupRunMeta{}, "", err
+	}
+	for _, r := range refusals {
+		if r.Group == groupName {
+			return "", GroupRunMeta{}, r.Reason, nil
+		}
+	}
+	for _, e := range entries {
+		if e.name != groupName {
+			continue
+		}
+		data, mErr := yaml.Marshal(e.final)
+		if mErr != nil {
+			return "", GroupRunMeta{}, "", fmt.Errorf("marshaling config for group %s: %w", groupName, mErr)
+		}
+		return headerComment + string(data), e.meta, "", nil
+	}
+	return "", GroupRunMeta{}, "", nil
 }
 
 // sortedGroupNames returns the state's group names in deterministic order.
@@ -358,6 +395,9 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		for _, repo := range e.meta.Repos {
 			keptRepoGroups[repo] = append(keptRepoGroups[repo], e.name)
 		}
+	}
+	if g.keepOvermatched {
+		return kept, refusals, nil
 	}
 	if overmatching := overmatchingPatterns(keptRepoGroups, patterns, samples, g.logger); len(overmatching) > 0 {
 		final := kept[:0]
@@ -738,8 +778,11 @@ func overmatchingPatterns(repoGroups map[string][]string, patterns map[string]st
 		}
 
 		// Groups whose pattern claims an innocent sibling's archives are the
-		// round's refusals. If there are none, everything left offends
-		// mutually and all of it goes.
+		// round's refusals. If there are none, every conflict is between
+		// offenders; refuse only the cycles nothing escapes from (the sink
+		// strongly connected components), so that a group merely pointing
+		// INTO a cycle is re-evaluated next round against the survivors
+		// instead of being dragged down with it.
 		var round []string
 		for name, vs := range edges {
 			for _, v := range vs {
@@ -750,9 +793,13 @@ func overmatchingPatterns(repoGroups map[string][]string, patterns map[string]st
 			}
 		}
 		if len(round) == 0 {
-			for name := range edges {
-				round = append(round, name)
+			adjacency := map[string][]string{}
+			for name, vs := range edges {
+				for _, v := range vs {
+					adjacency[name] = append(adjacency[name], v.name)
+				}
 			}
+			round = sinkCycleMembers(adjacency)
 		}
 		sort.Strings(round)
 		for _, name := range round {
@@ -762,6 +809,89 @@ func overmatchingPatterns(repoGroups map[string][]string, patterns map[string]st
 			overmatching[name] = fmt.Sprintf("archive pattern %q also matches group %s's archives in a shared repository; retention would prune them", patterns[name], v.name)
 		}
 	}
+}
+
+// sinkCycleMembers returns the members of every strongly connected component
+// with no edge leaving it. Called when every victim in the overmatch graph is
+// itself an offender, so at least one such component exists and it is a cycle:
+// a single group cannot overmatch itself, and a singleton whose edges all stay
+// internal would have to. Refusing only these spares a group that points into
+// a cycle without being part of it; once the cycle is gone, the next round
+// finds its victims gone too.
+func sinkCycleMembers(adjacency map[string][]string) []string {
+	nodes := make([]string, 0, len(adjacency))
+	for n := range adjacency {
+		nodes = append(nodes, n)
+	}
+	sort.Strings(nodes)
+
+	// Tarjan's algorithm, iterative-enough for these tiny graphs.
+	index := map[string]int{}
+	low := map[string]int{}
+	onStack := map[string]bool{}
+	var stack []string
+	sccOf := map[string]int{}
+	counter, sccCount := 0, 0
+
+	var strongconnect func(v string)
+	strongconnect = func(v string) {
+		index[v] = counter
+		low[v] = counter
+		counter++
+		stack = append(stack, v)
+		onStack[v] = true
+		for _, w := range adjacency[v] {
+			if _, seen := index[w]; !seen {
+				strongconnect(w)
+				if low[w] < low[v] {
+					low[v] = low[w]
+				}
+			} else if onStack[w] && index[w] < low[v] {
+				low[v] = index[w]
+			}
+		}
+		if low[v] == index[v] {
+			for {
+				w := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				onStack[w] = false
+				sccOf[w] = sccCount
+				if w == v {
+					break
+				}
+			}
+			sccCount++
+		}
+	}
+	for _, n := range nodes {
+		if _, seen := index[n]; !seen {
+			strongconnect(n)
+		}
+	}
+
+	members := map[int][]string{}
+	escapes := map[int]bool{}
+	for _, n := range nodes {
+		members[sccOf[n]] = append(members[sccOf[n]], n)
+		for _, w := range adjacency[n] {
+			if sccOf[w] != sccOf[n] {
+				escapes[sccOf[n]] = true
+			}
+		}
+	}
+	var out []string
+	for id, ms := range members {
+		if !escapes[id] && len(ms) > 1 {
+			out = append(out, ms...)
+		}
+	}
+	if len(out) == 0 {
+		// Unreachable when every victim is an offender (a sink component must
+		// then be a cycle), but an empty round would spin forever: refuse
+		// everything rather than hang.
+		out = nodes
+	}
+	return out
 }
 
 // patternOvermatches reports whether the pattern claims any archive name the
@@ -787,9 +917,28 @@ func patternMatchesFormat(pattern string, segs []formatSegment) bool {
 	states := starClosure(pattern, map[int]bool{0: true})
 	for _, seg := range segs {
 		if seg.any {
-			// The segment can be anything, including whatever the rest of the
-			// pattern wants. Report a collision rather than guess.
-			return true
+			// The segment is any string of the caller's choosing, so every
+			// element boundary at or beyond the current states becomes
+			// reachable. It is not a free pass: the remaining segments still
+			// have to account for whatever the rest of the pattern demands,
+			// which is what keeps pattern "foo" from claiming a format that
+			// always ends in "-bar". A glob is a linear chain of elements, so
+			// walking from the earliest live state visits every boundary.
+			lo := len(pattern)
+			for state := range states {
+				if state < lo {
+					lo = state
+				}
+			}
+			next := map[int]bool{}
+			for p := lo; p < len(pattern); {
+				next[p] = true
+				_, after := patternElement(pattern, p)
+				p = after
+			}
+			next[len(pattern)] = true
+			states = starClosure(pattern, next)
+			continue
 		}
 		var next map[int]bool
 		if seg.digits > 0 {
