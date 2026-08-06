@@ -47,11 +47,14 @@ func TestRestoreLockKeys(t *testing.T) {
 		assert.Equal(t, []string{"group:owner", "group:source", "repo:/repo/shared"}, keys)
 	})
 
-	t.Run("a refused target group contributes no keys", func(t *testing.T) {
-		// "owner" absent from meta: refused during generation, it never runs.
+	t.Run("a refused target group still contributes its group key", func(t *testing.T) {
+		// "owner" absent from meta: refused by THIS generation. A daemon can
+		// still be finishing a backup generated before the configuration
+		// change, and the group flock is the identity both generations share;
+		// only the repository keys are unknowable here.
 		partial := map[string]config.GroupRunMeta{"source": {Repos: []string{"/repo/a"}}}
 		keys := restoreLockKeys(bs, partial, "source", "target-vol")
-		assert.Equal(t, []string{"group:source", "repo:/repo/a"}, keys)
+		assert.Equal(t, []string{"group:owner", "group:source", "repo:/repo/a"}, keys)
 	})
 
 	t.Run("the source group key is taken even with no resolvable repos", func(t *testing.T) {
