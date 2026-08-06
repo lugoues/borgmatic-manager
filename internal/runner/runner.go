@@ -47,6 +47,10 @@ var defaultActions = []string{actionCreate, actionPrune, "compact", actionCheck}
 // defaultKillGrace is the SIGTERM-to-SIGKILL grace after a run timeout fires.
 const defaultKillGrace = 60 * time.Second
 
+// pipeDrainTimeout bounds how long after borgmatic exits its stdout/stderr may
+// stay open (a hook's background child can inherit them) before Wait closes them.
+const pipeDrainTimeout = 10 * time.Second
+
 // Shell-convention exit codes for death by signal (128 + signal number).
 const (
 	sigintExit  = 130 // 128 + SIGINT
@@ -290,22 +294,38 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	}
 	// Own process group: borgmatic's shutdown signal fan-out must not hit the manager.
 	cmd.SysProcAttr.Setpgid = true
-
-	stdout, err := cmd.StdoutPipe()
+	// Self-owned pipes instead of StdoutPipe/StderrPipe: cmd.Wait closes the
+	// pipe read ends as soon as the process exits, racing the consumers out of
+	// buffered output. Owning both ends lets the consumers drain to EOF and
+	// lets a stuck pipe (a hook's background child inheriting stdout/stderr)
+	// be force-closed after a bound instead of wedging the run forever.
+	stdout, stdoutW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("creating stdout pipe for group %s: %w", groupName, err)
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, stderrW, err := os.Pipe()
 	if err != nil {
+		_ = stdout.Close()
+		_ = stdoutW.Close()
 		return fmt.Errorf("creating stderr pipe for group %s: %w", groupName, err)
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 
 	r.logger.Info("starting borgmatic", "group", groupName, "actions", strings.Join(r.actions, ","))
 	start := time.Now()
 
 	if err := cmd.Start(); err != nil {
+		_ = stdout.Close()
+		_ = stdoutW.Close()
+		_ = stderr.Close()
+		_ = stderrW.Close()
 		return fmt.Errorf("starting borgmatic for group %s: %w", groupName, err)
 	}
+	// The child holds its own copies; the parent's write ends must close now or
+	// the consumers would never see EOF.
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	run := &runState{logger: r.logger, group: groupName}
 	var wg sync.WaitGroup
@@ -336,8 +356,25 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 		}
 	}()
 
-	wg.Wait()
+	// Wait reaps the process without touching the self-owned pipes, then the
+	// consumers get a bounded window to drain to EOF. Normally EOF arrives the
+	// moment borgmatic exits; a hook that leaked a background child holding the
+	// inherited stdout/stderr would keep the pipes open forever, so after
+	// pipeDrainTimeout the read ends are force-closed rather than letting the
+	// run (and its group and repo locks) wedge until the manager restarts.
 	waitErr := cmd.Wait()
+	drained := make(chan struct{})
+	go func() { wg.Wait(); close(drained) }()
+	drainTimer := time.NewTimer(pipeDrainTimeout)
+	defer drainTimer.Stop()
+	select {
+	case <-drained:
+	case <-drainTimer.C:
+		r.logger.Warn("borgmatic exited but something still holds its output pipes open; a hook may have leaked a background process", "group", groupName)
+		_ = stdout.Close()
+		_ = stderr.Close()
+		<-drained
+	}
 	close(done)
 
 	return r.interpretResult(ctx, groupName, configPath, meta.Repositories, meta.RepositoriesKnown,
