@@ -690,35 +690,78 @@ func volumeNamedPath(hostPath, volumeName string) string {
 // "app-prod-{now}" never over-matches "app-{now}" because the literal "prod-"
 // would have to come out of a timestamp. Mutual matches, including identical
 // resolved formats, refuse both groups.
+//
+// Refusals are settled in rounds rather than one pass, because a refused group
+// never runs and must not condemn anyone else. With A over-matching B in one
+// repository and C over-matching only A in another, a single pass would refuse
+// C for a conflict with a group that is already being dropped, and C's backups
+// would stop over nothing. Each round refuses only groups that claim an
+// innocent sibling (one that over-matches nobody itself), then re-evaluates
+// the survivors; when every remaining conflict is between mutual offenders (a
+// cycle, identical formats being the two-party case), all of them are refused.
 func overmatchingPatterns(repoGroups map[string][]string, patterns map[string]string, formats map[string][]formatSegment, logger *slog.Logger) map[string]string {
-	overmatching := map[string]string{}
 	repos := make([]string, 0, len(repoGroups))
 	for repo := range repoGroups {
 		repos = append(repos, repo)
 	}
 	sort.Strings(repos)
-	for _, repo := range repos {
-		groups := repoGroups[repo]
-		if len(groups) < 2 {
-			continue
-		}
-		sort.Strings(groups)
-		for _, a := range groups {
-			if _, done := overmatching[a]; done {
+
+	overmatching := map[string]string{}
+	for {
+		// Every over-match among the surviving groups, in deterministic order.
+		type victim struct{ repo, name string }
+		edges := map[string][]victim{}
+		isSource := map[string]bool{}
+		for _, repo := range repos {
+			var groups []string
+			for _, g := range repoGroups[repo] {
+				if _, refused := overmatching[g]; !refused {
+					groups = append(groups, g)
+				}
+			}
+			if len(groups) < 2 {
 				continue
 			}
-			for _, b := range groups {
-				if a == b || !patternOvermatches(patterns[a], formats[b]) {
-					continue
+			sort.Strings(groups)
+			for _, a := range groups {
+				for _, b := range groups {
+					if a == b || !patternOvermatches(patterns[a], formats[b]) {
+						continue
+					}
+					edges[a] = append(edges[a], victim{repo, b})
+					isSource[a] = true
 				}
-				logger.Error("archive pattern also matches a sibling group's archives in a shared repository; retention for this group would prune the sibling's backups, rename a group or split repositories; skipping group",
-					"repository", repo, "group", a, "overlaps", b, "pattern", patterns[a])
-				overmatching[a] = fmt.Sprintf("archive pattern %q also matches group %s's archives in a shared repository; retention would prune them", patterns[a], b)
-				break
 			}
 		}
+		if len(edges) == 0 {
+			return overmatching
+		}
+
+		// Groups whose pattern claims an innocent sibling's archives are the
+		// round's refusals. If there are none, everything left offends
+		// mutually and all of it goes.
+		var round []string
+		for name, vs := range edges {
+			for _, v := range vs {
+				if !isSource[v.name] {
+					round = append(round, name)
+					break
+				}
+			}
+		}
+		if len(round) == 0 {
+			for name := range edges {
+				round = append(round, name)
+			}
+		}
+		sort.Strings(round)
+		for _, name := range round {
+			v := edges[name][0]
+			logger.Error("archive pattern also matches a sibling group's archives in a shared repository; retention for this group would prune the sibling's backups, rename a group or split repositories; skipping group",
+				"repository", v.repo, "group", name, "overlaps", v.name, "pattern", patterns[name])
+			overmatching[name] = fmt.Sprintf("archive pattern %q also matches group %s's archives in a shared repository; retention would prune them", patterns[name], v.name)
+		}
 	}
-	return overmatching
 }
 
 // patternOvermatches reports whether the pattern claims any archive name the

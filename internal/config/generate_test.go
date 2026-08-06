@@ -911,6 +911,43 @@ func TestArchivePatternOverlapIsDetectedFromTheGeneratedNames(t *testing.T) {
 	})
 }
 
+// A refused group never runs, so it must not condemn anyone else. Here "app"
+// over-matches "app-prod" in one repository and is refused for it; "ap"
+// over-matches only "app", in a repository the two of them alone share. A
+// single-pass decision would refuse "ap" for a conflict with a group that is
+// already being dropped, and its backups would stop over nothing.
+func TestARefusalDoesNotCascadeThroughTheRefusedGroup(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("ap", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("app", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	st.AddVolume("app-prod", models.VolumeInfo{Name: "v3", HostPath: "/mnt/v3"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"archive_name_format": "{group}{now}",
+	}}
+	overrides := map[string]map[string]interface{}{
+		"app": {"repositories": []interface{}{
+			map[string]interface{}{"path": "/mnt/shared1"},
+			map[string]interface{}{"path": "/mnt/shared2"},
+		}},
+		"app-prod": {"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared1"}}},
+		"ap":       {"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared2"}}},
+	}
+
+	g, _ := newTestGenerator(t, cfg, overrides, config.GeneratorOptions{})
+	meta, refusals, err := g.Generate(st)
+	require.NoError(t, err)
+
+	require.NotContains(t, meta, "app", `"app*" claims app-prod's archives in shared1`)
+	require.Contains(t, meta, "app-prod")
+	require.Contains(t, meta, "ap",
+		`"ap*" claims only app's archives, and app is not running; refusing ap too would stop its backups over nothing`)
+	require.Len(t, refusals, 1)
+	assert.Equal(t, "app", refusals[0].Group)
+}
+
 func TestPatternOvermatches(t *testing.T) {
 	defer config.SetSampleHostname("myhost")()
 
