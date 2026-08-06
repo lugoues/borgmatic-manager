@@ -124,27 +124,32 @@ func (c *GroupCache) SetPathExists(fn func(string) bool) {
 func (c *GroupCache) reload() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.groups = c.readFile().Groups
+	f, _ := c.readFile()
+	c.groups = f.Groups
 }
 
-func (c *GroupCache) readFile() groupCacheFile {
+// readFile loads the cache. A missing file or corrupt content is an empty
+// cache (nothing worth preserving); a transient read failure returns an error
+// so Reconcile does not overwrite intact on-disk state with an empty view.
+func (c *GroupCache) readFile() (groupCacheFile, error) {
 	f := groupCacheFile{Version: 1, Groups: map[string]CachedGroup{}}
 	data, err := os.ReadFile(c.path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			c.logger.Warn("cannot read group cache; offline members hidden until rediscovered", "path", c.path, "error", err)
+			return f, err
 		}
-		return f
+		return f, nil
 	}
 	var parsed groupCacheFile
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		c.logger.Warn("group cache is corrupt; rebuilding from discovery", "path", c.path, "error", err)
-		return f
+		return f, nil
 	}
 	if parsed.Groups != nil {
 		f.Groups = parsed.Groups
 	}
-	return f
+	return f, nil
 }
 
 // Reconcile unions live membership into the cache per member (never
@@ -163,7 +168,13 @@ func (c *GroupCache) Reconcile(live *models.BackupState, now time.Time) (*models
 	}
 	defer lock.Release()
 
-	f := c.readFile()
+	f, err := c.readFile()
+	if err != nil {
+		// The disk cache may be intact even though this read failed; writing a
+		// live-only view now would permanently drop every offline member.
+		c.logger.Warn("cannot read group cache; using live discovery only and leaving the cache untouched", "error", err)
+		return live, newOffline()
+	}
 	off := newOffline()
 
 	names := map[string]struct{}{}
