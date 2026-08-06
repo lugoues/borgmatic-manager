@@ -453,6 +453,43 @@ func TestDiscoverSQLitePathResolution(t *testing.T) {
 	assert.Equal(t, "/var/lib/docker/volumes/app-data/_data/db/app.sqlite3", dbs[0].Path)
 }
 
+// A sqlite dump reads the database file from the volume's host path and never
+// touches the container, so it stays dumpable when the container is stopped,
+// exactly like the volume data backed up alongside it. Only dumps that exec
+// into the container or join its namespaces sit the cycle out.
+func TestDiscoverStoppedContainerKeepsSQLiteDropsNamespaceDumps(t *testing.T) {
+	stubProbes(t)
+	rt := mockLists(
+		[]runtime.VolumeInfo{volumeFixture("app-data")},
+		[]runtime.ContainerInfo{
+			{
+				ID:      "c1",
+				Name:    "app",
+				Image:   "example/app:1",
+				Running: false,
+				Labels: map[string]string{
+					"borgmatic-manager.group":         "myapp",
+					"borgmatic-manager.db.0.type":     "sqlite",
+					"borgmatic-manager.db.0.name":     "app",
+					"borgmatic-manager.db.0.volume":   "app-data",
+					"borgmatic-manager.db.0.path":     "db/app.sqlite3",
+					"borgmatic-manager.db.1.type":     "postgresql",
+					"borgmatic-manager.db.1.name":     "appdb",
+					"borgmatic-manager.db.1.username": "admin",
+				},
+			},
+		},
+	)
+
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.NoError(t, err)
+
+	dbs := state.Groups["myapp"].Databases
+	require.Len(t, dbs, 1, "the postgres dump needs the container's namespace and is skipped")
+	assert.Equal(t, "sqlite", dbs[0].Type)
+	assert.Equal(t, "/var/lib/docker/volumes/app-data/_data/db/app.sqlite3", dbs[0].Path)
+}
+
 func TestDiscoverSQLiteUnknownVolumeFailsDiscovery(t *testing.T) {
 	stubProbes(t)
 
