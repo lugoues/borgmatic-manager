@@ -1,16 +1,16 @@
 Package: borgmatic-manager
-Version: 1.8.0
+Version: 1.9.0
 Architecture: arm64
 Maintainer: borgmatic-manager contributors
-Installed-Size: 9126
+Installed-Size: 17836
 Recommends: borgbackup
 Homepage: https://github.com/lugoues/borgmatic-manager
 Priority: optional
 Section: admin
-Filename: pool/main/b/borgmatic-manager/borgmatic-manager_1.8.0_arm64.deb
-Size: 3689856
-SHA256: d89ce54015409a788aa8925f0c062125be0fd6860a17b073a78af790492a670b
-SHA1: 57daf6b98b6d56e96c9d3100a2ced86e2bc20a90
-MD5sum: 7d113b0933946ae4e1279d7b7a1946a5
+Filename: pool/main/b/borgmatic-manager/borgmatic-manager_1.9.0_arm64.deb
+Size: 6652218
+SHA256: 5f2242587b6aca49e66cac8441123c9fb60e31ba5ad18fd1f00a1edaca83c687
+SHA1: d051487e5d010e4e829688713711ebe1a90322b0
+MD5sum: 31d94028f69dddbaab178c1e8acb4cc9
 Description: Label-driven borgmatic backup orchestration for Docker and Podman
 
