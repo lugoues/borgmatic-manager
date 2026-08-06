@@ -117,7 +117,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(increase(backup_runs_total{result=~\"failed|terminated\",group=~\"$group\",repository=~\"$repository\"}[$__range])) or vector(0)",
+          "expr": "sum(increase(backup_group_runs_total{result=~\"failed|terminated\",group=~\"$group\"}[$__range])) or vector(0)",
           "instant": true,
           "range": false
         }
