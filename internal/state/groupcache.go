@@ -30,7 +30,11 @@ type groupCacheFile struct {
 	Groups  map[string]CachedGroup `json:"groups"`
 }
 
-func dbKey(db models.DatabaseConfig) string { return db.Type + "/" + db.Name }
+// dbKey identifies a database within a group. The container is part of the
+// identity: two containers in one group can each expose a database with the
+// same type and name, and conflating them would silently drop the stopped
+// container's database from tracking instead of marking it offline.
+func dbKey(db models.DatabaseConfig) string { return db.Type + "/" + db.Container + "/" + db.Name }
 
 // Offline records which members are cached-but-not-live in the current cycle:
 // their container is gone. Volumes stay backed up (data at rest); databases
@@ -183,6 +187,14 @@ func (c *GroupCache) Reconcile(live *models.BackupState, now time.Time) (*models
 			continue
 		}
 
+		// Config (label fragments, period) is deliberately a live snapshot, not
+		// a union like membership: labels describe intent, and intent must
+		// follow the containers that are actually present. Unioning would keep
+		// a removed container's repository or hook config alive forever (the
+		// cache has no expiry). The trade-off: while a config-contributing
+		// container is stopped and a sibling stays live, the group runs on the
+		// sibling's config alone until the container returns. A fully-offline
+		// group keeps its complete cached config.
 		lastSeen, labelConfigs, period := cached.LastSeen, cached.LabelConfigs, cached.Period
 		if liveGroup != nil {
 			lastSeen, labelConfigs, period = now, liveGroup.LabelConfigs, liveGroup.Period
