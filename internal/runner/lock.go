@@ -28,6 +28,21 @@ func lockFileName(key string) string {
 	return "bm-" + hex.EncodeToString(sum[:8]) + ".lock"
 }
 
+// GroupLockKey is the cross-process lock key serializing runs of one group.
+func GroupLockKey(group string) string { return "group:" + group }
+
+// RepoLockKey is the cross-process lock key serializing runs against one
+// canonicalized repository.
+func RepoLockKey(repo string) string { return "repo:" + repo }
+
+// TryCrossLock non-blockingly takes the named cross-process lock under
+// lockDir: (lock, true) on success, (nil, false) when another process holds
+// it. Exported so restore-volume can exclude the daemon's backups while it
+// rewrites a volume.
+func TryCrossLock(lockDir, key string) (*lockfile.Lock, bool, error) {
+	return tryCrossLock(lockDir, key)
+}
+
 // PendingLockPath is the path of a run's liveness lock, held for the run's
 // lifetime so startup reconciliation can tell a live run from a crashed one.
 func PendingLockPath(lockDir, runID string) string {
