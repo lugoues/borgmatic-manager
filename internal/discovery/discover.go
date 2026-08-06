@@ -388,6 +388,15 @@ func checkNoSymlinkEscape(mountpoint, path string) error {
 			// cannot read either; only a successful resolution can escape.
 			return nil
 		}
+		// EvalSymlinks reports a dangling symlink the same way as a missing
+		// file, and the two are nothing alike here: a missing component is the
+		// database not existing yet, while a dangling link is a redirection
+		// that starts working the moment its target is created, which by
+		// backup time it can be. Refuse the link rather than walking past it
+		// to its parent.
+		if info, lerr := os.Lstat(probe); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%q is a symlink whose target does not exist; refusing a link that could later point outside volume mountpoint %q", probe, mountpoint)
+		}
 		parent := filepath.Dir(probe)
 		if parent == probe {
 			return nil // walked to the root without finding anything: nothing to follow
