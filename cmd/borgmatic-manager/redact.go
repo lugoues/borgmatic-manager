@@ -24,8 +24,10 @@ func redactConfigSecrets(cfg string) string {
 			continue
 		}
 		val := strings.Trim(strings.TrimSpace(m[4]), `"'`)
-		if strings.HasPrefix(val, "{") {
-			out = append(out, line) // a {credential ...} / {env ...} reference, not a literal secret
+		// Only a real {credential ...} / {env ...} reference stays visible; any
+		// other brace-prefixed value could be a literal secret and is masked.
+		if strings.HasPrefix(val, "{credential ") || strings.HasPrefix(val, "{env ") {
+			out = append(out, line)
 			continue
 		}
 		out = append(out, m[1]+m[2]+m[3]+redactedPlaceholder)
