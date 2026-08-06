@@ -65,7 +65,9 @@ func ParseSpecLabel(labels map[string]string, containerName string) (*ContainerS
 			// Quadlet: systemd strips unquoted double quotes from Label= values.
 			hint = `the label value contains no double quotes, systemd/quadlet strips them from unquoted Label= lines; wrap the whole assignment in single quotes: Label='borgmatic-manager.spec={"group": "x", "enable": true}'`
 		}
-		return nil, true, fmt.Errorf("container %s: invalid borgmatic-manager.spec label %q: %w (%s)", containerName, raw, err, hint)
+		// The raw label stays out of the error: a spec can carry database
+		// passwords, and this error ends up in logs.
+		return nil, true, fmt.Errorf("container %s: invalid borgmatic-manager.spec label: %w (%s)", containerName, err, hint)
 	}
 
 	if spec.Group == "" {
