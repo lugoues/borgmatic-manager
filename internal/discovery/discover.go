@@ -80,20 +80,34 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			specErrs = append(specErrs, err)
 			continue
 		}
-		// A container that cannot be exec'd into has no dumpable databases: a
-		// stopped one has no namespace to join and fails every cycle, and a
-		// paused one is worse, its frozen namespace hangs a helper until
-		// timeout and takes the whole group backup with it. ExecReady, not
-		// Running: Running deliberately includes paused and restarting for
-		// restore safety. Leaving the databases out lets cache reconciliation
-		// mark them offline (the broken-label validation above still ran).
-		// Volumes stay: their data is at rest and safe to back up.
+		// A dump that execs into the container or joins its namespaces needs
+		// the container executing: a stopped one has no namespace to join and
+		// fails every cycle, and a paused one is worse, its frozen namespace
+		// hangs a helper until timeout and takes the whole group backup with
+		// it. ExecReady, not Running: Running deliberately includes paused and
+		// restarting for restore safety. Leaving those databases out lets
+		// cache reconciliation mark them offline (the broken-label validation
+		// above still ran).
+		//
+		// SQLite is exempt: its dump reads the database file from the volume's
+		// host path and never touches the container, so the file is at rest
+		// and dumpable exactly like the volume data backed up alongside it.
 		if len(dbs) > 0 {
-			if c.ExecReady {
-				state.AddDatabases(intent.group, dbs)
-			} else {
-				logger.Info("container is not executing; skipping its databases this cycle",
-					"container", c.Name, "group", intent.group, "databases", len(dbs))
+			dumpable := dbs
+			if !c.ExecReady {
+				dumpable = nil
+				for _, db := range dbs {
+					if db.Type == dbTypeSQLite {
+						dumpable = append(dumpable, db)
+					}
+				}
+				if skipped := len(dbs) - len(dumpable); skipped > 0 {
+					logger.Info("container is not executing; skipping its namespace-dependent database dumps this cycle",
+						"container", c.Name, "group", intent.group, "databases", skipped)
+				}
+			}
+			if len(dumpable) > 0 {
+				state.AddDatabases(intent.group, dumpable)
 			}
 		}
 
