@@ -351,15 +351,15 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		kept = append(kept, e)
 	}
 
-	// Pass 3: which groups can still tell their archives apart from each other.
+	// Pass 3: refuse any group whose archive pattern claims a sibling's archives
+	// in a shared repository; its retention would prune them.
 	//
 	// Recomputed over kept rather than reusing repoGroups, which was built before
 	// the refusals above. A refused group never runs, so it writes nothing to
 	// contaminate a survivor's repository, and counting it here would do real
-	// damage: it has no pattern or sample, which patternsCollide reads as "cannot
-	// be distinguished" and reports as a collision. Every group merely sharing a
-	// repository with a refused one would then lose success confirmation there,
-	// and warn about a conflict with a group that is not running.
+	// damage: it has no pattern or sample, which reads as "cannot be
+	// distinguished" and would refuse every group merely sharing a repository
+	// with it over a conflict with a group that is not running.
 	keptRepoGroups := make(map[string][]string, len(repoGroups))
 	patterns := make(map[string]string, len(kept))
 	samples := make(map[string][]formatSegment, len(kept))
@@ -371,12 +371,21 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			keptRepoGroups[repo] = append(keptRepoGroups[repo], e.name)
 		}
 	}
-	for name, repos := range overlappingPatternRepos(keptRepoGroups, patterns, samples, g.logger) {
-		for i := range kept {
-			if kept[i].name == name {
-				kept[i].meta.AmbiguousRepos = repos
+	if overmatching := overmatchingPatterns(keptRepoGroups, patterns, samples, g.logger); len(overmatching) > 0 {
+		final := kept[:0]
+		for _, e := range kept {
+			if reason, ok := overmatching[e.name]; ok {
+				refusals = append(refusals, Refusal{
+					Group:             e.name,
+					Reason:            reason,
+					Repositories:      e.meta.Repositories,
+					RepositoriesKnown: e.meta.RepositoriesKnown,
+				})
+				continue
 			}
+			final = append(final, e)
 		}
+		kept = final
 	}
 
 	return kept, refusals, nil
@@ -663,13 +672,11 @@ func volumeNamedPath(hostPath, volumeName string) string {
 	return hostPath[:idx] + string(filepath.Separator) + "." + hostPath[idx:]
 }
 
-// overlappingPatternRepos maps each group to the repositories in which its
-// archive pattern also matches another group's archives, and warns once per
-// colliding pair.
-//
-// The result is per repository rather than per group. A group can share one
-// destination with a colliding sibling and have another to itself, and only the
-// shared one loses the ability to confirm a success.
+// overmatchingPatterns maps each group whose archive pattern also claims a
+// sibling's archives in a shared repository to its refusal reason, and logs an
+// error per refused group. borgmatic derives the group's prune scope
+// (match_archives) from its archive pattern, so an over-matching pattern means
+// retention for one group deletes another's backups.
 //
 // The test is on the archive names a format generates, not on the group names
 // and not on the patterns alone.
@@ -686,16 +693,14 @@ func volumeNamedPath(hostPath, volumeName string) string {
 // "x-app--other-y", so every pair of groups would look like a collision. What
 // matters is narrower: whether one group's pattern matches a name the other
 // group's format would actually generate.
-func overlappingPatternRepos(repoGroups map[string][]string, patterns map[string]string, formats map[string][]formatSegment, logger *slog.Logger) map[string][]string {
-	affected := map[string][]string{}
-	add := func(name, repo string) {
-		for _, r := range affected[name] {
-			if r == repo {
-				return
-			}
-		}
-		affected[name] = append(affected[name], repo)
-	}
+//
+// The decision is directional: "app-{now}" over-matches "app-prod-{now}" (its
+// wildcard swallows "prod-…"), so app is refused and app-prod runs;
+// "app-prod-{now}" never over-matches "app-{now}" because the literal "prod-"
+// would have to come out of a timestamp. Mutual matches, including identical
+// resolved formats, refuse both groups.
+func overmatchingPatterns(repoGroups map[string][]string, patterns map[string]string, formats map[string][]formatSegment, logger *slog.Logger) map[string]string {
+	overmatching := map[string]string{}
 	repos := make([]string, 0, len(repoGroups))
 	for repo := range repoGroups {
 		repos = append(repos, repo)
@@ -707,31 +712,33 @@ func overlappingPatternRepos(repoGroups map[string][]string, patterns map[string
 			continue
 		}
 		sort.Strings(groups)
-		for i, a := range groups {
-			for _, b := range groups[i+1:] {
-				if !patternsCollide(patterns[a], formats[a], patterns[b], formats[b]) {
+		for _, a := range groups {
+			if _, done := overmatching[a]; done {
+				continue
+			}
+			for _, b := range groups {
+				if a == b || !patternOvermatches(patterns[a], formats[b]) {
 					continue
 				}
-				logger.Warn("groups sharing a repository have overlapping archive name patterns; retention can cross group boundaries and neither group's backups can be confirmed independently in it, rename a group or split repositories",
-					"repository", repo, "groups", a+", "+b,
-					"patterns", patterns[a]+", "+patterns[b])
-				add(a, repo)
-				add(b, repo)
+				logger.Error("archive pattern also matches a sibling group's archives in a shared repository; retention for this group would prune the sibling's backups, rename a group or split repositories; skipping group",
+					"repository", repo, "group", a, "overlaps", b, "pattern", patterns[a])
+				overmatching[a] = fmt.Sprintf("archive pattern %q also matches group %s's archives in a shared repository; retention would prune them", patterns[a], b)
+				break
 			}
 		}
 	}
-	return affected
+	return overmatching
 }
 
-// patternsCollide reports whether either group's pattern claims any archive name
-// the other group's format can generate. An absent pattern or format means
-// nothing distinguishes that group's archives from anyone else's: treated as a
-// collision, which is the safe direction.
-func patternsCollide(patternA string, formatA []formatSegment, patternB string, formatB []formatSegment) bool {
-	if patternA == "" || patternB == "" || len(formatA) == 0 || len(formatB) == 0 {
+// patternOvermatches reports whether the pattern claims any archive name the
+// format can generate. An absent pattern or format means nothing distinguishes
+// that group's archives from anyone else's: treated as over-matching, which is
+// the safe direction.
+func patternOvermatches(pattern string, format []formatSegment) bool {
+	if pattern == "" || len(format) == 0 {
 		return true
 	}
-	return patternMatchesFormat(patternA, formatB) || patternMatchesFormat(patternB, formatA)
+	return patternMatchesFormat(pattern, format)
 }
 
 // patternMatchesFormat reports whether the glob matches any name the format can

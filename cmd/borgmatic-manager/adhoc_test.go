@@ -121,13 +121,16 @@ func TestResolveAdhocTargets_RefusedGroupCannotRun(t *testing.T) {
 func dbOnlyGroupAllOffline(t *testing.T) (*models.BackupState, map[string]config.GroupRunMeta) {
 	t.Helper()
 	bs, meta := adhocFixture()
-	db := models.DatabaseConfig{Type: "postgresql", Name: "app"}
+	db := models.DatabaseConfig{Type: "postgresql", Name: "app", Container: "pg"}
 	bs.Groups["dbonly"] = &models.VolumeGroup{Databases: []models.DatabaseConfig{db}}
 	meta["dbonly"] = config.GroupRunMeta{}
 
+	// The key shape matches the state package's database identity, which
+	// includes the container: two containers in one group can each expose a
+	// database with the same type and name.
 	off := &state.Offline{
 		Volumes:   map[string]map[string]bool{},
-		Databases: map[string]map[string]bool{"dbonly": {db.Type + "/" + db.Name: true}},
+		Databases: map[string]map[string]bool{"dbonly": {db.Type + "/" + db.Container + "/" + db.Name: true}},
 	}
 	stripOfflineDatabases(bs, off, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.Empty(t, bs.Groups["dbonly"].Databases, "the offline database was stripped")
