@@ -24,9 +24,10 @@ func redactConfigSecrets(cfg string) string {
 			continue
 		}
 		val := strings.Trim(strings.TrimSpace(m[4]), `"'`)
-		// Only a real {credential ...} / {env ...} reference stays visible; any
-		// other brace-prefixed value could be a literal secret and is masked.
-		if strings.HasPrefix(val, "{credential ") || strings.HasPrefix(val, "{env ") {
+		// Only a complete {credential ...} / {env ...} reference stays visible;
+		// a prefix match alone would print "{env X}actual-secret" or an
+		// unterminated "{env my-secret" verbatim.
+		if referenceRE.MatchString(val) {
 			out = append(out, line)
 			continue
 		}
@@ -45,6 +46,10 @@ func redactConfigSecrets(cfg string) string {
 }
 
 const redactedPlaceholder = "***redacted***"
+
+// referenceRE matches a value that is exactly one {credential ...} or
+// {env ...} reference, nothing more.
+var referenceRE = regexp.MustCompile(`^\{(?:credential|env)\s+[^{}]+\}$`)
 
 // isBlockScalar reports a YAML block scalar indicator, "|" or ">", with any
 // chomping or explicit-indent modifier ("|-", "|+", ">2").

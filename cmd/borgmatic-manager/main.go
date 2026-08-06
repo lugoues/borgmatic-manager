@@ -1368,6 +1368,10 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if err != nil {
 		return err
 	}
+	// The generated config carries credentials; remove it once the restore is
+	// over rather than leaving it for a later dead-PID sweep. The extract runs
+	// as a supervised child (not an exec), so this defer actually runs.
+	defer func() { _ = os.RemoveAll(configsDir) }()
 	meta, _, genErr := e.newGenerator(configsDir, logger).Generate(backupState)
 	if genErr != nil {
 		return genErr
