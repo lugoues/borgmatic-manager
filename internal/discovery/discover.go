@@ -80,16 +80,19 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 			specErrs = append(specErrs, err)
 			continue
 		}
-		// A stopped container's databases cannot be dumped: the helper would
-		// try to join a namespace that is not running and fail every cycle.
-		// Leaving them out lets cache reconciliation mark them offline (the
-		// broken-label validation above still ran). Volumes stay: their data
-		// is at rest and safe to back up.
+		// A container that cannot be exec'd into has no dumpable databases: a
+		// stopped one has no namespace to join and fails every cycle, and a
+		// paused one is worse, its frozen namespace hangs a helper until
+		// timeout and takes the whole group backup with it. ExecReady, not
+		// Running: Running deliberately includes paused and restarting for
+		// restore safety. Leaving the databases out lets cache reconciliation
+		// mark them offline (the broken-label validation above still ran).
+		// Volumes stay: their data is at rest and safe to back up.
 		if len(dbs) > 0 {
-			if c.Running {
+			if c.ExecReady {
 				state.AddDatabases(intent.group, dbs)
 			} else {
-				logger.Info("container is not running; skipping its databases this cycle",
+				logger.Info("container is not executing; skipping its databases this cycle",
 					"container", c.Name, "group", intent.group, "databases", len(dbs))
 			}
 		}
