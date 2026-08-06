@@ -661,6 +661,28 @@ func TestDiscoverSpecInvalidJSONFailsDiscovery(t *testing.T) {
 	assert.Nil(t, state)
 	assert.Contains(t, err.Error(), "invalid borgmatic-manager.spec")
 	assert.Contains(t, err.Error(), "must be valid JSON", "the error must teach the accepted syntax")
+	assert.NotContains(t, err.Error(), "myapp",
+		"the raw spec (which can carry database passwords) must not be echoed into logs")
+}
+
+func TestDiscoverSpecTrailingDocumentFailsDiscovery(t *testing.T) {
+	stubProbes(t)
+	rt := mockLists([]runtime.VolumeInfo{}, []runtime.ContainerInfo{
+		{
+			ID:   "c1",
+			Name: "web",
+			Labels: map[string]string{
+				"borgmatic-manager.spec": `{"group": "myapp", "enable": false} {"group": "myapp", "enable": true}`,
+			},
+		},
+	})
+
+	// json.Decoder.More peeks the next non-space token at the top level too, so
+	// a second document is caught as trailing data instead of silently ignored.
+	state, err := discovery.Discover(context.Background(), rt, discardLogger())
+	require.Error(t, err)
+	assert.Nil(t, state)
+	assert.Contains(t, err.Error(), "trailing data")
 }
 
 func TestDiscoverSpecUnknownFieldFailsDiscovery(t *testing.T) {
