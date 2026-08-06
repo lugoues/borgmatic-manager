@@ -73,6 +73,9 @@ type Runner struct {
 	// takes defaultValidateTimeout.
 	validateTimeout time.Duration
 	killGrace       time.Duration
+	// drainTimeout bounds the post-exit pipe drain; pipeDrainTimeout unless a
+	// test shortens it.
+	drainTimeout time.Duration
 
 	// locks holds named binary semaphores: "group:<name>" (try), "repo:<key>" and "snapshots" (blocking, ordered).
 	locks   map[string]chan struct{}
@@ -161,6 +164,7 @@ func NewRunner(logger *slog.Logger, configDir, borgmaticPath string, actions []s
 		runTimeout:      runTimeout,
 		validateTimeout: defaultValidateTimeout,
 		killGrace:       defaultKillGrace,
+		drainTimeout:    pipeDrainTimeout,
 		locks:           make(map[string]chan struct{}),
 		execCommand: func(_ context.Context, name string, args ...string) *exec.Cmd {
 			// Not CommandContext: cancellation must SIGTERM the process group
@@ -389,12 +393,37 @@ func (r *Runner) runGroup(ctx context.Context, groupName string, meta config.Gro
 	close(done)
 	drained := make(chan struct{})
 	go func() { wg.Wait(); close(drained) }()
-	drainTimer := time.NewTimer(pipeDrainTimeout)
+	drainTimer := time.NewTimer(r.drainTimeout)
 	defer drainTimer.Stop()
 	select {
 	case <-drained:
 	case <-drainTimer.C:
-		r.logger.Warn("borgmatic exited but something still holds its output pipes open; a hook may have leaked a background process", "group", groupName)
+		// A hook's backgrounded child still holds the pipes. Closing the
+		// readers alone would unwedge this run but then release the group and
+		// repository locks with that child still touching the volume,
+		// snapshot, or repository, so the process group is terminated first
+		// and only then are the pipes forced shut.
+		//
+		// The empty-group probe narrows the recycled-pgid hazard the watchdog
+		// comment above describes: the usual holder is a group member (a
+		// shell's background job inherits the group), which keeps the pgid
+		// allocated. A holder that left the group entirely is out of signal
+		// reach either way, and in that rare shape a recycled pgid could be
+		// signalled; ten seconds after exit, with the pipes demonstrably
+		// held, that residual risk is taken over letting the leak outlive
+		// the locks.
+		r.logger.Warn("borgmatic exited but something still holds its output pipes open; a hook leaked a background process, terminating the run's process group", "group", groupName)
+		if cmd.Process != nil && syscall.Kill(-cmd.Process.Pid, 0) == nil {
+			signalGroup(cmd, syscall.SIGTERM)
+			grace := time.NewTimer(r.killGrace)
+			select {
+			case <-drained:
+			case <-grace.C:
+				r.logger.Error("leaked process ignored SIGTERM: killing the run's process group", "group", groupName)
+				signalGroup(cmd, syscall.SIGKILL)
+			}
+			grace.Stop()
+		}
 		_ = stdout.Close()
 		_ = stderr.Close()
 		<-drained
