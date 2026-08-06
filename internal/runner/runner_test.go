@@ -565,6 +565,29 @@ func TestTryRunGroup_SkipsWhenRepoLockedByAnotherProcess(t *testing.T) {
 	assert.Empty(t, fake.callArgs(), "borgmatic must not run when the lock is held")
 }
 
+// The group key is flocked as well as the repository keys: it is what a
+// restore holds to exclude this group's backups, and the repository keys
+// cannot carry that alone because the two processes can derive different
+// repository keys for the same group when the configuration changed between
+// their generations.
+func TestTryRunGroup_SkipsWhenGroupLockedByAnotherProcess(t *testing.T) {
+	fake := newFakeExecutor()
+	r := newTestRunner(t, fake, nil)
+	lockDir := t.TempDir()
+	r.SetLockDir(lockDir)
+
+	// Stand in for a restore holding the group's cross-process lock.
+	held, ok, err := tryCrossLock(lockDir, GroupLockKey("files"))
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer held.Release()
+
+	ran, _, err := r.TryRunGroup(context.Background(), "files", config.GroupRunMeta{Repos: []string{"/repo/shared"}})
+	require.ErrorIs(t, err, ErrLockedByAnotherProcess)
+	assert.False(t, ran, "the group must be skipped while a restore holds its group lock")
+	assert.Empty(t, fake.callArgs(), "borgmatic must not run when the group lock is held")
+}
+
 func TestTryRunGroup_RunsWhenLockFree(t *testing.T) {
 	fake := newFakeExecutor()
 	r := newTestRunner(t, fake, nil)
