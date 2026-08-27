@@ -269,7 +269,16 @@ func runDoctor(ctx context.Context) error {
 			// problems are exactly what an operator is running doctor for, and
 			// they are diagnosable without it. Only the `config validate`
 			// sub-step needs the binary, and it says so when it is missing.
-			r.checkGenerate(ctx, e, backupState, borgmaticPath)
+			//
+			// The merged (cache-included) state when available, live otherwise:
+			// an offline group's cached label config (a broken local_path
+			// included) is judged by every cycle, and doctor diagnosing the
+			// live-only view would miss what those cycles refuse.
+			genState := backupState
+			if discoveredState != nil {
+				genState = discoveredState
+			}
+			r.checkGenerate(ctx, e, genState, borgmaticPath)
 		}
 	}
 

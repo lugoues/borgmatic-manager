@@ -400,24 +400,27 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			keptRepoGroups[repo] = append(keptRepoGroups[repo], e.name)
 		}
 	}
-	if g.keepOvermatched {
-		return kept, refusals, nil
-	}
-	if overmatching := overmatchingPatterns(keptRepoGroups, patterns, samples, g.logger); len(overmatching) > 0 {
-		final := kept[:0]
-		for _, e := range kept {
-			if reason, ok := overmatching[e.name]; ok {
-				refusals = append(refusals, Refusal{
-					Group:             e.name,
-					Reason:            reason,
-					Repositories:      e.meta.Repositories,
-					RepositoriesKnown: e.meta.RepositoriesKnown,
-				})
-				continue
+	// keepOvermatched (the restore-only render) bypasses EXACTLY this overlap
+	// refusal: an extract neither prunes nor creates. Every other judgment,
+	// the group-borg validation below included, still applies to it — a
+	// zero-exit no-op borg is as unusable for a restore as for a backup.
+	if !g.keepOvermatched {
+		if overmatching := overmatchingPatterns(keptRepoGroups, patterns, samples, g.logger); len(overmatching) > 0 {
+			final := kept[:0]
+			for _, e := range kept {
+				if reason, ok := overmatching[e.name]; ok {
+					refusals = append(refusals, Refusal{
+						Group:             e.name,
+						Reason:            reason,
+						Repositories:      e.meta.Repositories,
+						RepositoriesKnown: e.meta.RepositoriesKnown,
+					})
+					continue
+				}
+				final = append(final, e)
 			}
-			final = append(final, e)
+			kept = final
 		}
-		kept = final
 	}
 
 	// Pass 4: a group naming its own borg (local_path from an override or a
@@ -443,9 +446,11 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 // advisory without hooks, matching the default borg's rules.
 func (g *Generator) refuseBrokenGroupBorgs(kept []*pending, refusals []Refusal) ([]*pending, []Refusal) {
 	globalLP, _ := g.cfg.Borgmatic["local_path"].(string)
-	// One verdict per local_path within this plan: several groups sharing a
-	// hung borg must cost one probe timeout, not one each.
-	verdicts := map[string]string{}
+	// One raw probe per local_path within this plan, whatever mix of snapshot
+	// modes uses it: several groups sharing a hung borg must cost one probe
+	// timeout, not one each. The snapshot-specific floor decision is applied
+	// per group on the shared result.
+	probes := map[string]borgProbeResult{}
 	final := kept[:0]
 	for _, e := range kept {
 		lp, _ := e.final["local_path"].(string)
@@ -455,11 +460,12 @@ func (g *Generator) refuseBrokenGroupBorgs(kept []*pending, refusals []Refusal) 
 			final = append(final, e)
 			continue
 		}
-		reason, seen := verdicts[lp+"\x00"+fmt.Sprint(hasSnapshotHooks(e.final))]
+		probe, seen := probes[lp]
 		if !seen {
-			reason = g.groupBorgProblem(lp, hasSnapshotHooks(e.final))
-			verdicts[lp+"\x00"+fmt.Sprint(hasSnapshotHooks(e.final))] = reason
+			probe = g.probeGroupBorg(lp)
+			probes[lp] = probe
 		}
+		reason := g.judgeGroupBorg(lp, probe, hasSnapshotHooks(e.final))
 		if reason == "" {
 			final = append(final, e)
 			continue
@@ -476,37 +482,52 @@ func (g *Generator) refuseBrokenGroupBorgs(kept []*pending, refusals []Refusal) 
 	return final, refusals
 }
 
-// groupBorgProblem describes why the borg at lp cannot serve a group, or ""
-// when it can.
-func (g *Generator) groupBorgProblem(lp string, snapshots bool) string {
+// borgProbeResult is one local_path's raw probe outcome, shared by every
+// group naming it within a plan.
+type borgProbeResult struct {
+	problem string // resolution/exec problems; version judged per group
+	version string
+	out     string
+}
+
+// probeGroupBorg resolves and probes one configured borg.
+func (g *Generator) probeGroupBorg(lp string) borgProbeResult {
 	path := lp
 	if !strings.ContainsRune(lp, os.PathSeparator) {
 		resolved, err := g.lookPath(lp)
 		if err != nil {
-			return "not found on PATH"
+			return borgProbeResult{problem: "not found on PATH"}
 		}
 		path = resolved
 	} else if info, err := os.Stat(lp); err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
-		return "not an executable file"
+		return borgProbeResult{problem: "not an executable file"}
 	}
 	out, err := g.borgVersion(path)
 	fields := strings.Fields(out)
 	if err != nil || len(fields) == 0 {
-		return fmt.Sprintf("--version failed (output %q)", strings.TrimSpace(out))
+		return borgProbeResult{problem: fmt.Sprintf("--version failed (output %q)", strings.TrimSpace(out))}
 	}
-	// "borg 1.4.4". Plausibility first: borgVersionAtLeast deliberately
-	// passes unparseable tokens, and a zero-exit shim printing garbage would
-	// otherwise serve this group while creating nothing.
+	// "borg 1.4.4". Plausibility here: borgVersionAtLeast deliberately passes
+	// unparseable tokens, and a zero-exit shim printing garbage would
+	// otherwise serve groups while creating nothing.
 	version := fields[len(fields)-1]
 	if !plausibleBorgVersion(version) {
-		return fmt.Sprintf("reports no usable version (output %q)", strings.TrimSpace(out))
+		return borgProbeResult{problem: fmt.Sprintf("reports no usable version (output %q)", strings.TrimSpace(out))}
 	}
-	if !borgVersionAtLeast(version, minGroupBorg) {
+	return borgProbeResult{version: version, out: out}
+}
+
+// judgeGroupBorg applies one group's requirements to a shared probe result.
+func (g *Generator) judgeGroupBorg(lp string, probe borgProbeResult, snapshots bool) string {
+	if probe.problem != "" {
+		return probe.problem
+	}
+	if !borgVersionAtLeast(probe.version, minGroupBorg) {
 		if snapshots {
-			return fmt.Sprintf("borg %s is older than %d.%d and this group uses snapshot hooks: archives would record snapshot paths", version, minGroupBorg[0], minGroupBorg[1])
+			return fmt.Sprintf("borg %s is older than %d.%d and this group uses snapshot hooks: archives would record snapshot paths", probe.version, minGroupBorg[0], minGroupBorg[1])
 		}
 		g.logger.Warn("group borg is older than the snapshot floor (fine until snapshot hooks are enabled)",
-			"local_path", lp, "version", version)
+			"local_path", lp, "version", probe.version)
 	}
 	return ""
 }

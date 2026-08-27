@@ -1713,3 +1713,46 @@ func TestBorgRefusedGroupsRemainOverlapVictims(t *testing.T) {
 	assert.Contains(t, reasons, "archive pattern")
 	assert.Contains(t, reasons, "local_path")
 }
+
+// Groups sharing one hung borg must cost one probe, whatever mix of snapshot
+// modes uses it; the floor decision is per group on the shared result.
+func TestSharedGroupBorgIsProbedOncePerPlan(t *testing.T) {
+	st := models.NewBackupState()
+	st.AddVolume("plain", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("snappy", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	st.Groups["plain"].LabelConfigs = append(st.Groups["plain"].LabelConfigs,
+		map[string]interface{}{"local_path": "shared-borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
+	st.Groups["snappy"].LabelConfigs = append(st.Groups["snappy"].LabelConfigs,
+		map[string]interface{}{"local_path": "shared-borg", "btrfs": map[string]interface{}{},
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r2"}}})
+
+	g, _ := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
+	probes := 0
+	g.SetBorgVersion(func(string) (string, error) {
+		probes++
+		return "borg 1.2.0", nil
+	})
+	meta, refusals, err := g.Generate(st)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probes, "one probe serves every group naming the path")
+	require.Contains(t, meta, "plain", "below the floor without hooks is advisory")
+	require.NotContains(t, meta, "snappy", "the same result fails the hooked group's floor")
+	require.Len(t, refusals, 1)
+}
+
+// The restore-only render bypasses exactly the overlap refusal; a broken
+// group borg is as unusable for a restore as for a backup.
+func TestRenderGroupForRestoreStillJudgesTheGroupBorg(t *testing.T) {
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": "gone-borg",
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
+
+	g, _ := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
+	g.SetLookPath(func(string) (string, error) { return "", os.ErrNotExist })
+	yamlStr, _, reason, err := g.RenderGroupForRestore(st, "app")
+	require.NoError(t, err)
+	assert.Empty(t, yamlStr)
+	assert.Contains(t, reason, "local_path", "a no-op borg must not run a merge restore either")
+}

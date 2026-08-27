@@ -21,12 +21,19 @@ var borgProbeCache = struct {
 }{m: map[string]borgProbeEntry{}}
 
 type borgProbeEntry struct {
-	mtime time.Time
-	size  int64
-	dev   uint64
-	ino   uint64
-	out   string
+	mtime    time.Time
+	size     int64
+	dev      uint64
+	ino      uint64
+	out      string
+	probedAt time.Time
 }
+
+// borgProbeTTL bounds how long a cached verdict stands even for an unchanged
+// file. A wrapper script's inode is stable while the interpreter or binary it
+// delegates to changes underneath it, so file identity alone could carry a
+// stale version forever.
+const borgProbeTTL = time.Hour
 
 // cachedBorgVersionProbe runs `path --version` through the cache.
 func cachedBorgVersionProbe(path string) (string, error) {
@@ -41,22 +48,33 @@ func cachedBorgVersionProbe(path string) (string, error) {
 	borgProbeCache.mu.Lock()
 	e, hit := borgProbeCache.m[path]
 	borgProbeCache.mu.Unlock()
-	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() && e.dev == dev && e.ino == ino {
+	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() && e.dev == dev && e.ino == ino &&
+		time.Since(e.probedAt) < borgProbeTTL {
 		return e.out, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "--version") // #nosec G204 -- probing the operator-configured borg
-	// A wedged probe's descendant holding stdout must not turn the bound
-	// into an unbounded wait.
+	// Its own process group, killed whole on timeout: a shim that spawns a
+	// lingering descendant would otherwise leave one orphan per probe, and
+	// failed probes deliberately retry every plan.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// And a bounded pipe wait, so a descendant holding stdout cannot turn
+	// the bound into an unbounded wait before the group kill lands.
 	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.Output()
 	if err != nil {
 		return string(out), err
 	}
 	borgProbeCache.mu.Lock()
-	borgProbeCache.m[path] = borgProbeEntry{mtime: info.ModTime(), size: info.Size(), dev: dev, ino: ino, out: string(out)}
+	borgProbeCache.m[path] = borgProbeEntry{mtime: info.ModTime(), size: info.Size(), dev: dev, ino: ino, out: string(out), probedAt: time.Now()}
 	borgProbeCache.mu.Unlock()
 	return string(out), nil
 }
