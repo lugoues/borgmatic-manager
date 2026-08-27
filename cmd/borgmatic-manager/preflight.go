@@ -134,14 +134,8 @@ func detectContainerCLI(cfg *config.ManagerConfig, socketPath string) string {
 // (archive path recording is silently wrong below it); a snapshot-free group
 // may point local_path at an older borg without stopping everything else.
 func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[string]config.GroupOverride, state *models.BackupState) error {
-	// A malformed global local_path (a number or list from a YAML typo) must
-	// fail loudly here: the string assertions downstream would read it as
-	// unset and silently fall back to "borg" on PATH, running backups with an
-	// engine the operator did not choose.
-	if raw, ok := cfg.Borgmatic["local_path"]; ok {
-		if lp, isStr := raw.(string); !isStr || lp == "" {
-			return fmt.Errorf("manager.yaml borgmatic local_path must be a non-empty string, got %T (%v)", raw, raw)
-		}
+	if err := globalLocalPathError(cfg); err != nil {
+		return err
 	}
 	for _, bc := range borgCommands(cfg, overrides, state) {
 		borgPath, err := resolveBorgCommand(bc.command)
@@ -233,6 +227,20 @@ func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
 	borgVersionCache.m[path] = borgVersionEntry{mtime: info.ModTime(), size: info.Size(), dev: dev, ino: ino, out: out, probedAt: time.Now()}
 	borgVersionCache.mu.Unlock()
 	return out, true
+}
+
+// globalLocalPathError rejects a global local_path that exists but is not a
+// non-empty string (a number or list from a YAML typo): the string assertions
+// downstream would read it as unset and silently fall back to "borg" on
+// PATH, running backups with an engine the operator did not choose. Shared by
+// the launch/cycle gates and doctor so every caller reports the same verdict.
+func globalLocalPathError(cfg *config.ManagerConfig) error {
+	if raw, ok := cfg.Borgmatic["local_path"]; ok {
+		if lp, isStr := raw.(string); !isStr || lp == "" {
+			return fmt.Errorf("manager.yaml borgmatic local_path must be a non-empty string, got %T (%v)", raw, raw)
+		}
+	}
+	return nil
 }
 
 // borgCommand is one borg executable the generated configs will invoke, where

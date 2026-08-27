@@ -206,11 +206,16 @@ func runDoctor(ctx context.Context) error {
 		r.pass("toolchain", "not provisioned; the daemon provisions one only when no healthy host borgmatic exists")
 	}
 
-	// borg is required outright: without the engine nothing runs. Every borg
-	// the configuration names is checked, and labels can point a group at its
-	// own borg, so a quiet discovery feeds the check; nil (socket down) makes
-	// it conservatively demand the default. The labels section below runs its
-	// own discovery with the warning-capturing logger.
+	// borg is required outright: without the engine nothing runs. The same
+	// verdict as the daemon's gates, malformed global local_path included: the
+	// daemon refuses to start on that, and doctor probing PATH borg instead
+	// would report a passing setup the daemon rejects.
+	if err := globalLocalPathError(e.cfg); err != nil {
+		r.fail("borg", err.Error())
+	}
+	// A quiet discovery feeds the hooks scan; nil (socket down) is fine. The
+	// labels section below runs its own discovery with the warning-capturing
+	// logger.
 	// Merged with the durable cache, exactly as preflight and the cycle see
 	// it: a group whose containers are all offline keeps its cached label
 	// config (a label-sourced local_path included), and diagnosing live-only
