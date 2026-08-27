@@ -317,6 +317,9 @@ type env struct {
 // reaps against.
 func (e *env) locksDir() string { return filepath.Join(e.stateDir, "locks") }
 
+// toolchainDir holds the manager-provisioned borgmatic toolchain.
+func (e *env) toolchainDir() string { return filepath.Join(e.stateDir, "toolchain") }
+
 func loadEnv() (*env, error) {
 	e := &env{
 		configDir:  getEnv("CONFIG_DIR", "/etc/borgmatic-manager"),
@@ -1005,7 +1008,7 @@ func runBorgmaticPassthrough(args []string) error {
 		logger.Warn("group is offline: its container is not running, using the last cached config"+lastSeen+"; membership may be stale", "group", group)
 	}
 
-	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	borgmaticPath, err := resolveBorgmatic(e.cfg, e.toolchainDir())
 	if err != nil {
 		return err
 	}
@@ -1371,7 +1374,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		meta[group] = gm
 	}
 
-	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	borgmaticPath, err := resolveBorgmatic(e.cfg, e.toolchainDir())
 	if err != nil {
 		return err
 	}

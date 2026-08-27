@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/toolchain"
 )
 
 // Version floors: below borgmatic 2.1.0 the warning detection and exit-code
@@ -55,7 +56,16 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 		return nil, fmt.Errorf("container runtime socket check failed (socket %s; set CONTAINER_SOCKET to override): %w", e.rt.SocketPath(), err)
 	}
 
-	path, err := resolveBorgmatic(e.cfg)
+	// borg first: it is the engine everything drives, and it is deliberately
+	// host-owned (its repository format and CLI must match what the operator
+	// uses by hand against the same repositories). Checked before borgmatic so
+	// a missing borg fails cleanly instead of provisioning a toolchain for a
+	// deployment that cannot run anyway.
+	if err := checkBorg(ctx, snapshotHooksConfigured(e.cfg, e.groupOverrides)); err != nil {
+		return nil, err
+	}
+
+	path, err := e.launchBorgmatic(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -67,29 +77,8 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	}
 	res.borgmaticVersion = strings.TrimSpace(bmVersion)
 	if !versionAtLeast(res.borgmaticVersion, minBorgmatic) {
-		return nil, fmt.Errorf("borgmatic %s is too old: need >= %d.%d.%d (distro packages often lag; install with 'uv tool install borgmatic' or pipx)",
+		return nil, fmt.Errorf("borgmatic %s is too old: need >= %d.%d.%d (unset manager.borgmatic_path / BORGMATIC_PATH to let the manager provision its own)",
 			res.borgmaticVersion, minBorgmatic[0], minBorgmatic[1], minBorgmatic[2])
-	}
-
-	// Borg version floor: hard requirement when snapshot hooks are
-	// configured (archive path recording), advisory otherwise.
-	snapshotsConfigured := snapshotHooksConfigured(e.cfg, e.groupOverrides)
-	if borgPath, err := exec.LookPath("borg"); err != nil {
-		if snapshotsConfigured {
-			return nil, fmt.Errorf("borg not found on PATH but snapshot hooks are configured")
-		}
-		slog.Warn("borg not found on PATH; borgmatic will fail until it is installed")
-	} else if out, err := commandOutput(ctx, borgPath, "--version"); err == nil && len(strings.Fields(out)) > 0 {
-		// "borg 1.4.4"
-		fields := strings.Fields(out)
-		borgVersion := fields[len(fields)-1]
-		if !versionAtLeast(borgVersion, minBorg) {
-			msg := fmt.Sprintf("borg %s is older than %d.%d: snapshot-hook archives would record snapshot paths instead of original paths", borgVersion, minBorg[0], minBorg[1])
-			if snapshotsConfigured {
-				return nil, fmt.Errorf("%s, upgrade borg or disable the snapshot hooks", msg)
-			}
-			slog.Warn(msg + " (not fatal: no snapshot hooks configured)")
-		}
 	}
 
 	// docker/podman CLI: generated helper/exec dump commands invoke it.
@@ -122,24 +111,117 @@ func detectContainerCLI(cfg *config.ManagerConfig, socketPath string) string {
 	return ""
 }
 
-// resolveBorgmatic finds the borgmatic binary: BORGMATIC_PATH env, then the
-// manager.borgmatic_path config option, then PATH, then well-known locations.
-func resolveBorgmatic(cfg *config.ManagerConfig) (string, error) {
-	if p := os.Getenv("BORGMATIC_PATH"); p != "" {
+// checkBorg fails the launch when borg is absent: without the engine nothing
+// can back up or restore, and discovering that one failed cycle at a time
+// serves nobody. The version floor stays advisory unless snapshot hooks are
+// configured (archive path recording is silently wrong below it).
+func checkBorg(ctx context.Context, snapshotsConfigured bool) error {
+	borgPath, err := exec.LookPath("borg")
+	if err != nil {
+		return fmt.Errorf("borg not found on PATH: install it from your distribution or the official binaries " +
+			"(borg stays host-installed; the manager only provisions borgmatic)")
+	}
+	if out, err := commandOutput(ctx, borgPath, "--version"); err == nil && len(strings.Fields(out)) > 0 {
+		// "borg 1.4.4"
+		fields := strings.Fields(out)
+		borgVersion := fields[len(fields)-1]
+		if !versionAtLeast(borgVersion, minBorg) {
+			msg := fmt.Sprintf("borg %s is older than %d.%d: snapshot-hook archives would record snapshot paths instead of original paths", borgVersion, minBorg[0], minBorg[1])
+			if snapshotsConfigured {
+				return fmt.Errorf("%s, upgrade borg or disable the snapshot hooks", msg)
+			}
+			slog.Warn(msg + " (not fatal: no snapshot hooks configured)")
+		}
+	}
+	return nil
+}
+
+// launchBorgmatic picks the borgmatic a launch runs with, provisioning the
+// manager's own toolchain when nothing usable exists:
+//
+//  1. An explicit manager.borgmatic_path / BORGMATIC_PATH always wins and
+//     disables provisioning entirely: the operator chose.
+//  2. An existing toolchain is used; if its pins are stale it is refreshed
+//     (degrading to the stale one when the refresh cannot download).
+//  3. With no toolchain, a healthy host install is respected: no downloads
+//     behind the back of a host that manages borgmatic itself.
+//  4. Only a host whose borgmatic is missing, broken, or too old provisions
+//     the toolchain. A pipx upgrade that broke its environments lands here
+//     and heals instead of failing every cycle.
+func (e *env) launchBorgmatic(ctx context.Context) (string, error) {
+	if p := explicitBorgmaticPath(e.cfg); p != "" {
 		return p, nil
 	}
-	if p := cfg.Manager.BorgmaticPath; p != "" {
+	tc := toolchain.New(e.toolchainDir(), slog.Default())
+	if p, ok := tc.BorgmaticPath(); ok {
+		if tc.Fresh() {
+			return p, nil
+		}
+		return tc.Ensure(ctx)
+	}
+	if p, ok := healthyHostBorgmatic(ctx); ok {
 		return p, nil
 	}
+	return tc.Ensure(ctx)
+}
+
+// healthyHostBorgmatic reports a host-installed borgmatic that actually runs
+// and meets the version floor. A shim that exists but cannot exec (the broken
+// pipx case) or an install below the floor is not healthy: the caller
+// provisions the toolchain instead of failing on it.
+func healthyHostBorgmatic(ctx context.Context) (string, bool) {
+	p, ok := hostBorgmaticPath()
+	if !ok {
+		return "", false
+	}
+	out, err := commandOutput(ctx, p, "--version")
+	if err != nil {
+		slog.Warn("host borgmatic is broken; provisioning the manager's own toolchain instead", "path", p, "error", err)
+		return "", false
+	}
+	if v := strings.TrimSpace(out); !versionAtLeast(v, minBorgmatic) {
+		slog.Warn("host borgmatic is too old; provisioning the manager's own toolchain instead", "path", p, "version", v)
+		return "", false
+	}
+	return p, true
+}
+
+// hostBorgmaticPath finds borgmatic on PATH or in the well-known locations.
+func hostBorgmaticPath() (string, bool) {
 	if p, err := exec.LookPath("borgmatic"); err == nil {
-		return p, nil
+		return p, true
 	}
 	for _, p := range wellKnownBorgmaticPaths {
 		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			return p, nil
+			return p, true
 		}
 	}
-	return "", fmt.Errorf("borgmatic not found: install it (e.g. 'uv tool install borgmatic') or set manager.borgmatic_path / BORGMATIC_PATH")
+	return "", false
+}
+
+// explicitBorgmaticPath is the operator's override: env, then config.
+func explicitBorgmaticPath(cfg *config.ManagerConfig) string {
+	if p := os.Getenv("BORGMATIC_PATH"); p != "" {
+		return p
+	}
+	return cfg.Manager.BorgmaticPath
+}
+
+// resolveBorgmatic finds the borgmatic binary for commands that must not
+// provision (restore, config rendering, passthrough): the explicit override,
+// then an already-provisioned toolchain, then the host. The daemon and
+// one-shot runs go through launchBorgmatic instead, which can provision.
+func resolveBorgmatic(cfg *config.ManagerConfig, toolchainDir string) (string, error) {
+	if p := explicitBorgmaticPath(cfg); p != "" {
+		return p, nil
+	}
+	if p, ok := toolchain.CurrentBorgmatic(toolchainDir); ok {
+		return p, nil
+	}
+	if p, ok := hostBorgmaticPath(); ok {
+		return p, nil
+	}
+	return "", fmt.Errorf("borgmatic not found: start the daemon or a run once to let the manager provision its own, install it (e.g. 'uv tool install borgmatic'), or set manager.borgmatic_path / BORGMATIC_PATH")
 }
 
 // snapshotHooksConfigured reports whether any btrfs/zfs/lvm hook appears in

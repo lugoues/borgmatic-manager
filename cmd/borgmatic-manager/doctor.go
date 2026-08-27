@@ -14,6 +14,7 @@ import (
 
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/models"
+	"github.com/lugoues/borgmatic-manager/internal/toolchain"
 )
 
 // doctorTimeout bounds each external command the checks run.
@@ -137,7 +138,7 @@ func runDoctor(ctx context.Context) error {
 
 	// borgmatic binary and version floor.
 	borgmaticPath := ""
-	if path, err := resolveBorgmatic(e.cfg); err != nil {
+	if path, err := resolveBorgmatic(e.cfg, e.toolchainDir()); err != nil {
 		r.fail("borgmatic", err.Error())
 	} else {
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
@@ -155,13 +156,33 @@ func runDoctor(ctx context.Context) error {
 		}
 	}
 
-	// borg: hard floor only when snapshot hooks are configured.
+	// Which borgmatic is in use and whether the manager's own toolchain backs
+	// it: the first question when "it works in my shell but not in the unit".
+	switch {
+	case explicitBorgmaticPath(e.cfg) != "":
+		r.pass("toolchain", "not in use: manager.borgmatic_path / BORGMATIC_PATH overrides it")
+	default:
+		tc := toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler))
+		if m, fresh, err := tc.Info(); err == nil {
+			state := "current"
+			if !fresh {
+				state = "stale; the next daemon launch refreshes it"
+			}
+			r.pass("toolchain", fmt.Sprintf("borgmatic %s (uv %s, python %s), %s",
+				m.BorgmaticVersion, m.UVVersion, m.PythonVersion, state))
+		} else {
+			r.pass("toolchain", "not provisioned; the daemon provisions one only when no healthy host borgmatic exists")
+		}
+	}
+
+	// borg is required outright: without the engine nothing runs. The version
+	// floor is hard only when snapshot hooks are configured.
 	snapshots := snapshotHooksConfigured(e.cfg, e.groupOverrides)
 	if borgPath, err := exec.LookPath("borg"); err != nil {
 		if snapshots {
 			r.fail("borg", "not on PATH, and snapshot hooks are configured")
 		} else {
-			r.warn("borg", "not on PATH; borgmatic will fail until it is installed")
+			r.fail("borg", "not on PATH; install it from your distribution (the manager provisions borgmatic, never borg)")
 		}
 	} else {
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
