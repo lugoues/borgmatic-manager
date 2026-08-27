@@ -42,7 +42,7 @@ reimplements.
 
 | Dependency | Minimum | Notes |
 |---|---|---|
-| borgmatic | — | **not needed on the host**: the manager owns its own pinned install (see below); `manager.borgmatic_path` / `BORGMATIC_PATH` is the only way to use another |
+| borgmatic | **2.1.0** (overrides only) | **not needed on the host**: the manager owns its own pinned install (see below). `manager.borgmatic_path` / `BORGMATIC_PATH` is the only way to use another, and that install must be >= 2.1.0 |
 | borg | **1.4** | **required on the host**; the manager refuses to start without it. Deliberately never provisioned: its repository format and CLI must match what you use by hand against the same repositories |
 | Docker or Podman | — | socket access; rootless Podman supported with [limitations](#rootless-podman) |
 | `sqlite3` | — | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers — no host clients needed) |
@@ -50,7 +50,7 @@ reimplements.
 ### The borgmatic toolchain
 
 The manager owns its borgmatic. On first use — daemon launch, a restore, a
-passthrough command — it provisions a pinned toolchain: a pinned
+passthrough command, even `doctor` — it provisions a pinned toolchain: a pinned
 [uv](https://docs.astral.sh/uv/) (checksum-verified static binary) installs a
 pinned borgmatic with a uv-managed Python under `<state-dir>/toolchain/`
 (`/var/lib/borgmatic-manager/toolchain/` for the system unit,
