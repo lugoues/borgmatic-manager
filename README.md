@@ -538,7 +538,7 @@ full output from the systemd journal (`journalctl -u borgmatic-manager`, or
 | `manager.actions` | `[create, prune, compact, check]` | borgmatic actions per cycle, in order |
 | `manager.container_cli` | derived from socket | CLI for generated dump commands (`docker`/`podman`); default follows the connected socket |
 | `manager.run_timeout` | none | bound one group's run; SIGTERM → SIGKILL escalation |
-| `borgmatic.*` | none | defaults merged into every group's config |
+| `borgmatic.*` | empty (shipped config sets a repository, retention, checks, `lock_wait`) | defaults merged into every group's config |
 
 Local tweaks belong in `/etc/borgmatic-manager/conf.d/*.yaml` (`.yml` works too): full config
 fragments (`manager:` and/or `borgmatic:` sections) deep-merged over
