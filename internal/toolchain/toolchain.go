@@ -72,6 +72,12 @@ const defaultDownloadBase = "https://github.com/astral-sh/uv/releases/download"
 // keeps working meanwhile.
 const provisionTimeout = 10 * time.Minute
 
+// probeTimeout bounds each health probe of a toolchain binary. The daemon's
+// context is its lifetime: probing on it unbounded means a launcher wedged by
+// a corrupted managed Python hangs the startup forever instead of counting as
+// unhealthy and being reprovisioned.
+const probeTimeout = time.Minute
+
 // maxDownloadBytes bounds how much of a response is read. The checksum would
 // reject an oversized body anyway; this stops the disk filling first.
 const maxDownloadBytes = 512 << 20
@@ -99,6 +105,7 @@ type Toolchain struct {
 	downloadBase     string
 	uvSums           map[string]string
 	provisionTimeout time.Duration
+	probeTimeout     time.Duration
 	client           *http.Client
 	runUV            func(ctx context.Context, uvPath string, env []string, args ...string) ([]byte, error)
 	binVersion       func(ctx context.Context, bin string) (string, error)
@@ -114,6 +121,7 @@ func New(root string, logger *slog.Logger) *Toolchain {
 		downloadBase:     defaultDownloadBase,
 		uvSums:           uvSHA256,
 		provisionTimeout: provisionTimeout,
+		probeTimeout:     probeTimeout,
 		client:           &http.Client{},
 		runUV: func(ctx context.Context, uvPath string, env []string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, uvPath, args...) // #nosec G204 -- executing the checksum-verified uv this package just installed
@@ -122,6 +130,10 @@ func New(root string, logger *slog.Logger) *Toolchain {
 		},
 		binVersion: func(ctx context.Context, bin string) (string, error) {
 			cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- probing the binary this package just installed
+			// WaitDelay releases the output-pipe wait after the kill: a hung
+			// launcher's child (a wedged Python holding stdout) must not turn
+			// a bounded probe back into an unbounded one.
+			cmd.WaitDelay = 5 * time.Second
 			out, err := cmd.CombinedOutput()
 			return strings.TrimSpace(string(out)), err
 		},
@@ -200,6 +212,8 @@ func (t *Toolchain) Info() (Manifest, bool, error) {
 // for the degrade fallback, where a stale (older-versioned) toolchain is
 // acceptable, so only the exit status is judged.
 func (t *Toolchain) healthy(ctx context.Context, p string) bool {
+	ctx, cancel := context.WithTimeout(ctx, t.probeTimeout)
+	defer cancel()
 	out, err := t.binVersion(ctx, p)
 	if err != nil {
 		t.logger.Warn("toolchain borgmatic failed its health check", "borgmatic", p, "error", err, "output", out)
@@ -219,7 +233,9 @@ func (t *Toolchain) freshAndHealthy(ctx context.Context) (string, bool) {
 	if !ok || !t.Fresh() {
 		return "", false
 	}
-	out, err := t.binVersion(ctx, p)
+	pctx, cancel := context.WithTimeout(ctx, t.probeTimeout)
+	defer cancel()
+	out, err := t.binVersion(pctx, p)
 	if err != nil {
 		t.logger.Warn("toolchain borgmatic failed its health check", "borgmatic", p, "error", err, "output", out)
 		return "", false
@@ -249,7 +265,7 @@ func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 
 	// One provisioner at a time, across processes: a daemon start and a
 	// one-shot run racing here would both build the same version directory.
-	lock, err := lockfile.Exclusive(filepath.Join(t.root, "provision.lock"))
+	lock, err := t.acquireProvisionLock(ctx)
 	if err != nil {
 		return "", fmt.Errorf("locking toolchain for provisioning: %w", err)
 	}
@@ -263,13 +279,12 @@ func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 	pctx, cancel := context.WithTimeout(ctx, t.provisionTimeout)
 	defer cancel()
 	if err := t.provision(pctx); err != nil {
-		// The degrade probe runs on its own context: a provisioning attempt
-		// that died by its deadline must not take the fallback's health check
-		// down with it, or a stalled download turns into a failed launch even
-		// though the existing toolchain still works.
-		hctx, hcancel := context.WithTimeout(ctx, time.Minute)
-		defer hcancel()
-		if p, ok := t.BorgmaticPath(); ok && t.healthy(hctx, p) {
+		// The degrade probe runs on the caller's context (healthy bounds it
+		// itself): a provisioning attempt that died by its own deadline must
+		// not take the fallback's health check down with it, or a stalled
+		// download turns into a failed launch even though the existing
+		// toolchain still works.
+		if p, ok := t.BorgmaticPath(); ok && t.healthy(ctx, p) {
 			t.logger.Warn("toolchain provisioning failed; continuing with the existing toolchain",
 				"error", err, "borgmatic", p)
 			return p, nil
@@ -286,26 +301,36 @@ func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 	return p, nil
 }
 
+// acquireProvisionLock takes the cross-process provisioning lock without
+// going deaf to cancellation: a blocking flock cannot be interrupted by a
+// context, so the lock is polled. SIGTERM arriving while another process sits
+// in a stalled download must stop this waiter now, not when that download's
+// deadline finally expires.
+func (t *Toolchain) acquireProvisionLock(ctx context.Context) (*lockfile.Lock, error) {
+	path := filepath.Join(t.root, "provision.lock")
+	for {
+		lock, acquired, err := lockfile.TryExclusive(path)
+		if err != nil {
+			return nil, err
+		}
+		if acquired {
+			return lock, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 // provision builds the pinned version directory and flips "current" to it.
 func (t *Toolchain) provision(ctx context.Context) error {
-	name := versionDirName()
-	// A repair of the very composition "current" points at must not build in
-	// place: the live directory would be destroyed before its replacement
-	// exists, and a borgmatic already running from it would lose its files.
-	// Stage under a generation sibling instead and let the flip retire the
-	// old one through the usual grace period.
-	if name == t.currentTargetBase() {
-		name += "-r2"
-	} else if base := t.currentTargetBase(); base == name+"-r2" {
-		name += "-r3"
+	name, nameErr := t.buildDirName()
+	if nameErr != nil {
+		return nameErr
 	}
 	vdir := filepath.Join(t.root, "versions", name)
-
-	// A directory left by a crashed provisioner is unfinished by definition
-	// ("current" never pointed at it); rebuild from scratch.
-	if err := os.RemoveAll(vdir); err != nil {
-		return fmt.Errorf("clearing unfinished toolchain %s: %w", name, err)
-	}
 	if err := os.MkdirAll(filepath.Join(vdir, "bin"), 0o700); err != nil {
 		return fmt.Errorf("creating toolchain version directory: %w", err)
 	}
@@ -366,6 +391,32 @@ func (t *Toolchain) provision(ctx context.Context) error {
 
 	t.cleanOldVersions(name)
 	return nil
+}
+
+// buildDirName picks the directory this provisioning run builds into: the
+// pinned name, or the first unused repair generation when a same-composition
+// repair is needed. Never a directory that already exists: a retired
+// generation may be inside its grace period with a borgmatic still running
+// from it, the live "current" target must never be cleared before its
+// replacement exists, and a crashed provisioner's leftover is cheaper to
+// abandon to the grace cleanup than to reuse.
+func (t *Toolchain) buildDirName() (string, error) {
+	name := versionDirName()
+	current := t.currentTargetBase()
+	for r := 1; r <= 100; r++ {
+		candidate := name
+		if r > 1 {
+			candidate = fmt.Sprintf("%s-r%d", name, r)
+		}
+		if candidate == current {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(t.root, "versions", candidate)); err == nil {
+			continue
+		}
+		return candidate, nil
+	}
+	return "", errors.New("no free toolchain generation name; remove old directories under the toolchain's versions/ manually")
 }
 
 // downloadUV fetches the pinned uv release tarball, refuses it unless its

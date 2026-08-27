@@ -21,6 +21,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 )
 
 // uvTarball builds a release-shaped tar.gz holding one uv "binary" (a shell
@@ -206,7 +208,8 @@ func TestSameVersionRepairStagesBesideTheLiveDirectory(t *testing.T) {
 		p, err := tc.Ensure(context.Background())
 		require.NoError(t, err)
 		assert.True(t, tc.Fresh(), "a repair generation still counts as the pinned composition")
-		assert.Equal(t, name+"-r2", tc.currentTargetBase())
+		assert.True(t, strings.HasPrefix(tc.currentTargetBase(), name+"-r"),
+			"the rebuild lands in an unused generation sibling, never the live directory (got %s)", tc.currentTargetBase())
 		out, err := os.ReadFile(p)
 		require.NoError(t, err)
 		assert.Contains(t, string(out), BorgmaticVersion)
@@ -369,4 +372,74 @@ func TestExtractUVTakesOnlyTheUVMember(t *testing.T) {
 	info, err := os.Stat(dest)
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+}
+
+// A generation is never reused: a retired directory inside its grace period
+// may still back a running borgmatic, and rebuilding into it would delete
+// that process's files. The allocator skips anything on disk.
+func TestBuildDirNameNeverReusesExistingDirectories(t *testing.T) {
+	root := t.TempDir()
+	tc := New(root, slog.New(slog.DiscardHandler))
+	name := versionDirName()
+
+	first, err := tc.buildDirName()
+	require.NoError(t, err)
+	assert.Equal(t, name, first, "an empty root builds the pinned name")
+
+	// Current on -r3, with the base and -r2 retired but still on disk (grace).
+	for _, d := range []string{name, name + "-r2", name + "-r3"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "versions", d), 0o755))
+	}
+	require.NoError(t, os.Symlink(filepath.Join("versions", name+"-r3"), filepath.Join(root, "current")))
+
+	next, err := tc.buildDirName()
+	require.NoError(t, err)
+	assert.Equal(t, name+"-r4", next,
+		"cycling back onto a retired directory would delete files a running borgmatic may still need")
+}
+
+// Waiting for another process's provisioning lock must observe cancellation:
+// SIGTERM during someone else's stalled download stops the waiter now.
+func TestProvisionLockWaitObservesCancellation(t *testing.T) {
+	root := t.TempDir()
+	tc := New(root, slog.New(slog.DiscardHandler))
+	require.NoError(t, os.MkdirAll(root, 0o700))
+
+	held, acquired, err := lockfile.TryExclusive(filepath.Join(root, "provision.lock"))
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer held.Release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = tc.Ensure(ctx)
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second,
+		"the waiter must give up with the context, not wait out the holder")
+}
+
+// A launcher that hangs instead of exiting must read as unhealthy, or a
+// wedged managed Python would hold the daemon's startup forever instead of
+// being reprovisioned.
+func TestHungProbeIsUnhealthyAndReprovisions(t *testing.T) {
+	root := t.TempDir()
+	vdir := filepath.Join(root, "versions", versionDirName())
+	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\nsleep 60\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
+
+	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
+	tc, envs := newTestToolchain(t, root, tarball, sum)
+	tc.probeTimeout = 200 * time.Millisecond
+
+	start := time.Now()
+	p, err := tc.Ensure(context.Background())
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), 30*time.Second)
+	require.Len(t, *envs, 1, "the hung toolchain must be rebuilt")
+	out, err := os.ReadFile(p)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), BorgmaticVersion)
 }
