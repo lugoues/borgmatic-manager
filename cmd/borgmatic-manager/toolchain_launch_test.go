@@ -87,17 +87,16 @@ func TestResolveBorgmaticIgnoresHealthyHostInstall(t *testing.T) {
 // the command fails; the host is not a fallback, because a host borgmatic
 // healthy today is one host package upgrade away from broken.
 func TestResolveBorgmaticIgnoresHostWhenProvisioningFails(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("permission-based provisioning failure needs a non-root user")
-	}
 	hp := hostWith(t, "#!/bin/sh\necho 2.1.7\n")
 	t.Setenv("BORGMATIC_PATH", "")
 
-	roParent := t.TempDir()
-	require.NoError(t, os.Chmod(roParent, 0o555)) // provisioning cannot create the dir
-	t.Cleanup(func() { _ = os.Chmod(roParent, 0o755) })
+	// A regular file where the toolchain dir must go: every mkdir under it
+	// fails ENOTDIR, root included, so the failure is deterministic and no
+	// network is ever reached.
+	tcPath := filepath.Join(t.TempDir(), "toolchain")
+	require.NoError(t, os.WriteFile(tcPath, nil, 0o644))
 
-	p, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, filepath.Join(roParent, "toolchain"))
+	p, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, tcPath)
 	require.Error(t, err, "no toolchain and no way to provision one is a failure, not a host fallback")
 	assert.NotEqual(t, hp, p)
 	assert.Contains(t, err.Error(), "provisioning")

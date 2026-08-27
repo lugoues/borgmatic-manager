@@ -31,6 +31,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 [ "$(id -u)" = "0" ] || fail "run as root (e.g. 'sudo -E env \"PATH=\$PATH\" $0'; the DinD harness already is)"
 
 WORK="/srv/borgmatic-e2e" # matches manager.yaml's repository path
+# The harness pins BORGMATIC_PATH (the explicit override) on purpose: e2e
+# must not depend on live PyPI/GitHub, and on-demand provisioning is pinned
+# by the toolchain unit tests against fake servers.
 BORGMATIC_PATH="${BORGMATIC_PATH:-$(command -v borgmatic)}"
 [ -n "$BORGMATIC_PATH" ] || fail "borgmatic not found; install it or set BORGMATIC_PATH"
 command -v borg >/dev/null || fail "borg not found on PATH"

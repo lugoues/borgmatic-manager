@@ -28,7 +28,7 @@ Environment=CONTAINER_SOCKET=%t/podman/podman.sock
 Environment=CONFIG_DIR=%h/.config/borgmatic-manager
 Environment=RUNTIME_DIR=%t/borgmatic-manager
 Environment=STATE_DIR=%h/.local/state/borgmatic-manager
-# borgmatic from uv/pipx:
+# The manager provisions its own borgmatic; uncomment only to force one:
 #Environment=BORGMATIC_PATH=%h/.local/bin/borgmatic
 
 [Install]
