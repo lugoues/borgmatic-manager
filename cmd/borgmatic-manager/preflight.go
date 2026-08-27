@@ -354,8 +354,17 @@ func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainD
 		// zero-exit no-op would otherwise let a merge restore report
 		// "restore complete" having extracted nothing. The operator pinned
 		// this path, so a broken pin is an error, never a silent fallback.
-		if out, err := commandOutput(ctx, p, "--version"); err != nil || !toolchain.PlausibleReportedVersion(out) {
+		out, err := commandOutput(ctx, p, "--version")
+		if err != nil || !toolchain.PlausibleReportedVersion(out) {
 			return "", fmt.Errorf("borgmatic at %s (manager.borgmatic_path / BORGMATIC_PATH) is not usable: %v (output %q); fix the override", p, err, strings.TrimSpace(out))
+		}
+		// The floor is enforced here, in the one shared selection policy, so
+		// restore and passthrough refuse an old override exactly like the
+		// daemon and doctor do; the toolchain's pin sits above it by
+		// construction.
+		if !versionAtLeast(borgmaticVersionOf(out), minBorgmatic) {
+			return "", fmt.Errorf("borgmatic at %s (manager.borgmatic_path / BORGMATIC_PATH) is %s, need >= %d.%d.%d; unset the override to use the managed toolchain",
+				p, strings.TrimSpace(out), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2])
 		}
 		return p, nil
 	}

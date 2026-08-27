@@ -134,3 +134,18 @@ func TestExplicitOverrideKeepsHostPythonEnv(t *testing.T) {
 	assert.Equal(t, pin, p)
 	assert.Equal(t, "/opt/host/pythonpath", os.Getenv("PYTHONPATH"))
 }
+
+// The floor lives in the shared resolver, so restore and passthrough refuse
+// an old explicit override exactly like the daemon does; an operator opting
+// out of the toolchain does not opt out of the version requirement.
+func TestResolveBorgmaticRejectsBelowFloorExplicitPin(t *testing.T) {
+	pin := filepath.Join(t.TempDir(), "borgmatic")
+	require.NoError(t, os.WriteFile(pin, []byte("#!/bin/sh\necho 2.0.5\n"), 0o755))
+	cfg := &config.ManagerConfig{}
+	cfg.Manager.BorgmaticPath = pin
+	t.Setenv("BORGMATIC_PATH", "")
+
+	_, err := resolveBorgmatic(context.Background(), cfg, filepath.Join(t.TempDir(), "toolchain"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "need >= 2.1.0")
+}
