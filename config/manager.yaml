@@ -8,8 +8,10 @@ manager:
   # the container socket the manager is connected to (docker or podman).
   #container_cli: podman
 
-  # Path to the host borgmatic binary. Defaults to searching PATH, then
-  # /root/.local/bin (where 'uv tool install' / pipx put it).
+  # Force a specific borgmatic binary (BORGMATIC_PATH env wins over this).
+  # Unset, the manager provisions and uses its own pinned toolchain; host
+  # installs are ignored. Set it only to opt out of the managed toolchain,
+  # and keeping that install working is then on you.
   # borgmatic_path: /root/.local/bin/borgmatic
 
   # Borgmatic actions run for each group per cycle, in order. The default

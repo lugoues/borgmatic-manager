@@ -26,13 +26,6 @@ var (
 	minBorg      = [3]int{1, 4, 0}
 )
 
-// wellKnownBorgmaticPaths are probed when borgmatic is not on PATH; uv and pipx
-// install to /root/.local/bin, which is off systemd's default PATH.
-var wellKnownBorgmaticPaths = []string{
-	"/root/.local/bin/borgmatic",
-	"/usr/local/bin/borgmatic",
-}
-
 type preflightResult struct {
 	borgmaticPath    string
 	borgmaticVersion string
@@ -75,7 +68,7 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 		return nil, err
 	}
 
-	path, err := e.launchBorgmatic(ctx)
+	path, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir())
 	if err != nil {
 		return nil, err
 	}
@@ -88,8 +81,8 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	res.borgmaticVersion = strings.TrimSpace(bmVersion)
 	// Plausibility before the floor: an explicit borgmatic_path/BORGMATIC_PATH
 	// shim exiting zero with garbage would otherwise ride versionAtLeast's
-	// unparseable-passes rule into recording no-op runs as backups. Toolchain
-	// and host candidates were vetted already; this catches the override path.
+	// unparseable-passes rule into recording no-op runs as backups. The
+	// toolchain was vetted already; this catches the override path.
 	if !toolchain.PlausibleReportedVersion(res.borgmaticVersion) {
 		return nil, fmt.Errorf("borgmatic at %s reports no usable version (output %q); fix manager.borgmatic_path / BORGMATIC_PATH", path, res.borgmaticVersion)
 	}
@@ -307,70 +300,6 @@ func resolveBorgCommand(command string) (string, error) {
 	return command, nil
 }
 
-// launchBorgmatic picks the borgmatic a launch runs with, provisioning the
-// manager's own toolchain when nothing usable exists:
-//
-//  1. An explicit manager.borgmatic_path / BORGMATIC_PATH always wins and
-//     disables provisioning entirely: the operator chose.
-//  2. An existing toolchain is used; if its pins are stale it is refreshed
-//     (degrading to the stale one when the refresh cannot download).
-//  3. With no toolchain, a healthy host install is respected: no downloads
-//     behind the back of a host that manages borgmatic itself.
-//  4. Only a host whose borgmatic is missing, broken, or too old provisions
-//     the toolchain. A pipx upgrade that broke its environments lands here
-//     and heals instead of failing every cycle.
-func (e *env) launchBorgmatic(ctx context.Context) (string, error) {
-	if p := explicitBorgmaticPath(e.cfg); p != "" {
-		return p, nil
-	}
-	tc := toolchain.New(e.toolchainDir(), slog.Default())
-	if tc.Exists() {
-		// Any provisioned toolchain, however damaged (a vanished launcher
-		// included), is repaired rather than abandoned: Ensure hands a fresh
-		// healthy one straight back, refreshes a stale one, and reprovisions
-		// a broken one. Falling back to the host here would silently
-		// re-couple the daemon to the host's Python packaging.
-		//
-		// Stripped BEFORE the probes inside Ensure, not after: a poisoned
-		// PYTHONHOME failing the health checks would refuse the very
-		// toolchain that exists to escape it.
-		stripHostPythonEnv()
-		return tc.Ensure(ctx)
-	}
-	if p, ok := healthyHostBorgmatic(ctx); ok {
-		return p, nil
-	}
-	stripHostPythonEnv()
-	return tc.Ensure(ctx)
-}
-
-// healthyHostBorgmatic reports the first host-installed borgmatic that
-// actually runs, reports a plausible version (a corrupted shim exiting zero
-// with garbage must not be selected: versionAtLeast deliberately passes
-// unparseable tokens), and meets the version floor. Candidates are probed in
-// priority order and an unhealthy one does not hide a healthy one behind it:
-// a broken PATH shim with a good /usr/local install must not force
-// provisioning.
-func healthyHostBorgmatic(ctx context.Context) (string, bool) {
-	for _, p := range hostBorgmaticCandidates() {
-		out, err := commandOutput(ctx, p, "--version")
-		if err != nil {
-			slog.Warn("host borgmatic is broken; trying the next candidate", "path", p, "error", err)
-			continue
-		}
-		if !toolchain.PlausibleReportedVersion(out) {
-			slog.Warn("host borgmatic reports no usable version; trying the next candidate", "path", p, "reported", strings.TrimSpace(out))
-			continue
-		}
-		if v := borgmaticVersionOf(out); !versionAtLeast(v, minBorgmatic) {
-			slog.Warn("host borgmatic is too old; trying the next candidate", "path", p, "version", v)
-			continue
-		}
-		return p, true
-	}
-	return "", false
-}
-
 // borgmaticVersionOf extracts the version token from `borgmatic --version`
 // output: bare ("2.1.7") in current releases, prefixed ("borgmatic 2.1.7") in
 // some packagings. versionAtLeast deliberately passes unparseable strings
@@ -382,54 +311,6 @@ func borgmaticVersionOf(out string) string {
 		return ""
 	}
 	return fields[len(fields)-1]
-}
-
-// hostBorgmaticCandidates lists host borgmatic locations in priority order:
-// PATH, then the well-known install dirs systemd's PATH misses.
-func hostBorgmaticCandidates() []string {
-	var out []string
-	seen := map[string]bool{}
-	if p, err := exec.LookPath("borgmatic"); err == nil {
-		out = append(out, p)
-		seen[p] = true
-	}
-	for _, p := range wellKnownBorgmaticPaths {
-		if seen[p] {
-			continue
-		}
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// sanitizedProbe is commandOutput --version with the host's Python
-// configuration removed from the probe's own environment only.
-func sanitizedProbe(ctx context.Context, bin string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- probing the toolchain launcher
-	cmd.Env = toolchain.SanitizedEnviron()
-	// Its own process group, killed whole on timeout, like every other probe:
-	// restore, passthrough, and doctor route through here repeatedly and a
-	// damaged launcher's descendants must not accumulate.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.WaitDelay = 5 * time.Second
-	out, err := cmd.Output()
-	if errors.Is(err, exec.ErrWaitDelay) && cmd.Process != nil {
-		// The delay fired because a descendant held the pipes past the
-		// parent's exit; the context never expired, so Cancel never ran.
-		// Sweep the group before it becomes an orphan-per-cycle.
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	return string(out), err
 }
 
 // stripHostPythonEnv removes the host's Python environment configuration
@@ -456,45 +337,48 @@ func explicitBorgmaticPath(cfg *config.ManagerConfig) string {
 	return cfg.Manager.BorgmaticPath
 }
 
-// resolveBorgmatic finds the borgmatic binary for commands that must not
-// provision (restore, config rendering, passthrough): the explicit override,
-// then an already-provisioned toolchain, then the host. The toolchain
-// candidate is probed before it is preferred: an urgent restore must fall
-// through to a working host install rather than fail on a toolchain that
-// merely exists, and only the next daemon launch repairs it. The daemon and
-// one-shot runs go through launchBorgmatic instead, which can provision.
+// resolveBorgmatic is the single borgmatic selection policy, for the daemon
+// and every subcommand alike (restore, config rendering, passthrough,
+// doctor). The manager owns borgmatic: an explicit manager.borgmatic_path /
+// BORGMATIC_PATH is the only thing that overrides the managed toolchain,
+// which is provisioned on demand right here — a restore on a freshly
+// reinstalled host works without first running the daemon. A host install
+// without the override means nothing and is never probed, preferred, or
+// fallen back to: a host borgmatic healthy today is one host package
+// upgrade away from broken, which is the failure the toolchain exists to
+// end. When no toolchain exists and provisioning fails (an offline first
+// launch), the command fails and the next attempt retries.
 func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainDir string) (string, error) {
 	if p := explicitBorgmaticPath(cfg); p != "" {
-		// Probed like every other candidate: a pinned launcher that decayed
-		// into a zero-exit no-op would otherwise let a merge restore report
+		// Probed, not trusted: a pinned launcher that decayed into a
+		// zero-exit no-op would otherwise let a merge restore report
 		// "restore complete" having extracted nothing. The operator pinned
 		// this path, so a broken pin is an error, never a silent fallback.
-		if out, err := commandOutput(ctx, p, "--version"); err != nil || !toolchain.PlausibleReportedVersion(out) {
+		out, err := commandOutput(ctx, p, "--version")
+		if err != nil || !toolchain.PlausibleReportedVersion(out) {
 			return "", fmt.Errorf("borgmatic at %s (manager.borgmatic_path / BORGMATIC_PATH) is not usable: %v (output %q); fix the override", p, err, strings.TrimSpace(out))
+		}
+		// The floor is enforced here, in the one shared selection policy, so
+		// restore and passthrough refuse an old override exactly like the
+		// daemon and doctor do; the toolchain's pin sits above it by
+		// construction.
+		if !versionAtLeast(borgmaticVersionOf(out), minBorgmatic) {
+			return "", fmt.Errorf("borgmatic at %s (manager.borgmatic_path / BORGMATIC_PATH) is %s, need >= %d.%d.%d; unset the override to use the managed toolchain",
+				p, strings.TrimSpace(out), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2])
 		}
 		return p, nil
 	}
-	if p, ok := toolchain.CurrentBorgmatic(toolchainDir); ok {
-		// Probed on a sanitized environment WITHOUT touching the process env:
-		// the strip commits only once the probe passes. A broken toolchain
-		// must hand restore and passthrough an unaltered host fallback, which
-		// may itself rely on the very variables the toolchain sheds.
-		if out, err := sanitizedProbe(ctx, p); err == nil && toolchain.PlausibleReportedVersion(out) {
-			stripHostPythonEnv()
-			return p, nil
-		}
-		slog.Warn("toolchain borgmatic is broken or reports no usable version; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)
+	// Stripped BEFORE the probes inside Ensure, not after: a poisoned
+	// PYTHONHOME failing the health checks would refuse the very toolchain
+	// that exists to escape it. Nothing but the toolchain can be selected
+	// past this point, so the strip cannot strand a fallback that needed
+	// the variables.
+	stripHostPythonEnv()
+	p, err := toolchain.New(toolchainDir, slog.Default()).Ensure(ctx)
+	if err != nil {
+		return "", fmt.Errorf("no usable borgmatic: provisioning the manager's toolchain failed (%w); retry with network access, or set manager.borgmatic_path / BORGMATIC_PATH to use a specific install", err)
 	}
-	// Host candidates are probed lightly (runnable, plausible version) rather
-	// than floor-checked: for a restore, an old borgmatic that works beats a
-	// refusal. A broken first candidate must not hide a working later one.
-	for _, p := range hostBorgmaticCandidates() {
-		if out, err := commandOutput(ctx, p, "--version"); err == nil && toolchain.PlausibleReportedVersion(out) {
-			return p, nil
-		}
-		slog.Warn("host borgmatic candidate is not usable; trying the next", "path", p)
-	}
-	return "", fmt.Errorf("borgmatic not found: start the daemon or a run once to let the manager provision its own, install it (e.g. 'uv tool install borgmatic'), or set manager.borgmatic_path / BORGMATIC_PATH")
+	return p, nil
 }
 
 func commandOutput(ctx context.Context, name string, args ...string) (string, error) {

@@ -42,8 +42,9 @@ func (c *ManagerConfig) ParsedPeriod() (time.Duration, error) {
 type ManagerSettings struct {
 	// Period is the backup cycle interval (Go duration format, e.g. "1h").
 	Period string `yaml:"period"`
-	// BorgmaticPath is the path to the host borgmatic binary. Empty means
-	// resolve via BORGMATIC_PATH env, then PATH, then well-known locations.
+	// BorgmaticPath forces a specific borgmatic binary (BORGMATIC_PATH env
+	// wins over it). Empty means the manager's own toolchain, provisioned
+	// on demand; host installs are never discovered.
 	BorgmaticPath string `yaml:"borgmatic_path"`
 	// Actions are the borgmatic actions run per group per cycle, in order.
 	// Empty means the default: create, prune, compact, check.

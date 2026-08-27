@@ -33,8 +33,9 @@ RuntimeDirectoryPreserve=restart
 StateDirectory=borgmatic-manager
 StateDirectoryMode=0700
 
-# uv/pipx root installs land at /root/.local/bin, which is not on the
-# default service PATH. Uncomment if that's how you installed borgmatic.
+# The manager provisions and uses its own borgmatic toolchain; host
+# installs are ignored. Uncomment ONLY to force a specific binary instead
+# (keeping it working is then on you).
 #Environment=BORGMATIC_PATH=/root/.local/bin/borgmatic
 
 # The runtime socket is autodetected (docker, then podman). Override only

@@ -136,18 +136,14 @@ func runDoctor(ctx context.Context) error {
 		r.pass("socket", e.rt.SocketPath())
 	}
 
-	// borgmatic binary and version floor.
+	// borgmatic binary and version floor. resolveBorgmatic is the daemon's
+	// own selection: the explicit override, else the managed toolchain,
+	// provisioned on demand right here. Doctor validates the setup the
+	// daemon will actually run, provisioning included: a failure below is
+	// the same failure the daemon hits, so it is a fail, never a prediction.
 	borgmaticPath := ""
 	if path, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir()); err != nil {
-		// A clean install (no host borgmatic, no override, nothing
-		// provisioned yet) is a supported state: the daemon provisions its
-		// own on first launch. Failing it here would contradict the toolchain
-		// line below that reports exactly that plan.
-		if explicitBorgmaticPath(e.cfg) == "" && !toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler)).Exists() {
-			r.warn("borgmatic", "not installed yet; the daemon provisions its own toolchain on first launch")
-		} else {
-			r.fail("borgmatic", err.Error())
-		}
+		r.fail("borgmatic", err.Error())
 	} else {
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
 		version, err := commandOutput(cctx, path, "--version")
@@ -156,29 +152,10 @@ func runDoctor(ctx context.Context) error {
 		case err != nil:
 			r.fail("borgmatic", fmt.Sprintf("running %s --version: %v", path, err))
 		case !versionAtLeast(borgmaticVersionOf(version), minBorgmatic):
-			// The daemon does not run on this either: launchBorgmatic rejects
-			// a below-floor host install and provisions the toolchain, so an
-			// unprovisioned setup here is the supported first-launch plan,
-			// not a failure. An explicit override or an existing toolchain
-			// reporting an old version IS wrong, and stays one.
-			if explicitBorgmaticPath(e.cfg) == "" && !toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler)).Exists() {
-				// The daemon walks past a below-floor candidate to a healthy
-				// later one (a current /usr/local install behind an old
-				// distro package, say) before it ever provisions; predicting
-				// provisioning here would skip schema validation against the
-				// borgmatic actually selected.
-				if hp, ok := healthyHostBorgmatic(ctx); ok {
-					borgmaticPath = hp
-					r.pass("borgmatic", fmt.Sprintf("%s (the daemon skips %s: %s is below %d.%d.%d)",
-						hp, path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
-				} else {
-					r.warn("borgmatic", fmt.Sprintf("%s is %s, below %d.%d.%d; the daemon provisions its own toolchain on first launch",
-						path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
-				}
-			} else {
-				r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d",
-					path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
-			}
+			// Only an explicit override can sit below the floor: the
+			// toolchain's borgmatic is pinned above it.
+			r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d (unset manager.borgmatic_path / BORGMATIC_PATH to use the managed toolchain)",
+				path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
 		default:
 			borgmaticPath = path
 			r.pass("borgmatic", fmt.Sprintf("%s (%s)", path, strings.TrimSpace(version)))
@@ -187,10 +164,9 @@ func runDoctor(ctx context.Context) error {
 
 	// Which borgmatic is in use and whether the manager's own toolchain backs
 	// it: the first question when "it works in my shell but not in the unit".
-	// Judged by the path actually selected above, not the manifest: a broken
-	// toolchain keeps valid metadata while resolveBorgmatic falls back to the
-	// host, and reporting it as in-use would contradict the borgmatic line in
-	// exactly the scenario this line exists to explain.
+	// Judged by the path actually selected above, not the manifest: without
+	// the explicit override the toolchain is the only possible selection, so
+	// anything else here means the selection above already failed.
 	tc := toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler))
 	selectedToolchain := borgmaticPath != "" && strings.HasPrefix(borgmaticPath, e.toolchainDir()+string(filepath.Separator))
 	switch {
@@ -200,7 +176,7 @@ func runDoctor(ctx context.Context) error {
 		if m, fresh, err := tc.Info(); err == nil {
 			state := "current"
 			if !fresh {
-				state = "stale; the next daemon launch refreshes it"
+				state = "stale; the next launch refreshes it"
 			}
 			r.pass("toolchain", fmt.Sprintf("in use: borgmatic %s (uv %s, python %s), %s",
 				m.BorgmaticVersion, m.UVVersion, m.PythonVersion, state))
@@ -208,13 +184,9 @@ func runDoctor(ctx context.Context) error {
 			r.pass("toolchain", "in use")
 		}
 	case tc.Exists():
-		fallback := "no usable fallback was found"
-		if borgmaticPath != "" {
-			fallback = fmt.Sprintf("commands fall back to %s", borgmaticPath)
-		}
-		r.warn("toolchain", fmt.Sprintf("provisioned but not usable; %s (the next daemon launch repairs it)", fallback))
+		r.warn("toolchain", "provisioned but not usable (see the borgmatic line above); the next launch retries the repair")
 	default:
-		r.pass("toolchain", "not provisioned; the daemon provisions one only when no healthy host borgmatic exists")
+		r.warn("toolchain", "not provisioned; provisioning on demand failed (see the borgmatic line above)")
 	}
 
 	// borg is required outright: without the engine nothing runs. The same
@@ -363,7 +335,7 @@ func (r *doctorReport) checkGenerate(ctx context.Context, e *env, backupState *m
 // skips this step loudly rather than silently shortening the report.
 func (r *doctorReport) validateGeneratedConfigs(ctx context.Context, files []string, borgmaticPath string) {
 	if borgmaticPath == "" {
-		r.warn("validate", "skipped: borgmatic is not installed, so its schema check cannot run (the configs above still compiled)")
+		r.warn("validate", "skipped: no usable borgmatic (see the borgmatic line above), so its schema check cannot run (the configs above still compiled)")
 		return
 	}
 
