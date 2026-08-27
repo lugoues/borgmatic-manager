@@ -58,9 +58,24 @@ compose() { docker compose -f "$HERE/compose.yaml" "$@"; }
 
 # stack_up ARGS...: compose up gated by healthchecks; on failure, dump every
 # container's state and logs so CI/DinD failures are diagnosable from output.
+# Bounded: a compose --wait that never resolves (podman healthcheck wedges
+# have eaten entire 90-minute job timeouts in silence) must fail here with
+# diagnostics instead.
 stack_up() {
-  if ! compose "$@" up -d --wait; then
-    echo "=== stack state ===" >&2
+  compose "$@" up -d --wait &
+  local up_pid=$!
+  local deadline=$((SECONDS + 300))
+  local timed_out=0
+  while kill -0 "$up_pid" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      timed_out=1
+      kill -TERM "$up_pid" 2>/dev/null || true
+      break
+    fi
+    sleep 2
+  done
+  if [ "$timed_out" = 1 ] || ! wait "$up_pid"; then
+    echo "=== stack state (timed_out=$timed_out) ===" >&2
     compose "$@" ps -a >&2 || true
     echo "=== stack logs ===" >&2
     compose "$@" logs --no-color --timestamps >&2 || true
