@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/lockfile"
@@ -126,10 +127,27 @@ func New(root string, logger *slog.Logger) *Toolchain {
 		runUV: func(ctx context.Context, uvPath string, env []string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, uvPath, args...) // #nosec G204 -- executing the checksum-verified uv this package just installed
 			cmd.Env = env
+			// Its own process group, killed whole on cancellation, and a
+			// bounded pipe wait: uv spawns Python and installer descendants,
+			// and an expired provisioning deadline must actually return
+			// instead of waiting on a descendant that inherited stdout.
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Cancel = func() error {
+				if cmd.Process == nil {
+					return nil
+				}
+				return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			cmd.WaitDelay = 10 * time.Second
 			return cmd.CombinedOutput()
 		},
 		binVersion: func(ctx context.Context, bin string) (string, error) {
 			cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- probing the binary this package just installed
+			// The managed interpreter must never read the host's Python
+			// configuration, and that includes these probes: a poisoned
+			// PYTHONHOME failing the health check would refuse the very
+			// toolchain that escapes it.
+			cmd.Env = hostPythonEnvSanitized()
 			// WaitDelay releases the output-pipe wait after the kill: a hung
 			// launcher's child (a wedged Python holding stdout) must not turn
 			// a bounded probe back into an unbounded one.
@@ -255,12 +273,38 @@ func (t *Toolchain) freshAndHealthy(ctx context.Context) (string, bool) {
 		t.logger.Warn("toolchain borgmatic failed its health check", "borgmatic", p, "error", err, "output", out)
 		return "", false
 	}
-	if !strings.Contains(out, BorgmaticVersion) {
+	if reportedVersion(out) != BorgmaticVersion {
 		t.logger.Warn("toolchain borgmatic reports the wrong version; reprovisioning",
 			"borgmatic", p, "reported", out, "expected", BorgmaticVersion)
 		return "", false
 	}
 	return p, true
+}
+
+// reportedVersion extracts the version token from --version output ("2.1.7"
+// bare or "borgmatic 2.1.7" prefixed). Compared exactly: a substring check
+// would accept "2.1.70" as the pinned "2.1.7" and never repair it.
+func reportedVersion(out string) string {
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[len(fields)-1]
+}
+
+// hostPythonEnvSanitized is the process environment minus the host's Python
+// configuration, which the managed interpreter must never read.
+func hostPythonEnvSanitized() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if k == "PYTHONHOME" || k == "PYTHONPATH" || k == "PYTHONSTARTUP" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // Ensure returns a working toolchain borgmatic, provisioning or refreshing
@@ -271,7 +315,7 @@ func (t *Toolchain) freshAndHealthy(ctx context.Context) (string, bool) {
 // an error.
 func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 	if p, ok := t.freshAndHealthy(ctx); ok {
-		t.cleanOldVersions(t.currentTargetBase())
+		t.tryCleanOldVersions(t.currentTargetBase())
 		return p, nil
 	}
 	if err := os.MkdirAll(t.root, 0o700); err != nil {
@@ -386,15 +430,14 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("smoke test: running %s --version: %w (output: %s)", bin, err, got)
 	}
-	if !strings.Contains(got, BorgmaticVersion) {
-		return fmt.Errorf("smoke test: %s --version reported %q, expected %s", bin, got, BorgmaticVersion)
+	if reportedVersion(got) != BorgmaticVersion {
+		return fmt.Errorf("smoke test: %s --version reported %q, expected exactly %s", bin, got, BorgmaticVersion)
 	}
 
 	// The wheel cache only helps re-installs, which build a fresh directory
 	// anyway; drop it rather than carry megabytes per version.
 	_ = os.RemoveAll(filepath.Join(vdir, "cache"))
 
-	_ = os.Remove(filepath.Join(vdir, ".superseded"))
 	manifest, err := json.Marshal(Manifest{
 		UVVersion:        uvVersion,
 		PythonVersion:    pythonVersion,
@@ -419,6 +462,9 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 	if err := os.Rename(tmp, filepath.Join(t.root, "current")); err != nil {
 		return fmt.Errorf("switching current toolchain: %w", err)
 	}
+	// The new current must not carry a retirement clock from any past life or
+	// race; its grace period starts fresh when it is really superseded.
+	_ = os.Remove(filepath.Join(vdir, ".superseded"))
 
 	t.cleanOldVersions(name)
 	return nil
@@ -582,6 +628,21 @@ func uvEnv(vdir string) []string {
 		}
 	}
 	return env
+}
+
+// tryCleanOldVersions retires old versions only when the provisioning lock is
+// free. A provisioner past its manifest write but before its flip looks
+// finished to the lock-free fast path, which would mark the staged generation
+// superseded; the marker would ride into its life as current and age into an
+// immediate deletion at its real retirement. No lock, no cleanup: whoever
+// holds it cleans up afterwards anyway.
+func (t *Toolchain) tryCleanOldVersions(keep string) {
+	lock, acquired, err := lockfile.TryExclusive(filepath.Join(t.root, "provision.lock"))
+	if err != nil || !acquired {
+		return
+	}
+	defer lock.Release()
+	t.cleanOldVersions(keep)
 }
 
 // supersededGrace is how long a superseded toolchain version survives before

@@ -502,3 +502,68 @@ func TestVanishedLauncherIsReprovisioned(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(out), BorgmaticVersion)
 }
+
+// "2.1.70" contains "2.1.7"; a substring version check would keep an
+// unexpectedly upgraded launcher forever. The comparison is exact.
+func TestWrongVersionByPrefixIsReprovisioned(t *testing.T) {
+	root := t.TempDir()
+	vdir := filepath.Join(root, "versions", versionDirName())
+	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\necho "+BorgmaticVersion+"0\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
+
+	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
+	tc, envs := newTestToolchain(t, root, tarball, sum)
+	_, err := tc.Ensure(context.Background())
+	require.NoError(t, err)
+	require.Len(t, *envs, 1, "the prefix-matching version must be rebuilt")
+}
+
+// The probes themselves must not read the host's Python configuration: a
+// poisoned PYTHONHOME failing the health check would refuse the very
+// toolchain that exists to escape it.
+func TestProbesIgnoreHostPythonEnv(t *testing.T) {
+	t.Setenv("PYTHONHOME", "/definitely/broken")
+	root := t.TempDir()
+	vdir := filepath.Join(root, "versions", versionDirName())
+	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
+	// Fails when PYTHONHOME leaks through, healthy otherwise.
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\n[ -n \"$PYTHONHOME\" ] && exit 1\necho "+BorgmaticVersion+"\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
+
+	tc := New(root, slog.New(slog.DiscardHandler))
+	p, ok := tc.freshAndHealthy(context.Background())
+	require.True(t, ok, "the probe runs on a sanitized environment")
+	assert.Equal(t, filepath.Join(root, "current", "bin", "borgmatic"), p)
+}
+
+// While a provisioner holds the lock, the fast path must not retire anything:
+// a staged generation past its manifest write would be marked superseded and
+// carry that clock into its life as current.
+func TestFastPathCleanupSkipsWhileProvisionLockHeld(t *testing.T) {
+	root := t.TempDir()
+	vdir := filepath.Join(root, "versions", versionDirName())
+	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\necho "+BorgmaticVersion+"\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
+
+	// A finished-looking old version that WOULD be retired.
+	old := filepath.Join(root, "versions", "uv0.0.1-py3.12-borgmatic2.0.0")
+	require.NoError(t, os.MkdirAll(old, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(old, "manifest.json"), []byte("{}"), 0o644))
+
+	held, acquired, err := lockfile.TryExclusive(filepath.Join(root, "provision.lock"))
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer held.Release()
+
+	tc := New(root, slog.New(slog.DiscardHandler))
+	_, err = tc.Ensure(context.Background())
+	require.NoError(t, err, "the fresh fast path does not wait on the lock")
+	_, statErr := os.Stat(filepath.Join(old, ".superseded"))
+	assert.True(t, os.IsNotExist(statErr), "no retirement while another process provisions")
+}
