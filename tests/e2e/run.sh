@@ -56,32 +56,56 @@ MANAGER_PID=""
 
 compose() { docker compose -f "$HERE/compose.yaml" "$@"; }
 
-# stack_up ARGS...: compose up gated by healthchecks; on failure, dump every
-# container's state and logs so CI/DinD failures are diagnosable from output.
-# Bounded: a compose --wait that never resolves (podman healthcheck wedges
-# have eaten entire 90-minute job timeouts in silence) must fail here with
-# diagnostics instead.
+# probe_ready NAME: the service's own readiness command, exec'd directly so
+# readiness does not depend on the runtime's healthcheck engine. Podman on
+# 2026-08 GitHub runner images stopped firing healthchecks: containers ran
+# fine but stayed unhealthy forever and `up --wait` never returned. These
+# mirror the healthchecks in compose.yaml, which remain for documentation and
+# for plain docker use.
+probe_ready() {
+  case "$1" in
+    e2e-app-a)    docker exec e2e-app-a test -f /data/file-a.txt ;;
+    e2e-app-b)    docker exec e2e-app-b test -f /data/file-b.txt ;;
+    e2e-postgres) docker exec e2e-postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null ;;
+    e2e-mariadb)  docker exec e2e-mariadb healthcheck.sh --connect --innodb_initialized >/dev/null ;;
+    *)            return 0 ;;
+  esac
+}
+
+# stack_up ARGS...: compose up, then poll every expected service's readiness
+# probe. Bounded, and on failure every container's state and logs are dumped
+# so CI failures are diagnosable from output.
 stack_up() {
-  compose "$@" up -d --wait &
-  local up_pid=$!
+  if ! compose "$@" up -d; then
+    stack_dump "$@"
+    fail "stack failed to start"
+  fi
+  local services="e2e-app-a e2e-postgres e2e-mariadb"
+  case "$*" in *late*) services="$services e2e-app-b" ;; esac
   local deadline=$((SECONDS + 300))
-  local timed_out=0
-  while kill -0 "$up_pid" 2>/dev/null; do
+  local pending
+  while :; do
+    pending=""
+    for c in $services; do
+      probe_ready "$c" >/dev/null 2>&1 || pending="$pending $c"
+    done
+    [ -z "$pending" ] && return 0
     if [ "$SECONDS" -ge "$deadline" ]; then
-      timed_out=1
-      kill -TERM "$up_pid" 2>/dev/null || true
-      break
+      echo "=== stack not ready after 300s; pending:$pending ===" >&2
+      stack_dump "$@"
+      fail "stack failed to become ready"
     fi
     sleep 2
   done
-  if [ "$timed_out" = 1 ] || ! wait "$up_pid"; then
-    echo "=== stack state (timed_out=$timed_out) ===" >&2
-    compose "$@" ps -a >&2 || true
-    echo "=== stack logs ===" >&2
-    compose "$@" logs --no-color --timestamps >&2 || true
-    fail "stack failed to become healthy"
-  fi
 }
+
+stack_dump() {
+  echo "=== stack state ===" >&2
+  compose "$@" ps -a >&2 || true
+  echo "=== stack logs ===" >&2
+  compose "$@" logs --no-color --timestamps >&2 || true
+}
+
 manager() { "$WORK/borgmatic-manager" "$@"; }
 
 cleanup() {
