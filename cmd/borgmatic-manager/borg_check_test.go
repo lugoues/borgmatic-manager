@@ -278,3 +278,26 @@ func TestCheckBorgRejectsGarbageVersionOutput(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no usable version")
 }
+
+// A global local_path IS the default borg; groups inheriting it must not
+// read as "brings its own borg" or the globally configured binary would be
+// validated nowhere.
+func TestGlobalLocalPathStaysInTheDefaultGate(t *testing.T) {
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": "/nonexistent/global-borg"}}
+	err := checkBorg(context.Background(), cfg, nil, st)
+	require.Error(t, err, "the inherited global borg is missing; the launch must say so")
+	assert.Contains(t, err.Error(), "manager.yaml local_path")
+
+	t.Run("a group-layer local_path still suppresses inheritance", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		lp := fakeBorg(t, t.TempDir(), "1.4.5")
+		st2 := models.NewBackupState()
+		st2.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+		st2.Groups["app"].LabelConfigs = append(st2.Groups["app"].LabelConfigs,
+			map[string]interface{}{"local_path": lp})
+		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st2))
+	})
+}

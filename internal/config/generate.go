@@ -380,14 +380,6 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		kept = append(kept, e)
 	}
 
-	// Pass 2.5: a group naming its own borg (local_path from an override or a
-	// label) is judged here, per group, so one container's broken label
-	// refuses that group loudly instead of failing the whole cycle or the
-	// daemon's launch. The DEFAULT borg is deliberately not judged here: its
-	// problems are global by nature and preflight and the scheduler's pre-run
-	// gate own them.
-	kept, refusals = g.refuseBrokenGroupBorgs(kept, refusals)
-
 	// Pass 3: refuse any group whose archive pattern claims a sibling's archives
 	// in a shared repository; its retention would prune them.
 	//
@@ -428,6 +420,20 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		kept = final
 	}
 
+	// Pass 4: a group naming its own borg (local_path from an override or a
+	// label) is judged here, per group, so one container's broken label
+	// refuses that group loudly instead of failing the whole cycle or the
+	// daemon's launch. The DEFAULT borg (including a global local_path) is
+	// deliberately not judged here: its problems are global by nature and
+	// preflight and the scheduler's pre-run gate own them.
+	//
+	// AFTER the overlap pass, not before: a borg-refused group's existing
+	// archives are still real, and removing it first would let a surviving
+	// sibling whose pattern claims them run retention over backups a transient
+	// local_path breakage briefly orphaned. Here it still counts as a victim;
+	// it only stops being a runner.
+	kept, refusals = g.refuseBrokenGroupBorgs(kept, refusals)
+
 	return kept, refusals, nil
 }
 
@@ -436,14 +442,24 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 // snapshot floor while the group uses snapshot hooks. The floor stays
 // advisory without hooks, matching the default borg's rules.
 func (g *Generator) refuseBrokenGroupBorgs(kept []*pending, refusals []Refusal) ([]*pending, []Refusal) {
+	globalLP, _ := g.cfg.Borgmatic["local_path"].(string)
+	// One verdict per local_path within this plan: several groups sharing a
+	// hung borg must cost one probe timeout, not one each.
+	verdicts := map[string]string{}
 	final := kept[:0]
 	for _, e := range kept {
 		lp, _ := e.final["local_path"].(string)
-		if lp == "" {
+		if lp == "" || lp == globalLP {
+			// Inherited from the global config: that is the default borg, and
+			// the launch and per-cycle gates own it.
 			final = append(final, e)
 			continue
 		}
-		reason := g.groupBorgProblem(lp, hasSnapshotHooks(e.final))
+		reason, seen := verdicts[lp+"\x00"+fmt.Sprint(hasSnapshotHooks(e.final))]
+		if !seen {
+			reason = g.groupBorgProblem(lp, hasSnapshotHooks(e.final))
+			verdicts[lp+"\x00"+fmt.Sprint(hasSnapshotHooks(e.final))] = reason
+		}
 		if reason == "" {
 			final = append(final, e)
 			continue

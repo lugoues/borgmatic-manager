@@ -1676,3 +1676,40 @@ func TestGroupBorgProblemsRefuseOnlyThatGroup(t *testing.T) {
 		require.Len(t, refusals, 1)
 	})
 }
+
+// A borg-refused group's archives are still real. It must stop being a
+// runner but stay a victim: a sibling whose pattern claims its archives is
+// refused too, or a transient local_path breakage would hand the sibling's
+// retention the orphaned backups.
+func TestBorgRefusedGroupsRemainOverlapVictims(t *testing.T) {
+	defer config.SetSampleHostname("backup01")()
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.AddVolume("app-prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+	// app-prod's own borg is broken this cycle.
+	st.Groups["app-prod"].LabelConfigs = append(st.Groups["app-prod"].LabelConfigs,
+		map[string]interface{}{"local_path": "broken-borg"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
+		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
+	}}
+
+	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+	g.SetLookPath(func(bin string) (string, error) {
+		if bin == "broken-borg" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/bin/found", nil
+	})
+	meta, refusals, err := g.Generate(st)
+	require.NoError(t, err)
+
+	require.NotContains(t, meta, "app",
+		"app's pattern claims app-prod's archives; those archives exist regardless of app-prod's borg")
+	require.NotContains(t, meta, "app-prod")
+	require.Len(t, refusals, 2)
+	reasons := refusals[0].Reason + " | " + refusals[1].Reason
+	assert.Contains(t, reasons, "archive pattern")
+	assert.Contains(t, reasons, "local_path")
+}

@@ -245,21 +245,25 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 	for _, name := range groupNames {
 		// The group's effective config in generation's merge order: global,
 		// file override, label fragments, last wins.
-		chain := []map[string]interface{}{cfg.Borgmatic}
+		// Only GROUP layers (override, labels) suppress inheritance: a global
+		// local_path IS the default this gate checks, and letting it satisfy
+		// every group's chain would leave the globally configured borg
+		// unvalidated anywhere.
+		var groupLayers []map[string]interface{}
 		if o, ok := overrides[name]; ok && o.Borgmatic != nil {
-			chain = append(chain, o.Borgmatic)
+			groupLayers = append(groupLayers, o.Borgmatic)
 		}
-		chain = append(chain, state.Groups[name].LabelConfigs...)
+		groupLayers = append(groupLayers, state.Groups[name].LabelConfigs...)
 
-		lp := ""
-		hooks := false
-		for _, m := range chain {
+		groupLP := ""
+		hooks := hasSnapshotHooks(cfg.Borgmatic)
+		for _, m := range groupLayers {
 			if v, _ := m["local_path"].(string); v != "" {
-				lp = v
+				groupLP = v
 			}
 			hooks = hooks || hasSnapshotHooks(m)
 		}
-		if lp == "" {
+		if groupLP == "" {
 			defaultNeeded = true
 			defaultHooks = defaultHooks || hooks
 		}
