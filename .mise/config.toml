@@ -1,7 +1,10 @@
 [tools]
 go = "1.25"
 "aqua:golangci/golangci-lint" = "latest"
-"aqua:goreleaser/goreleaser" = "latest"
+# Pinned: v2.18.0 ships GitHub's new release attestations, whose certificate
+# identity (dotcom.releases.github.com) mise/aqua cannot verify yet; "latest"
+# broke every CI job at tool setup. Unpin once mise handles them.
+"aqua:goreleaser/goreleaser" = "2.17.1"
 "aqua:cli/cli"="latest"
 
 [tasks.build]
