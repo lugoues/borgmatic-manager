@@ -122,106 +122,6 @@ func TestCheckBorgHonorsLocalPath(t *testing.T) {
 	})
 }
 
-// Labels may point every group at its own borg; a deployment doing so worked
-// before the outright borg requirement and must keep working without a PATH
-// borg. A group falling through to the default still demands it.
-func TestCheckBorgHonorsLabelLocalPath(t *testing.T) {
-	t.Setenv("PATH", t.TempDir()) // no default borg anywhere
-
-	lp := fakeBorg(t, t.TempDir(), "1.4.5")
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
-		map[string]interface{}{"local_path": lp})
-
-	require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st),
-		"every discovered group labels its own borg; no PATH borg is invoked")
-
-	t.Run("a group without a label still needs the default", func(t *testing.T) {
-		st.AddVolume("plain", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
-		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, st)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "PATH")
-	})
-
-	t.Run("a broken label borg is not a launch failure", func(t *testing.T) {
-		// Its group is refused at generation instead (see the config package's
-		// refusal tests): one container's bad label must not stop the fleet.
-		st2 := models.NewBackupState()
-		st2.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-		st2.Groups["app"].LabelConfigs = append(st2.Groups["app"].LabelConfigs,
-			map[string]interface{}{"local_path": "/nonexistent/borg"})
-		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st2))
-	})
-}
-
-// Generation merges labels after the group's file override, so a label
-// local_path supersedes the override's. The superseded executable is never
-// invoked and must not be able to fail preflight.
-func TestSupersededOverrideBorgIsNotDemanded(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	labelBorg := fakeBorg(t, t.TempDir(), "1.4.5")
-
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
-		map[string]interface{}{"local_path": labelBorg})
-	overrides := map[string]config.GroupOverride{
-		"app": {Borgmatic: map[string]interface{}{"local_path": "/nonexistent/old-borg"}},
-	}
-
-	require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st),
-		"the label superseded the override; generation never invokes /nonexistent/old-borg")
-}
-
-// A dormant group (override present, containers currently gone) that inherits
-// the default borg still runs on it when it returns, without preflight
-// rerunning. Its snapshot hooks must reach the default's version floor, and
-// its fallthrough must keep the default required even when every discovered
-// group brings its own borg.
-func TestDormantSnapshotGroupHardensTheInheritedDefault(t *testing.T) {
-	dir := t.TempDir()
-	fakeBorg(t, dir, "1.2.0") // old default borg
-	t.Setenv("PATH", dir)
-
-	labelBorg := fakeBorg(t, t.TempDir(), "1.4.5")
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
-		map[string]interface{}{"local_path": labelBorg})
-
-	overrides := map[string]config.GroupOverride{
-		"dormant": {Borgmatic: map[string]interface{}{"btrfs": map[string]interface{}{}}},
-	}
-	err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st)
-	require.Error(t, err,
-		"the dormant snapshot group inherits the old default borg; waving it through would record snapshot paths when it wakes")
-
-	t.Run("and keeps the default required at all", func(t *testing.T) {
-		t.Setenv("PATH", t.TempDir()) // no default borg anywhere
-		err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "PATH")
-	})
-}
-
-// A dormant group configured only through manager settings (a period alone)
-// still inherits the default borg when it wakes, without a preflight rerun.
-func TestManagerOnlyDormantOverrideKeepsDefaultRequired(t *testing.T) {
-	t.Setenv("PATH", t.TempDir()) // no default borg
-	labelBorg := fakeBorg(t, t.TempDir(), "1.4.5")
-
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
-		map[string]interface{}{"local_path": labelBorg})
-
-	overrides := map[string]config.GroupOverride{"dormant": {}}
-	err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st)
-	require.Error(t, err, "the dormant group will inherit the default borg; its absence must fail now, not when the group wakes")
-	assert.Contains(t, err.Error(), "PATH")
-}
-
 // A transient probe failure must not be remembered against an unchanged file:
 // cached, it would skip every future cycle until the daemon restarts.
 func TestTransientBorgProbeFailureIsRetried(t *testing.T) {
@@ -279,40 +179,42 @@ func TestCheckBorgRejectsGarbageVersionOutput(t *testing.T) {
 	assert.Contains(t, err.Error(), "no usable version")
 }
 
-// A global local_path IS the default borg; groups inheriting it must not
-// read as "brings its own borg" or the globally configured binary would be
-// validated nowhere.
-func TestGlobalLocalPathStaysInTheDefaultGate(t *testing.T) {
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-
-	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": "/nonexistent/global-borg"}}
-	err := checkBorg(context.Background(), cfg, nil, st)
-	require.Error(t, err, "the inherited global borg is missing; the launch must say so")
-	assert.Contains(t, err.Error(), "manager.yaml local_path")
-
-	t.Run("a group-layer local_path still suppresses inheritance", func(t *testing.T) {
-		t.Setenv("PATH", t.TempDir())
-		lp := fakeBorg(t, t.TempDir(), "1.4.5")
-		st2 := models.NewBackupState()
-		st2.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-		st2.Groups["app"].LabelConfigs = append(st2.Groups["app"].LabelConfigs,
-			map[string]interface{}{"local_path": lp})
-		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st2))
+// The borg binary is global-only, so there is exactly one command and it is
+// always required; snapshot hooks from ANY source harden its floor, since
+// every group runs on it.
+func TestSingleGlobalBorgGate(t *testing.T) {
+	t.Run("label local_path does not suppress the default", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir()) // no borg anywhere
+		st := models.NewBackupState()
+		st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+		st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+			map[string]interface{}{"local_path": "/anything/borg"})
+		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, st)
+		require.Error(t, err, "generation strips group-level local_path, so the default borg always runs")
+		assert.Contains(t, err.Error(), "PATH")
 	})
-}
 
-// A group layer repeating the global local_path verbatim is inheritance
-// restated: it must not suppress the default gate, or the path would be
-// validated nowhere (generation skips it by the same equality).
-func TestOverrideRepeatingGlobalPathKeepsDefaultGate(t *testing.T) {
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
-		map[string]interface{}{"local_path": "/nonexistent/global-borg"})
+	t.Run("label snapshot hooks harden the global floor", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeBorg(t, dir, "1.2.0")
+		t.Setenv("PATH", dir)
+		st := models.NewBackupState()
+		st.AddVolume("snappy", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st),
+			"old borg without hooks anywhere is advisory")
+		st.Groups["snappy"].LabelConfigs = append(st.Groups["snappy"].LabelConfigs,
+			map[string]interface{}{"btrfs": map[string]interface{}{}})
+		require.Error(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st),
+			"a label-defined snapshot hook runs on the global borg and hardens its floor")
+	})
 
-	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": "/nonexistent/global-borg"}}
-	err := checkBorg(context.Background(), cfg, nil, st)
-	require.Error(t, err, "every group repeats the broken global path; the default gate must still catch it")
-	assert.Contains(t, err.Error(), "manager.yaml local_path")
+	t.Run("dormant override hooks harden the floor too", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeBorg(t, dir, "1.2.0")
+		t.Setenv("PATH", dir)
+		overrides := map[string]config.GroupOverride{
+			"dormant": {Borgmatic: map[string]interface{}{"zfs": map[string]interface{}{}}},
+		}
+		require.Error(t, checkBorg(context.Background(), &config.ManagerConfig{}, overrides, nil))
+	})
 }

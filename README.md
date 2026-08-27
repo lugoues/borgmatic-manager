@@ -65,6 +65,10 @@ the manager's backups.
   launch, atomically — a failed download leaves the previous toolchain working.
 - `manager.borgmatic_path` / `BORGMATIC_PATH` overrides everything and disables
   provisioning entirely.
+- The **borg binary is global-only**: `borg` on PATH, or `local_path` in
+  `manager.yaml`'s borgmatic defaults. A `local_path` in a group override or a
+  container label is ignored with a warning; from a label it would hand root
+  code execution to anyone who can label a container.
 - `borgmatic-manager doctor` reports which borgmatic is in use and the
   toolchain's state.
 

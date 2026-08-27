@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +85,13 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 		return nil, fmt.Errorf("running %s --version: %w", path, err)
 	}
 	res.borgmaticVersion = strings.TrimSpace(bmVersion)
+	// Plausibility before the floor: an explicit borgmatic_path/BORGMATIC_PATH
+	// shim exiting zero with garbage would otherwise ride versionAtLeast's
+	// unparseable-passes rule into recording no-op runs as backups. Toolchain
+	// and host candidates were vetted already; this catches the override path.
+	if !toolchain.PlausibleReportedVersion(res.borgmaticVersion) {
+		return nil, fmt.Errorf("borgmatic at %s reports no usable version (output %q); fix manager.borgmatic_path / BORGMATIC_PATH", path, res.borgmaticVersion)
+	}
 	if !versionAtLeast(borgmaticVersionOf(res.borgmaticVersion), minBorgmatic) {
 		return nil, fmt.Errorf("borgmatic %s is too old: need >= %d.%d.%d (unset manager.borgmatic_path / BORGMATIC_PATH to let the manager provision its own)",
 			res.borgmaticVersion, minBorgmatic[0], minBorgmatic[1], minBorgmatic[2])
@@ -168,12 +174,18 @@ var borgVersionCache = struct {
 }{m: map[string]borgVersionEntry{}}
 
 type borgVersionEntry struct {
-	mtime time.Time
-	size  int64
-	dev   uint64
-	ino   uint64
-	out   string
+	mtime    time.Time
+	size     int64
+	dev      uint64
+	ino      uint64
+	out      string
+	probedAt time.Time
 }
+
+// borgVersionTTL bounds how long a cached verdict stands even for an
+// unchanged file: a wrapper script's inode is stable while whatever it
+// delegates to changes underneath it.
+const borgVersionTTL = time.Hour
 
 // fileIdentity is (device, inode): size and mtime alone can be preserved
 // across an atomic replacement (a symlink repointed at a packaged binary with
@@ -200,7 +212,8 @@ func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
 	borgVersionCache.mu.Lock()
 	e, hit := borgVersionCache.m[path]
 	borgVersionCache.mu.Unlock()
-	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() && e.dev == dev && e.ino == ino {
+	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() && e.dev == dev && e.ino == ino &&
+		time.Since(e.probedAt) < borgVersionTTL {
 		return e.out, true
 	}
 	out, err := commandOutput(ctx, path, "--version")
@@ -208,7 +221,7 @@ func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
 		return out, false
 	}
 	borgVersionCache.mu.Lock()
-	borgVersionCache.m[path] = borgVersionEntry{mtime: info.ModTime(), size: info.Size(), dev: dev, ino: ino, out: out}
+	borgVersionCache.m[path] = borgVersionEntry{mtime: info.ModTime(), size: info.Size(), dev: dev, ino: ino, out: out, probedAt: time.Now()}
 	borgVersionCache.mu.Unlock()
 	return out, true
 }
@@ -222,91 +235,32 @@ type borgCommand struct {
 	snapshots bool
 }
 
-// borgCommands names the DEFAULT borg the configuration falls through to:
-// "borg" on PATH unless the global config sets borgmatic's local_path. It is
-// required only when some group actually inherits it (or no state is
-// available to tell). Group-specific borgs (override or label local_path) are
-// deliberately NOT listed: generation judges those per group and refuses only
-// the affected group, so one container's broken label cannot fail the launch
-// or stop every other group's cycle.
+// borgCommands names the one borg every group runs on: "borg" on PATH
+// unless manager.yaml sets borgmatic's local_path. The borg binary is
+// global-only by design (generation strips group-level local_path with a
+// warning: from a label it would be root code execution for anyone who can
+// label a container, and per-group engines were a footgun), so the default is
+// always required and there is exactly one command to validate. Snapshot
+// hooks from any source harden its version floor: every group, label-defined
+// hooks included, runs on this borg.
 func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOverride, state *models.BackupState) []borgCommand {
-	globalHooks := hasSnapshotHooks(cfg.Borgmatic)
-	globalLP, _ := cfg.Borgmatic["local_path"].(string)
-
-	groupNames := []string{}
-	if state != nil {
-		for name := range state.Groups {
-			groupNames = append(groupNames, name)
-		}
-		sort.Strings(groupNames)
-	}
-	defaultNeeded := state == nil || len(groupNames) == 0
-	defaultHooks := globalHooks
-	for _, name := range groupNames {
-		// The group's effective config in generation's merge order: global,
-		// file override, label fragments, last wins.
-		// Only GROUP layers (override, labels) suppress inheritance: a global
-		// local_path IS the default this gate checks, and letting it satisfy
-		// every group's chain would leave the globally configured borg
-		// unvalidated anywhere.
-		var groupLayers []map[string]interface{}
-		if o, ok := overrides[name]; ok && o.Borgmatic != nil {
-			groupLayers = append(groupLayers, o.Borgmatic)
-		}
-		groupLayers = append(groupLayers, state.Groups[name].LabelConfigs...)
-
-		groupLP := ""
-		hooks := hasSnapshotHooks(cfg.Borgmatic)
-		for _, m := range groupLayers {
-			// A group layer repeating the global path verbatim is inheritance
-			// restated, not a group-specific borg: generation skips it by the
-			// same equality, and letting it suppress the default gate here
-			// would leave that path validated nowhere.
-			if v, _ := m["local_path"].(string); v != "" && v != globalLP {
-				groupLP = v
-			}
-			hooks = hooks || hasSnapshotHooks(m)
-		}
-		if groupLP == "" {
-			defaultNeeded = true
-			defaultHooks = defaultHooks || hooks
-		}
-	}
-
-	// An undiscovered override without its own local_path names a group that
-	// will wake into the default, dragging its snapshot hooks onto its floor.
-	// Even a manager-only override (a period alone) implies the group.
-	names := make([]string, 0, len(overrides))
-	for name := range overrides {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if state != nil {
-			if _, discovered := state.Groups[name]; discovered {
-				continue
-			}
-		}
-		o := overrides[name]
-		lp := ""
+	hooks := hasSnapshotHooks(cfg.Borgmatic)
+	for _, o := range overrides {
 		if o.Borgmatic != nil {
-			lp, _ = o.Borgmatic["local_path"].(string)
+			hooks = hooks || hasSnapshotHooks(o.Borgmatic)
 		}
-		if lp == "" {
-			defaultNeeded = true
-			if o.Borgmatic != nil {
-				defaultHooks = defaultHooks || hasSnapshotHooks(o.Borgmatic)
+	}
+	if state != nil {
+		for _, grp := range state.Groups {
+			for _, lc := range grp.LabelConfigs {
+				hooks = hooks || hasSnapshotHooks(lc)
 			}
 		}
 	}
-
-	if !defaultNeeded {
-		return nil
+	if globalLP, _ := cfg.Borgmatic["local_path"].(string); globalLP != "" {
+		return []borgCommand{{command: globalLP, source: "manager.yaml local_path", snapshots: hooks}}
 	}
-	if globalLP != "" {
-		return []borgCommand{{command: globalLP, source: "manager.yaml local_path", snapshots: defaultHooks}}
-	}
-	return []borgCommand{{command: "borg", source: "PATH", snapshots: defaultHooks}}
+	return []borgCommand{{command: "borg", source: "PATH", snapshots: hooks}}
 }
 
 // hasSnapshotHooks reports whether one config map enables a btrfs/zfs/lvm hook.
