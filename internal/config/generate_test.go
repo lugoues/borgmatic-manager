@@ -1594,3 +1594,85 @@ func TestLocaleDependentDirectivesAreNotModelledInEnglishOnly(t *testing.T) {
 	assert.True(t, config.PatternOvermatchesForTest(
 		"Juli-*", "{now:%B}-other"))
 }
+
+// A group naming its own borg (override or label local_path) is judged per
+// group: one container's broken label refuses that group loudly instead of
+// failing the daemon's launch or every other group's cycle. The default borg
+// is deliberately not judged here; preflight owns it.
+func TestGroupBorgProblemsRefuseOnlyThatGroup(t *testing.T) {
+	newState := func() *models.BackupState {
+		st := models.NewBackupState()
+		st.AddVolume("healthy", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+		st.AddVolume("broken", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
+		return st
+	}
+	cfg := func() *config.ManagerConfig {
+		return &config.ManagerConfig{Borgmatic: map[string]interface{}{
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-healthy"}},
+		}}
+	}
+
+	t.Run("a missing label borg refuses the labeled group only", func(t *testing.T) {
+		st := newState()
+		st.Groups["broken"].LabelConfigs = append(st.Groups["broken"].LabelConfigs,
+			map[string]interface{}{"local_path": "/nonexistent/borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
+
+		g, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
+		g.SetBorgVersion(func(string) (string, error) { return "borg 1.4.5", nil })
+		meta, refusals, err := g.Generate(st)
+		require.NoError(t, err)
+
+		require.Contains(t, meta, "healthy", "the fleet keeps running")
+		require.NotContains(t, meta, "broken")
+		require.Len(t, refusals, 1)
+		assert.Equal(t, "broken", refusals[0].Group)
+		assert.Contains(t, refusals[0].Reason, "local_path")
+	})
+
+	t.Run("an old group borg with snapshot hooks is refused; without hooks it runs", func(t *testing.T) {
+		st := newState()
+		st.Groups["broken"].LabelConfigs = append(st.Groups["broken"].LabelConfigs,
+			map[string]interface{}{"local_path": "/opt/old/borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
+
+		g, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
+		g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
+		g.SetBorgVersion(func(path string) (string, error) {
+			if path == "/opt/old/borg" {
+				return "borg 1.2.0", nil
+			}
+			return "borg 1.4.5", nil
+		})
+		// Stat of /opt/old/borg fails in the sandbox; use a bare name so the
+		// lookPath seam resolves it instead.
+		st.Groups["broken"].LabelConfigs[0]["local_path"] = "old-borg"
+		g.SetBorgVersion(func(path string) (string, error) { return "borg 1.2.0", nil })
+
+		meta, refusals, err := g.Generate(st)
+		require.NoError(t, err)
+		require.Contains(t, meta, "broken", "below the floor without snapshot hooks is advisory")
+		require.Empty(t, refusals)
+
+		st2 := newState()
+		st2.Groups["broken"].LabelConfigs = append(st2.Groups["broken"].LabelConfigs,
+			map[string]interface{}{"local_path": "old-borg", "btrfs": map[string]interface{}{},
+				"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
+		g2, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
+		g2.SetBorgVersion(func(string) (string, error) { return "borg 1.2.0", nil })
+		meta, refusals, err = g2.Generate(st2)
+		require.NoError(t, err)
+		require.NotContains(t, meta, "broken", "the same old borg under snapshot hooks records snapshot paths")
+		require.Len(t, refusals, 1)
+	})
+
+	t.Run("a zero-exit borg reporting nothing is refused", func(t *testing.T) {
+		st := newState()
+		st.Groups["broken"].LabelConfigs = append(st.Groups["broken"].LabelConfigs,
+			map[string]interface{}{"local_path": "noop-borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
+		g, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
+		g.SetBorgVersion(func(string) (string, error) { return "", nil })
+		meta, refusals, err := g.Generate(st)
+		require.NoError(t, err)
+		require.NotContains(t, meta, "broken")
+		require.Len(t, refusals, 1)
+	})
+}

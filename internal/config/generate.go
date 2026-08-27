@@ -89,6 +89,9 @@ type Generator struct {
 
 	// lookPath is an exec.LookPath seam for testing host-dependency warnings.
 	lookPath func(string) (string, error)
+	// borgVersion probes a borg executable's version; a seam for tests.
+	// Results are memoized by file identity across all generators.
+	borgVersion func(path string) (string, error)
 
 	// keepOvermatched skips the archive-pattern overlap refusal (pass 3).
 	// Only RenderGroupForRestore sets it: an extract of an explicitly named
@@ -107,6 +110,7 @@ func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]GroupOverride, o
 		opts:           opts,
 		logger:         logger,
 		lookPath:       exec.LookPath,
+		borgVersion:    cachedBorgVersionProbe,
 	}
 }
 
@@ -376,6 +380,14 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		kept = append(kept, e)
 	}
 
+	// Pass 2.5: a group naming its own borg (local_path from an override or a
+	// label) is judged here, per group, so one container's broken label
+	// refuses that group loudly instead of failing the whole cycle or the
+	// daemon's launch. The DEFAULT borg is deliberately not judged here: its
+	// problems are global by nature and preflight and the scheduler's pre-run
+	// gate own them.
+	kept, refusals = g.refuseBrokenGroupBorgs(kept, refusals)
+
 	// Pass 3: refuse any group whose archive pattern claims a sibling's archives
 	// in a shared repository; its retention would prune them.
 	//
@@ -418,6 +430,74 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 
 	return kept, refusals, nil
 }
+
+// refuseBrokenGroupBorgs drops groups whose own borg (a non-default
+// local_path) is missing, cannot run, reports no version, or sits below the
+// snapshot floor while the group uses snapshot hooks. The floor stays
+// advisory without hooks, matching the default borg's rules.
+func (g *Generator) refuseBrokenGroupBorgs(kept []*pending, refusals []Refusal) ([]*pending, []Refusal) {
+	final := kept[:0]
+	for _, e := range kept {
+		lp, _ := e.final["local_path"].(string)
+		if lp == "" {
+			final = append(final, e)
+			continue
+		}
+		reason := g.groupBorgProblem(lp, hasSnapshotHooks(e.final))
+		if reason == "" {
+			final = append(final, e)
+			continue
+		}
+		g.logger.Error("skipping group: its configured borg is unusable",
+			"group", e.name, "local_path", lp, "reason", reason)
+		refusals = append(refusals, Refusal{
+			Group:             e.name,
+			Reason:            fmt.Sprintf("local_path %q: %s", lp, reason),
+			Repositories:      e.meta.Repositories,
+			RepositoriesKnown: e.meta.RepositoriesKnown,
+		})
+	}
+	return final, refusals
+}
+
+// groupBorgProblem describes why the borg at lp cannot serve a group, or ""
+// when it can.
+func (g *Generator) groupBorgProblem(lp string, snapshots bool) string {
+	path := lp
+	if !strings.ContainsRune(lp, os.PathSeparator) {
+		resolved, err := g.lookPath(lp)
+		if err != nil {
+			return "not found on PATH"
+		}
+		path = resolved
+	} else if info, err := os.Stat(lp); err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		return "not an executable file"
+	}
+	out, err := g.borgVersion(path)
+	fields := strings.Fields(out)
+	if err != nil || len(fields) == 0 {
+		return fmt.Sprintf("--version failed (output %q)", strings.TrimSpace(out))
+	}
+	// "borg 1.4.4". Plausibility first: borgVersionAtLeast deliberately
+	// passes unparseable tokens, and a zero-exit shim printing garbage would
+	// otherwise serve this group while creating nothing.
+	version := fields[len(fields)-1]
+	if !plausibleBorgVersion(version) {
+		return fmt.Sprintf("reports no usable version (output %q)", strings.TrimSpace(out))
+	}
+	if !borgVersionAtLeast(version, minGroupBorg) {
+		if snapshots {
+			return fmt.Sprintf("borg %s is older than %d.%d and this group uses snapshot hooks: archives would record snapshot paths", version, minGroupBorg[0], minGroupBorg[1])
+		}
+		g.logger.Warn("group borg is older than the snapshot floor (fine until snapshot hooks are enabled)",
+			"local_path", lp, "version", version)
+	}
+	return ""
+}
+
+// minGroupBorg mirrors preflight's borg floor: below 1.4 snapshot hooks
+// record snapshot paths in archives.
+var minGroupBorg = [3]int{1, 4, 0}
 
 // hookKeys are borgmatic options that execute shell commands as the user
 // running borgmatic (root under the system unit).
