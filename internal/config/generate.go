@@ -89,9 +89,6 @@ type Generator struct {
 
 	// lookPath is an exec.LookPath seam for testing host-dependency warnings.
 	lookPath func(string) (string, error)
-	// borgVersion probes a borg executable's version; a seam for tests.
-	// Results are memoized by file identity across all generators.
-	borgVersion func(path string) (string, error)
 
 	// keepOvermatched skips the archive-pattern overlap refusal (pass 3).
 	// Only RenderGroupForRestore sets it: an extract of an explicitly named
@@ -110,7 +107,6 @@ func NewGenerator(cfg *ManagerConfig, groupOverrides map[string]GroupOverride, o
 		opts:           opts,
 		logger:         logger,
 		lookPath:       exec.LookPath,
-		borgVersion:    cachedBorgVersionProbe,
 	}
 }
 
@@ -302,6 +298,23 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			base = DeepMerge(base, labelCfg)
 		}
 
+		// The borg binary is global-only: manager.yaml's local_path or "borg"
+		// on PATH, validated once at launch and each cycle. A group override
+		// or container label choosing its own borg is a footgun (and, from a
+		// label, root code execution for anyone who can label a container),
+		// so it is ignored loudly and the group runs on the default engine.
+		if globalLP, _ := g.cfg.Borgmatic["local_path"].(string); true {
+			if lp, _ := base["local_path"].(string); lp != "" && lp != globalLP {
+				g.logger.Warn("ignoring group-level local_path: the borg binary is global-only, set it in manager.yaml",
+					"group", groupName, "local_path", lp)
+				if globalLP != "" {
+					base["local_path"] = globalLP
+				} else {
+					delete(base, "local_path")
+				}
+			}
+		}
+
 		// 3. Build discovered data. Volume-named /./ paths are disabled when
 		// snapshot hooks are enabled: borg allows only one /./ marker per path.
 		runID, err := mintRunID()
@@ -423,20 +436,6 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		}
 	}
 
-	// Pass 4: a group naming its own borg (local_path from an override or a
-	// label) is judged here, per group, so one container's broken label
-	// refuses that group loudly instead of failing the whole cycle or the
-	// daemon's launch. The DEFAULT borg (including a global local_path) is
-	// deliberately not judged here: its problems are global by nature and
-	// preflight and the scheduler's pre-run gate own them.
-	//
-	// AFTER the overlap pass, not before: a borg-refused group's existing
-	// archives are still real, and removing it first would let a surviving
-	// sibling whose pattern claims them run retention over backups a transient
-	// local_path breakage briefly orphaned. Here it still counts as a victim;
-	// it only stops being a runner.
-	kept, refusals = g.refuseBrokenGroupBorgs(kept, refusals)
-
 	return kept, refusals, nil
 }
 
@@ -444,116 +443,6 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 // local_path) is missing, cannot run, reports no version, or sits below the
 // snapshot floor while the group uses snapshot hooks. The floor stays
 // advisory without hooks, matching the default borg's rules.
-func (g *Generator) refuseBrokenGroupBorgs(kept []*pending, refusals []Refusal) ([]*pending, []Refusal) {
-	globalLP, _ := g.cfg.Borgmatic["local_path"].(string)
-	// One raw probe per local_path within this plan, whatever mix of snapshot
-	// modes uses it: several groups sharing a hung borg must cost one probe
-	// timeout, not one each. The snapshot-specific floor decision is applied
-	// per group on the shared result.
-	probes := map[string]borgProbeResult{}
-	final := kept[:0]
-	for _, e := range kept {
-		lp, _ := e.final["local_path"].(string)
-		if lp == "" || lp == globalLP {
-			// Inherited from the global config: that is the default borg, and
-			// the launch and per-cycle gates own it.
-			final = append(final, e)
-			continue
-		}
-		probe, seen := probes[lp]
-		if !seen {
-			probe = g.probeGroupBorg(lp)
-			probes[lp] = probe
-		}
-		reason := g.judgeGroupBorg(lp, probe, hasSnapshotHooks(e.final))
-		if reason == "" {
-			final = append(final, e)
-			continue
-		}
-		g.logger.Error("skipping group: its configured borg is unusable",
-			"group", e.name, "local_path", lp, "reason", reason)
-		refusals = append(refusals, Refusal{
-			Group:             e.name,
-			Reason:            fmt.Sprintf("local_path %q: %s", lp, reason),
-			Repositories:      e.meta.Repositories,
-			RepositoriesKnown: e.meta.RepositoriesKnown,
-		})
-	}
-	return final, refusals
-}
-
-// borgProbeResult is one local_path's raw probe outcome, shared by every
-// group naming it within a plan.
-type borgProbeResult struct {
-	problem string // deterministic problems; version judged per group
-	version string
-	out     string
-	// transientProbeFailure marks an exec failure that may be momentary; the
-	// group runs and the run's own failure handling judges it.
-	transientProbeFailure bool
-}
-
-// probeGroupBorg resolves and probes one configured borg.
-func (g *Generator) probeGroupBorg(lp string) borgProbeResult {
-	path := lp
-	if !strings.ContainsRune(lp, os.PathSeparator) {
-		resolved, err := g.lookPath(lp)
-		if err != nil {
-			return borgProbeResult{problem: "not found on PATH"}
-		}
-		path = resolved
-	} else if info, err := os.Stat(lp); err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
-		return borgProbeResult{problem: "not an executable file"}
-	}
-	out, err := g.borgVersion(path)
-	if err != nil {
-		// Exec failure can be transient (load, a probe timeout). Refusing on
-		// it would drop a NEW group from the schedule entirely, and with no
-		// persisted record nothing re-wakes for it before the global period.
-		// Keeping the group hands the same broken borg to the actual run,
-		// which fails loudly through the normal recorded-failure path and its
-		// retry cadence. Deterministic problems (missing, not executable,
-		// zero-exit with no version) still refuse.
-		g.logger.Warn("group borg probe failed; letting the run judge it",
-			"local_path", lp, "error", err, "output", strings.TrimSpace(out))
-		return borgProbeResult{transientProbeFailure: true}
-	}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
-		return borgProbeResult{problem: "reports no usable version (empty output)"}
-	}
-	// "borg 1.4.4". Plausibility here: borgVersionAtLeast deliberately passes
-	// unparseable tokens, and a zero-exit shim printing garbage would
-	// otherwise serve groups while creating nothing.
-	version := fields[len(fields)-1]
-	if !plausibleBorgVersion(version) {
-		return borgProbeResult{problem: fmt.Sprintf("reports no usable version (output %q)", strings.TrimSpace(out))}
-	}
-	return borgProbeResult{version: version, out: out}
-}
-
-// judgeGroupBorg applies one group's requirements to a shared probe result.
-func (g *Generator) judgeGroupBorg(lp string, probe borgProbeResult, snapshots bool) string {
-	if probe.transientProbeFailure {
-		return ""
-	}
-	if probe.problem != "" {
-		return probe.problem
-	}
-	if !borgVersionAtLeast(probe.version, minGroupBorg) {
-		if snapshots {
-			return fmt.Sprintf("borg %s is older than %d.%d and this group uses snapshot hooks: archives would record snapshot paths", probe.version, minGroupBorg[0], minGroupBorg[1])
-		}
-		g.logger.Warn("group borg is older than the snapshot floor (fine until snapshot hooks are enabled)",
-			"local_path", lp, "version", probe.version)
-	}
-	return ""
-}
-
-// minGroupBorg mirrors preflight's borg floor: below 1.4 snapshot hooks
-// record snapshot paths in archives.
-var minGroupBorg = [3]int{1, 4, 0}
-
 // hookKeys are borgmatic options that execute shell commands as the user
 // running borgmatic (root under the system unit).
 var hookKeys = map[string]bool{

@@ -59,6 +59,3 @@ func SetSampleHostname(name string) func() {
 func ExtractRepoRefsForTest(final map[string]interface{}) ([]RepoRef, bool) {
 	return extractRepoRefs(final)
 }
-
-// SetBorgVersion replaces the borg --version probe for tests.
-func (g *Generator) SetBorgVersion(f func(string) (string, error)) { g.borgVersion = f }

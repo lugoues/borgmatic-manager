@@ -1595,182 +1595,33 @@ func TestLocaleDependentDirectivesAreNotModelledInEnglishOnly(t *testing.T) {
 		"Juli-*", "{now:%B}-other"))
 }
 
-// A group naming its own borg (override or label local_path) is judged per
-// group: one container's broken label refuses that group loudly instead of
-// failing the daemon's launch or every other group's cycle. The default borg
-// is deliberately not judged here; preflight owns it.
-func TestGroupBorgProblemsRefuseOnlyThatGroup(t *testing.T) {
-	newState := func() *models.BackupState {
-		st := models.NewBackupState()
-		st.AddVolume("healthy", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-		st.AddVolume("broken", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
-		return st
-	}
-	cfg := func() *config.ManagerConfig {
-		return &config.ManagerConfig{Borgmatic: map[string]interface{}{
-			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-healthy"}},
-		}}
-	}
+// The borg binary is global-only: a group override or label choosing its own
+// local_path is ignored with a warning and the group runs on the default
+// engine. From a label it would otherwise be root code execution for anyone
+// who can label a container.
+func TestGroupLevelLocalPathIsStripped(t *testing.T) {
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": "/evil/borg",
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
 
-	t.Run("a missing label borg refuses the labeled group only", func(t *testing.T) {
-		st := newState()
-		st.Groups["broken"].LabelConfigs = append(st.Groups["broken"].LabelConfigs,
-			map[string]interface{}{"local_path": "/nonexistent/borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
-
-		g, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
-		g.SetBorgVersion(func(string) (string, error) { return "borg 1.4.5", nil })
+	t.Run("with no global local_path the key is dropped", func(t *testing.T) {
+		g, outDir := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
 		meta, refusals, err := g.Generate(st)
 		require.NoError(t, err)
-
-		require.Contains(t, meta, "healthy", "the fleet keeps running")
-		require.NotContains(t, meta, "broken")
-		require.Len(t, refusals, 1)
-		assert.Equal(t, "broken", refusals[0].Group)
-		assert.Contains(t, refusals[0].Reason, "local_path")
-	})
-
-	t.Run("an old group borg with snapshot hooks is refused; without hooks it runs", func(t *testing.T) {
-		st := newState()
-		st.Groups["broken"].LabelConfigs = append(st.Groups["broken"].LabelConfigs,
-			map[string]interface{}{"local_path": "/opt/old/borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
-
-		g, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
-		g.SetLookPath(func(string) (string, error) { return "/usr/bin/found", nil })
-		g.SetBorgVersion(func(path string) (string, error) {
-			if path == "/opt/old/borg" {
-				return "borg 1.2.0", nil
-			}
-			return "borg 1.4.5", nil
-		})
-		// Stat of /opt/old/borg fails in the sandbox; use a bare name so the
-		// lookPath seam resolves it instead.
-		st.Groups["broken"].LabelConfigs[0]["local_path"] = "old-borg"
-		g.SetBorgVersion(func(path string) (string, error) { return "borg 1.2.0", nil })
-
-		meta, refusals, err := g.Generate(st)
-		require.NoError(t, err)
-		require.Contains(t, meta, "broken", "below the floor without snapshot hooks is advisory")
+		require.Contains(t, meta, "app", "the group keeps running, on the default borg")
 		require.Empty(t, refusals)
+		final := readGenerated(t, outDir, "app")
+		_, present := final["local_path"]
+		assert.False(t, present, "the label's borg must not reach the rendered config")
+	})
 
-		st2 := newState()
-		st2.Groups["broken"].LabelConfigs = append(st2.Groups["broken"].LabelConfigs,
-			map[string]interface{}{"local_path": "old-borg", "btrfs": map[string]interface{}{},
-				"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
-		g2, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
-		g2.SetBorgVersion(func(string) (string, error) { return "borg 1.2.0", nil })
-		meta, refusals, err = g2.Generate(st2)
+	t.Run("with a global local_path the global value wins", func(t *testing.T) {
+		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": "/opt/borg/borg"}}
+		g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+		_, _, err := g.Generate(st)
 		require.NoError(t, err)
-		require.NotContains(t, meta, "broken", "the same old borg under snapshot hooks records snapshot paths")
-		require.Len(t, refusals, 1)
+		assert.Equal(t, "/opt/borg/borg", readGenerated(t, outDir, "app")["local_path"])
 	})
-
-	t.Run("a zero-exit borg reporting nothing is refused", func(t *testing.T) {
-		st := newState()
-		st.Groups["broken"].LabelConfigs = append(st.Groups["broken"].LabelConfigs,
-			map[string]interface{}{"local_path": "noop-borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r-broken"}}})
-		g, _ := newTestGenerator(t, cfg(), nil, config.GeneratorOptions{})
-		g.SetBorgVersion(func(string) (string, error) { return "", nil })
-		meta, refusals, err := g.Generate(st)
-		require.NoError(t, err)
-		require.NotContains(t, meta, "broken")
-		require.Len(t, refusals, 1)
-	})
-}
-
-// A borg-refused group's archives are still real. It must stop being a
-// runner but stay a victim: a sibling whose pattern claims its archives is
-// refused too, or a transient local_path breakage would hand the sibling's
-// retention the orphaned backups.
-func TestBorgRefusedGroupsRemainOverlapVictims(t *testing.T) {
-	defer config.SetSampleHostname("backup01")()
-
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.AddVolume("app-prod", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
-	// app-prod's own borg is broken this cycle.
-	st.Groups["app-prod"].LabelConfigs = append(st.Groups["app-prod"].LabelConfigs,
-		map[string]interface{}{"local_path": "broken-borg"})
-
-	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{
-		"repositories": []interface{}{map[string]interface{}{"path": "/mnt/shared"}},
-	}}
-
-	g, _ := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
-	g.SetLookPath(func(bin string) (string, error) {
-		if bin == "broken-borg" {
-			return "", os.ErrNotExist
-		}
-		return "/usr/bin/found", nil
-	})
-	meta, refusals, err := g.Generate(st)
-	require.NoError(t, err)
-
-	require.NotContains(t, meta, "app",
-		"app's pattern claims app-prod's archives; those archives exist regardless of app-prod's borg")
-	require.NotContains(t, meta, "app-prod")
-	require.Len(t, refusals, 2)
-	reasons := refusals[0].Reason + " | " + refusals[1].Reason
-	assert.Contains(t, reasons, "archive pattern")
-	assert.Contains(t, reasons, "local_path")
-}
-
-// Groups sharing one hung borg must cost one probe, whatever mix of snapshot
-// modes uses it; the floor decision is per group on the shared result.
-func TestSharedGroupBorgIsProbedOncePerPlan(t *testing.T) {
-	st := models.NewBackupState()
-	st.AddVolume("plain", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.AddVolume("snappy", models.VolumeInfo{Name: "v2", HostPath: "/mnt/v2"})
-	st.Groups["plain"].LabelConfigs = append(st.Groups["plain"].LabelConfigs,
-		map[string]interface{}{"local_path": "shared-borg", "repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
-	st.Groups["snappy"].LabelConfigs = append(st.Groups["snappy"].LabelConfigs,
-		map[string]interface{}{"local_path": "shared-borg", "btrfs": map[string]interface{}{},
-			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r2"}}})
-
-	g, _ := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
-	probes := 0
-	g.SetBorgVersion(func(string) (string, error) {
-		probes++
-		return "borg 1.2.0", nil
-	})
-	meta, refusals, err := g.Generate(st)
-	require.NoError(t, err)
-	assert.Equal(t, 1, probes, "one probe serves every group naming the path")
-	require.Contains(t, meta, "plain", "below the floor without hooks is advisory")
-	require.NotContains(t, meta, "snappy", "the same result fails the hooked group's floor")
-	require.Len(t, refusals, 1)
-}
-
-// The restore-only render bypasses exactly the overlap refusal; a broken
-// group borg is as unusable for a restore as for a backup.
-func TestRenderGroupForRestoreStillJudgesTheGroupBorg(t *testing.T) {
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
-		map[string]interface{}{"local_path": "gone-borg",
-			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
-
-	g, _ := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
-	g.SetLookPath(func(string) (string, error) { return "", os.ErrNotExist })
-	yamlStr, _, reason, err := g.RenderGroupForRestore(st, "app")
-	require.NoError(t, err)
-	assert.Empty(t, yamlStr)
-	assert.Contains(t, reason, "local_path", "a no-op borg must not run a merge restore either")
-}
-
-// An exec failure probing a group's borg may be momentary; refusing would
-// drop a NEW group from the schedule with nothing to re-wake it before the
-// global period. The group runs and the run's own failure handling judges it.
-func TestTransientGroupBorgProbeFailureDoesNotRefuse(t *testing.T) {
-	st := models.NewBackupState()
-	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
-		map[string]interface{}{"local_path": "flaky-borg",
-			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
-
-	g, _ := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
-	g.SetBorgVersion(func(string) (string, error) { return "", fmt.Errorf("timeout") })
-	meta, refusals, err := g.Generate(st)
-	require.NoError(t, err)
-	require.Contains(t, meta, "app", "the run will judge the flaky borg and record a normal failure")
-	require.Empty(t, refusals)
 }
