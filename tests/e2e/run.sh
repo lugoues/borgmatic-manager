@@ -90,6 +90,18 @@ stack_up() {
       probe_ready "$c" >/dev/null 2>&1 || pending="$pending $c"
     done
     [ -z "$pending" ] && return 0
+    # A container that already exited will never become ready; waiting out
+    # the deadline on it would just delay the same failure.
+    for c in $pending; do
+      state=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)
+      case "$state" in
+        exited|dead|missing)
+          echo "=== container $c is $state; it will never become ready ===" >&2
+          stack_dump "$@"
+          fail "stack failed to become ready"
+          ;;
+      esac
+    done
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "=== stack not ready after 300s; pending:$pending ===" >&2
       stack_dump "$@"

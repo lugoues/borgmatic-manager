@@ -11,7 +11,8 @@ snapshot-consistent backups — no per-service config files.
    `borgmatic-manager.*` labels (periodically and on create/remove events);
    a labeled container's named volumes and databases join its backup group
 2. **Generate** — compiles per-group borgmatic YAML from labels + your defaults
-3. **Backup** — runs host-installed borgmatic per group:
+3. **Backup** — runs borgmatic (the manager's own toolchain, or a host
+   install) per group:
    `create prune compact check`; database dumps run in short-lived helper
    containers joined to the database's network namespace
 4. **Snapshots** — on btrfs/zfs/LVM hosts, borgmatic's built-in hooks snapshot
@@ -26,7 +27,7 @@ snapshot-consistent backups — no per-service config files.
    │  scheduler ──► discover ──► generate ──► run  │
    └──────────────────────────────────────────┼────┘
                                               ▼
-                                    borgmatic (host)
+                              borgmatic (toolchain or host)
                                     ├─ btrfs/zfs/lvm snapshots
                                     ├─ borg create/prune/check
                                     └─ database dumps
@@ -52,9 +53,11 @@ At launch the manager checks for a usable borgmatic and, if the host has none �
 not installed, a broken shim (a pipx upgrade that rebuilt its environments), or
 one below the version floor — it provisions its own: a pinned
 [uv](https://docs.astral.sh/uv/) (checksum-verified static binary) installs a
-pinned borgmatic with a uv-managed Python under
-`/var/lib/borgmatic-manager/toolchain/`. Nothing there touches the host's
-Python, so no host package upgrade can break the manager's backups.
+pinned borgmatic with a uv-managed Python under `<state-dir>/toolchain/`
+(`/var/lib/borgmatic-manager/toolchain/` for the system unit,
+`~/.local/state/borgmatic-manager/toolchain/` for the rootless user unit).
+Nothing there touches the host's Python, so no host package upgrade can break
+the manager's backups.
 
 - A healthy host install is respected: nothing is downloaded behind its back.
   Once a toolchain exists it is preferred, so the borgmatic in use stays stable.
