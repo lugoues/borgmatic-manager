@@ -1008,7 +1008,7 @@ func runBorgmaticPassthrough(args []string) error {
 		logger.Warn("group is offline: its container is not running, using the last cached config"+lastSeen+"; membership may be stale", "group", group)
 	}
 
-	borgmaticPath, err := resolveBorgmatic(e.cfg, e.toolchainDir())
+	borgmaticPath, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir())
 	if err != nil {
 		return err
 	}
@@ -1374,7 +1374,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		meta[group] = gm
 	}
 
-	borgmaticPath, err := resolveBorgmatic(e.cfg, e.toolchainDir())
+	borgmaticPath, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir())
 	if err != nil {
 		return err
 	}

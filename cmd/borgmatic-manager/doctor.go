@@ -138,7 +138,7 @@ func runDoctor(ctx context.Context) error {
 
 	// borgmatic binary and version floor.
 	borgmaticPath := ""
-	if path, err := resolveBorgmatic(e.cfg, e.toolchainDir()); err != nil {
+	if path, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir()); err != nil {
 		r.fail("borgmatic", err.Error())
 	} else {
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
@@ -177,8 +177,7 @@ func runDoctor(ctx context.Context) error {
 
 	// borg is required outright: without the engine nothing runs. Every borg
 	// the configuration names is checked (local_path overrides included); the
-	// version floor is hard only when snapshot hooks are configured.
-	snapshots := snapshotHooksConfigured(e.cfg, e.groupOverrides)
+	// version floor is hard only for a borg some snapshot-hook group invokes.
 	for _, bc := range borgCommands(e.cfg, e.groupOverrides) {
 		borgPath, err := resolveBorgCommand(bc.command)
 		if err != nil {
@@ -193,8 +192,8 @@ func runDoctor(ctx context.Context) error {
 			switch {
 			case versionAtLeast(version, minBorg):
 				r.pass("borg", fmt.Sprintf("%s (%s, %s)", borgPath, version, bc.source))
-			case snapshots:
-				r.fail("borg", fmt.Sprintf("%s (%s) is older than %d.%d and snapshot hooks are configured: archives would record snapshot paths", version, bc.source, minBorg[0], minBorg[1]))
+			case bc.snapshots:
+				r.fail("borg", fmt.Sprintf("%s (%s) is older than %d.%d and a snapshot-hook group uses it: archives would record snapshot paths", version, bc.source, minBorg[0], minBorg[1]))
 			default:
 				r.warn("borg", fmt.Sprintf("%s (%s) is older than %d.%d (fine until snapshot hooks are enabled)", version, bc.source, minBorg[0], minBorg[1]))
 			}

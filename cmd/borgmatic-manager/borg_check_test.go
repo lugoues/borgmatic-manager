@@ -53,12 +53,12 @@ func TestCheckBorgHonorsLocalPath(t *testing.T) {
 		t.Setenv("PATH", t.TempDir()) // empty: no "borg" anywhere on PATH
 		lp := fakeBorg(t, t.TempDir(), "1.4.5")
 		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": lp}}
-		assert.NoError(t, checkBorg(context.Background(), cfg, nil, false))
+		assert.NoError(t, checkBorg(context.Background(), cfg, nil))
 	})
 
 	t.Run("a missing local_path names its source", func(t *testing.T) {
 		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": "/nonexistent/borg"}}
-		err := checkBorg(context.Background(), cfg, nil, false)
+		err := checkBorg(context.Background(), cfg, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "manager.yaml local_path")
 	})
@@ -69,14 +69,14 @@ func TestCheckBorgHonorsLocalPath(t *testing.T) {
 		overrides := map[string]config.GroupOverride{
 			"g": {Borgmatic: map[string]interface{}{"local_path": lp}},
 		}
-		err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, false)
+		err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides)
 		require.Error(t, err, "groups without the override still invoke the default borg")
 		assert.Contains(t, err.Error(), "PATH")
 	})
 
 	t.Run("missing default borg fails outright", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
-		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, false)
+		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil)
 		require.Error(t, err)
 	})
 
@@ -84,7 +84,33 @@ func TestCheckBorgHonorsLocalPath(t *testing.T) {
 		dir := t.TempDir()
 		fakeBorg(t, dir, "1.2.0")
 		t.Setenv("PATH", dir)
-		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, false))
-		require.Error(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, true))
+		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil))
+		hooked := &config.ManagerConfig{Borgmatic: map[string]interface{}{"btrfs": map[string]interface{}{}}}
+		require.Error(t, checkBorg(context.Background(), hooked, nil))
+	})
+
+	// One group's snapshot hooks must not harden the floor for a different
+	// group's private borg: below-1.4 is supported without snapshot hooks, and
+	// a mixed configuration is valid.
+	t.Run("the floor is scoped to the groups using each borg", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		newBorg := fakeBorg(t, t.TempDir(), "1.4.5")
+		oldDir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(oldDir, "borg-old"), []byte("#!/bin/sh\necho borg 1.2.0\n"), 0o755))
+		oldBorg := filepath.Join(oldDir, "borg-old")
+
+		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": newBorg}}
+		overrides := map[string]config.GroupOverride{
+			"snappy": {Borgmatic: map[string]interface{}{"btrfs": map[string]interface{}{}}},
+			"legacy": {Borgmatic: map[string]interface{}{"local_path": oldBorg}},
+		}
+		require.NoError(t, checkBorg(context.Background(), cfg, overrides),
+			"the old borg belongs to a snapshot-free group; only the default borg carries the snapshot floor")
+
+		overrides["legacy"] = config.GroupOverride{Borgmatic: map[string]interface{}{
+			"local_path": oldBorg, "zfs": map[string]interface{}{},
+		}}
+		require.Error(t, checkBorg(context.Background(), cfg, overrides),
+			"the same old borg with hooks in its own group is fatal")
 	})
 }

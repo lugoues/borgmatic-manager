@@ -102,21 +102,21 @@ func TestResolveBorgmaticPrefersToolchainOverPath(t *testing.T) {
 	hostWith(t, "#!/bin/sh\necho 2.1.7\n")
 	t.Setenv("BORGMATIC_PATH", "")
 
-	p, err := resolveBorgmatic(&config.ManagerConfig{}, filepath.Join(stateDir, "toolchain"))
+	p, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, filepath.Join(stateDir, "toolchain"))
 	require.NoError(t, err)
 	assert.Equal(t, tp, p)
 
 	t.Run("explicit config path still wins", func(t *testing.T) {
 		cfg := &config.ManagerConfig{}
 		cfg.Manager.BorgmaticPath = "/opt/pin/borgmatic"
-		p, err := resolveBorgmatic(cfg, filepath.Join(stateDir, "toolchain"))
+		p, err := resolveBorgmatic(context.Background(), cfg, filepath.Join(stateDir, "toolchain"))
 		require.NoError(t, err)
 		assert.Equal(t, "/opt/pin/borgmatic", p)
 	})
 
 	t.Run("no toolchain falls through to PATH", func(t *testing.T) {
 		hp := hostWith(t, "#!/bin/sh\necho 2.1.7\n")
-		p, err := resolveBorgmatic(&config.ManagerConfig{}, filepath.Join(t.TempDir(), "toolchain"))
+		p, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, filepath.Join(t.TempDir(), "toolchain"))
 		require.NoError(t, err)
 		assert.Equal(t, hp, p)
 	})

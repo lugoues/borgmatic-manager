@@ -62,7 +62,7 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	// uses by hand against the same repositories). Checked before borgmatic so
 	// a missing borg fails cleanly instead of provisioning a toolchain for a
 	// deployment that cannot run anyway.
-	if err := checkBorg(ctx, e.cfg, e.groupOverrides, snapshotHooksConfigured(e.cfg, e.groupOverrides)); err != nil {
+	if err := checkBorg(ctx, e.cfg, e.groupOverrides); err != nil {
 		return nil, err
 	}
 
@@ -114,10 +114,11 @@ func detectContainerCLI(cfg *config.ManagerConfig, socketPath string) string {
 
 // checkBorg fails the launch when a borg the generated configs will invoke is
 // absent: without the engine nothing can back up or restore, and discovering
-// that one failed cycle at a time serves nobody. The version floor stays
-// advisory unless snapshot hooks are configured (archive path recording is
-// silently wrong below it).
-func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[string]config.GroupOverride, snapshotsConfigured bool) error {
+// that one failed cycle at a time serves nobody. The version floor is hard
+// only for a borg that some snapshot-hook-using group actually invokes
+// (archive path recording is silently wrong below it); a snapshot-free group
+// may point local_path at an older borg without stopping everything else.
+func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[string]config.GroupOverride) error {
 	for _, bc := range borgCommands(cfg, overrides) {
 		borgPath, err := resolveBorgCommand(bc.command)
 		if err != nil {
@@ -130,21 +131,23 @@ func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[str
 			borgVersion := fields[len(fields)-1]
 			if !versionAtLeast(borgVersion, minBorg) {
 				msg := fmt.Sprintf("borg %s (%s) is older than %d.%d: snapshot-hook archives would record snapshot paths instead of original paths", borgVersion, bc.source, minBorg[0], minBorg[1])
-				if snapshotsConfigured {
+				if bc.snapshots {
 					return fmt.Errorf("%s, upgrade borg or disable the snapshot hooks", msg)
 				}
-				slog.Warn(msg + " (not fatal: no snapshot hooks configured)")
+				slog.Warn(msg + " (not fatal: no group using this borg has snapshot hooks)")
 			}
 		}
 	}
 	return nil
 }
 
-// borgCommand is one borg executable the generated configs will invoke, and
-// where its name came from (for error messages).
+// borgCommand is one borg executable the generated configs will invoke, where
+// its name came from (for error messages), and whether any group invoking it
+// has snapshot hooks (which hardens the version floor for it).
 type borgCommand struct {
-	command string
-	source  string
+	command   string
+	source    string
+	snapshots bool
 }
 
 // borgCommands lists every borg the configuration names: the default "borg"
@@ -153,20 +156,42 @@ type borgCommand struct {
 // set local_path, but they are discovered per cycle and cannot be seen here;
 // those fail at run time like any other label mistake.
 func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOverride) []borgCommand {
+	globalHooks := hasSnapshotHooks(cfg.Borgmatic)
+
 	var cmds []borgCommand
-	seen := map[string]bool{}
-	add := func(command, source string) {
-		if command == "" || seen[command] {
+	index := map[string]int{}
+	add := func(command, source string, snapshots bool) {
+		if command == "" {
 			return
 		}
-		seen[command] = true
-		cmds = append(cmds, borgCommand{command: command, source: source})
+		if i, ok := index[command]; ok {
+			// Two configs naming one borg: the floor is hard if either side
+			// uses snapshot hooks.
+			cmds[i].snapshots = cmds[i].snapshots || snapshots
+			return
+		}
+		index[command] = len(cmds)
+		cmds = append(cmds, borgCommand{command: command, source: source, snapshots: snapshots})
+	}
+
+	// The default borg serves every group without its own local_path,
+	// including groups discovered later from labels, so its snapshot scope is
+	// "the global config, or any override that keeps the default borg".
+	defaultHooks := globalHooks
+	for _, o := range overrides {
+		if o.Borgmatic == nil {
+			continue
+		}
+		if lp, _ := o.Borgmatic["local_path"].(string); lp == "" && hasSnapshotHooks(o.Borgmatic) {
+			defaultHooks = true
+		}
 	}
 	if global, _ := cfg.Borgmatic["local_path"].(string); global != "" {
-		add(global, "manager.yaml local_path")
+		add(global, "manager.yaml local_path", defaultHooks)
 	} else {
-		add("borg", "PATH")
+		add("borg", "PATH", defaultHooks)
 	}
+
 	names := make([]string, 0, len(overrides))
 	for name := range overrides {
 		names = append(names, name)
@@ -175,11 +200,21 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 	for _, name := range names {
 		if o := overrides[name]; o.Borgmatic != nil {
 			if lp, _ := o.Borgmatic["local_path"].(string); lp != "" {
-				add(lp, "group "+name+" local_path")
+				add(lp, "group "+name+" local_path", globalHooks || hasSnapshotHooks(o.Borgmatic))
 			}
 		}
 	}
 	return cmds
+}
+
+// hasSnapshotHooks reports whether one config map enables a btrfs/zfs/lvm hook.
+func hasSnapshotHooks(m map[string]interface{}) bool {
+	for _, h := range config.SnapshotHookKeys {
+		if _, ok := m[h]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveBorgCommand resolves a configured borg the way borgmatic will: a
@@ -270,37 +305,25 @@ func explicitBorgmaticPath(cfg *config.ManagerConfig) string {
 
 // resolveBorgmatic finds the borgmatic binary for commands that must not
 // provision (restore, config rendering, passthrough): the explicit override,
-// then an already-provisioned toolchain, then the host. The daemon and
+// then an already-provisioned toolchain, then the host. The toolchain
+// candidate is probed before it is preferred: an urgent restore must fall
+// through to a working host install rather than fail on a toolchain that
+// merely exists, and only the next daemon launch repairs it. The daemon and
 // one-shot runs go through launchBorgmatic instead, which can provision.
-func resolveBorgmatic(cfg *config.ManagerConfig, toolchainDir string) (string, error) {
+func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainDir string) (string, error) {
 	if p := explicitBorgmaticPath(cfg); p != "" {
 		return p, nil
 	}
 	if p, ok := toolchain.CurrentBorgmatic(toolchainDir); ok {
-		return p, nil
+		if _, err := commandOutput(ctx, p, "--version"); err == nil {
+			return p, nil
+		}
+		slog.Warn("toolchain borgmatic is broken; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)
 	}
 	if p, ok := hostBorgmaticPath(); ok {
 		return p, nil
 	}
 	return "", fmt.Errorf("borgmatic not found: start the daemon or a run once to let the manager provision its own, install it (e.g. 'uv tool install borgmatic'), or set manager.borgmatic_path / BORGMATIC_PATH")
-}
-
-// snapshotHooksConfigured reports whether any btrfs/zfs/lvm hook appears in
-// the global borgmatic defaults or any per-group override.
-func snapshotHooksConfigured(cfg *config.ManagerConfig, overrides map[string]config.GroupOverride) bool {
-	for _, h := range config.SnapshotHookKeys {
-		if _, ok := cfg.Borgmatic[h]; ok {
-			return true
-		}
-	}
-	for _, override := range overrides {
-		for _, h := range config.SnapshotHookKeys {
-			if _, ok := override.Borgmatic[h]; ok {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func commandOutput(ctx context.Context, name string, args ...string) (string, error) {
