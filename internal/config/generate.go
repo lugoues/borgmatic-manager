@@ -302,17 +302,20 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 		// on PATH, validated once at launch and each cycle. A group override
 		// or container label choosing its own borg is a footgun (and, from a
 		// label, root code execution for anyone who can label a container),
-		// so it is ignored loudly and the group runs on the default engine.
-		if globalLP, _ := g.cfg.Borgmatic["local_path"].(string); true {
-			if lp, _ := base["local_path"].(string); lp != "" && lp != globalLP {
+		// so whatever a group layer merged in, string, empty, or null, is
+		// normalized back to the global value and warned about. An empty or
+		// null override would otherwise hand the group a config borgmatic
+		// cannot run at all.
+		if globalLP, _ := g.cfg.Borgmatic["local_path"].(string); globalLP != "" {
+			if v, ok := base["local_path"]; !ok || v != any(globalLP) {
 				g.logger.Warn("ignoring group-level local_path: the borg binary is global-only, set it in manager.yaml",
-					"group", groupName, "local_path", lp)
-				if globalLP != "" {
-					base["local_path"] = globalLP
-				} else {
-					delete(base, "local_path")
-				}
+					"group", groupName, "local_path", fmt.Sprint(v))
+				base["local_path"] = globalLP
 			}
+		} else if v, ok := base["local_path"]; ok {
+			g.logger.Warn("ignoring group-level local_path: the borg binary is global-only, set it in manager.yaml",
+				"group", groupName, "local_path", fmt.Sprint(v))
+			delete(base, "local_path")
 		}
 
 		// 3. Build discovered data. Volume-named /./ paths are disabled when

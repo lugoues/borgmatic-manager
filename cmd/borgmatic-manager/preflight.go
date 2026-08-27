@@ -431,6 +431,13 @@ func explicitBorgmaticPath(cfg *config.ManagerConfig) string {
 // one-shot runs go through launchBorgmatic instead, which can provision.
 func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainDir string) (string, error) {
 	if p := explicitBorgmaticPath(cfg); p != "" {
+		// Probed like every other candidate: a pinned launcher that decayed
+		// into a zero-exit no-op would otherwise let a merge restore report
+		// "restore complete" having extracted nothing. The operator pinned
+		// this path, so a broken pin is an error, never a silent fallback.
+		if out, err := commandOutput(ctx, p, "--version"); err != nil || !toolchain.PlausibleReportedVersion(out) {
+			return "", fmt.Errorf("borgmatic at %s (manager.borgmatic_path / BORGMATIC_PATH) is not usable: %v (output %q); fix the override", p, err, strings.TrimSpace(out))
+		}
 		return p, nil
 	}
 	if p, ok := toolchain.CurrentBorgmatic(toolchainDir); ok {

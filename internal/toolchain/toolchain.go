@@ -273,10 +273,23 @@ func (t *Toolchain) healthy(ctx context.Context, p string) bool {
 	return true
 }
 
-// plausibleVersion reports whether v looks like a release version: a real
-// borgmatic always prints one, and anything that does not is not borgmatic.
+// plausibleVersion reports whether v looks like a release version: at least
+// two dot-separated numeric components ("2.1.7", and beta forms like
+// "2.0.0b23" whose numeric prefix qualifies). "1.x" is not a version, and a
+// shim printing one must not ride versionAtLeast's unparseable-passes rule.
 func plausibleVersion(v string) bool {
-	return v != "" && v[0] >= '0' && v[0] <= '9' && strings.ContainsRune(v, '.')
+	i := 0
+	for i < len(v) && v[i] >= '0' && v[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(v) || v[i] != '.' {
+		return false
+	}
+	j := i + 1
+	for j < len(v) && v[j] >= '0' && v[j] <= '9' {
+		j++
+	}
+	return j > i+1
 }
 
 // PlausibleReportedVersion reports whether --version output carries a version

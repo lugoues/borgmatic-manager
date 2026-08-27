@@ -120,12 +120,23 @@ func TestResolveBorgmaticPrefersToolchainOverPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, tp, p)
 
-	t.Run("explicit config path still wins", func(t *testing.T) {
+	t.Run("explicit config path still wins, once it proves it runs", func(t *testing.T) {
+		pin := filepath.Join(t.TempDir(), "borgmatic")
+		require.NoError(t, os.WriteFile(pin, []byte("#!/bin/sh\necho 2.1.7\n"), 0o755))
 		cfg := &config.ManagerConfig{}
-		cfg.Manager.BorgmaticPath = "/opt/pin/borgmatic"
+		cfg.Manager.BorgmaticPath = pin
 		p, err := resolveBorgmatic(context.Background(), cfg, filepath.Join(stateDir, "toolchain"))
 		require.NoError(t, err)
-		assert.Equal(t, "/opt/pin/borgmatic", p)
+		assert.Equal(t, pin, p)
+	})
+
+	t.Run("a decayed explicit pin errors instead of no-op restoring", func(t *testing.T) {
+		pin := filepath.Join(t.TempDir(), "borgmatic")
+		require.NoError(t, os.WriteFile(pin, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		cfg := &config.ManagerConfig{}
+		cfg.Manager.BorgmaticPath = pin
+		_, err := resolveBorgmatic(context.Background(), cfg, filepath.Join(stateDir, "toolchain"))
+		require.Error(t, err, "the operator pinned it; a broken pin is an error, never a silent fallback")
 	})
 
 	t.Run("no toolchain falls through to PATH", func(t *testing.T) {
