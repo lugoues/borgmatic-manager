@@ -753,3 +753,49 @@ func TestRepositoryInventoryOmitsGroupsItCouldNotRead(t *testing.T) {
 		"absence is how this map says the inventory is unknown")
 	assert.NotContains(t, got, "refused-unreadable")
 }
+
+// A transient pre-run gate failure before a NEW group's first record must not
+// strand the first backup for a full period: nothing else exists for NextWake
+// to schedule around, so the skipped cycle sets its own bounded retry clock.
+func TestNextWake_PreRunGateFailureRetriesOnBoundedInterval(t *testing.T) {
+	runner := newMockGroupRunner()
+	store := testStore(t)
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+	s := dueTestScheduler(runner, store, t0)
+	s.discoverFunc = func(ctx context.Context) (*models.BackupState, error) {
+		return singleGroupState(), nil
+	}
+	s.generateFunc = func(st *models.BackupState) (map[string]config.GroupRunMeta, error) {
+		return metaFor(st), nil
+	}
+
+	gateHealthy := false
+	s.SetPreRunCheck(func(ctx context.Context, bs *models.BackupState) error {
+		if !gateHealthy {
+			return errors.New("borg probe timed out")
+		}
+		return nil
+	})
+
+	if err := s.RunCycle(context.Background()); err == nil {
+		t.Fatal("a failing pre-run check must surface as a cycle error")
+	}
+	if len(runner.getCalls()) != 0 {
+		t.Fatal("no group may run while the gate is failing")
+	}
+	if got := s.NextWake(); got != preRunRetryInterval {
+		t.Fatalf("a gate-skipped cycle must retry in preRunRetryInterval (%v), got %v (a full period strands a new group's first backup)", preRunRetryInterval, got)
+	}
+
+	// The gate recovers: the retry clock clears and the cycle runs the group.
+	gateHealthy = true
+	if err := s.RunCycle(context.Background()); err != nil {
+		t.Fatalf("recovered cycle failed: %v", err)
+	}
+	if len(runner.getCalls()) != 1 {
+		t.Fatal("the recovered cycle must run the group")
+	}
+	if got := s.NextWake(); got != time.Hour {
+		t.Fatalf("after recovery the retry clock must clear and the period resume, got %v", got)
+	}
+}

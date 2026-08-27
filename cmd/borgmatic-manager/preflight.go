@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -422,6 +423,12 @@ func sanitizedProbe(ctx context.Context, bin string) (string, error) {
 	}
 	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.Output()
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.Process != nil {
+		// The delay fired because a descendant held the pipes past the
+		// parent's exit; the context never expired, so Cancel never ran.
+		// Sweep the group before it becomes an orphan-per-cycle.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	return string(out), err
 }
 
@@ -508,6 +515,12 @@ func commandOutput(ctx context.Context, name string, args ...string) (string, er
 	}
 	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.Output()
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.Process != nil {
+		// The delay fired because a descendant held the pipes past the
+		// parent's exit; the context never expired, so Cancel never ran.
+		// Sweep the group before it becomes an orphan-per-cycle.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	return string(out), err
 }
 

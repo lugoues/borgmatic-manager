@@ -4,7 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -227,5 +231,36 @@ func TestMalformedGlobalLocalPathFailsLaunch(t *testing.T) {
 		err := checkBorg(context.Background(), cfg, nil, nil)
 		require.Error(t, err, "local_path %#v must be rejected", bad)
 		assert.Contains(t, err.Error(), "must be a non-empty string")
+	}
+}
+
+// A launcher that exits cleanly but leaves a background descendant holding
+// stdout never trips the context (so Cancel never runs); WaitDelay merely
+// releases the pipe wait. The probe must still sweep the process group, or
+// this per-cycle gate leaks one orphan per failed cycle.
+func TestBorgProbeSweepsDescendantAfterWaitDelay(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	// The descendant inherits stdout and would hold the probe's pipe open for
+	// minutes; the parent exits at once. PATH keeps the host's sleep visible.
+	script := "#!/bin/sh\nsleep 300 &\necho $! > " + pidFile + "\necho borg 1.4.5\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "borg"), []byte(script), 0o755))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	require.Error(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil),
+		"a probe whose output never closes is a failed probe")
+
+	raw, err := os.ReadFile(pidFile)
+	require.NoError(t, err, "the launcher must have run and recorded its child")
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, err)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatal("the descendant survived the probe: each failed cycle would leak one")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

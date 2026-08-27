@@ -139,7 +139,11 @@ func New(root string, logger *slog.Logger) *Toolchain {
 				return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			}
 			cmd.WaitDelay = 10 * time.Second
-			return cmd.CombinedOutput()
+			out, err := cmd.CombinedOutput()
+			if errors.Is(err, exec.ErrWaitDelay) && cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			return out, err
 		},
 		binVersion: func(ctx context.Context, bin string) (string, error) {
 			cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- probing the binary this package just installed
@@ -163,6 +167,11 @@ func New(root string, logger *slog.Logger) *Toolchain {
 			// a bounded probe back into an unbounded one.
 			cmd.WaitDelay = 5 * time.Second
 			out, err := cmd.CombinedOutput()
+			if errors.Is(err, exec.ErrWaitDelay) && cmd.Process != nil {
+				// A descendant held the pipes past the parent's exit; the
+				// context never expired, so Cancel never ran.
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
 			return strings.TrimSpace(string(out)), err
 		},
 	}

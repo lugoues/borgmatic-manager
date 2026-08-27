@@ -64,6 +64,11 @@ type Scheduler struct {
 	mu          sync.Mutex
 	lastAttempt map[string]time.Time
 
+	// preRunRetry, when set, is when a failed pre-run check should be retried.
+	// A transient borg probe failure before a NEW group's first record would
+	// otherwise leave nothing for NextWake to schedule around, delaying the
+	// first backup by the full global period.
+	preRunRetry time.Time
 	// lockedRetry holds per-group retry times for lock-blocked runs, so NextWake
 	// wakes in lockRetryInterval rather than a full period.
 	lockedRetry map[string]time.Time
@@ -485,8 +490,14 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 
 	if s.preRunCheck != nil {
 		if checkErr := s.preRunCheck(ctx, backupState); checkErr != nil {
-			return fmt.Errorf("pre-run check failed; skipping this cycle: %w", checkErr)
+			s.mu.Lock()
+			s.preRunRetry = s.now().Add(preRunRetryInterval)
+			s.mu.Unlock()
+			return fmt.Errorf("pre-run check failed; skipping this cycle (retrying in %s): %w", preRunRetryInterval, checkErr)
 		}
+		s.mu.Lock()
+		s.preRunRetry = time.Time{}
+		s.mu.Unlock()
 	}
 
 	meta, err := s.generateFunc(backupState)
@@ -504,6 +515,10 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 
 // NextWake returns the sleep until the earliest group comes due, clamped to
 // [minWake, period]; with no history it is one full period.
+// preRunRetryInterval is how soon a cycle skipped by the pre-run gate is
+// retried.
+const preRunRetryInterval = 5 * time.Minute
+
 func (s *Scheduler) NextWake() time.Duration {
 	if s.store == nil || s.period <= 0 {
 		return s.period
@@ -525,6 +540,13 @@ func (s *Scheduler) NextWake() time.Duration {
 	// period out (the optimistic attempt mark above would otherwise hide it).
 	for _, retry := range s.lockedRetry {
 		if d := retry.Sub(now); d < wake {
+			wake = d
+		}
+	}
+	// Same for a cycle skipped by the pre-run gate: a transient borg probe
+	// failure must retry on its own bounded clock, not the global period.
+	if !s.preRunRetry.IsZero() {
+		if d := s.preRunRetry.Sub(now); d < wake {
 			wake = d
 		}
 	}
