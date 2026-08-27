@@ -38,6 +38,12 @@ command -v borg >/dev/null || fail "borg not found on PATH"
 # The manager and every borg/borgmatic invocation share this environment.
 export BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes
 export BORG_RELOCATED_REPO_ACCESS_IS_OK=yes
+# The harness reads the repository the manager writes. An archive appears the
+# moment create finishes, but the manager's cycle still holds borg's
+# repository lock through prune/compact/check; borg's default 1s lock wait
+# turns that overlap into a flaky "Failed to create/acquire the lock" instead
+# of a short wait.
+export BORG_LOCK_WAIT=120
 export BORGMATIC_PATH
 export CONFIG_DIR="$WORK/etc" RUNTIME_DIR="$WORK/run" STATE_DIR="$WORK/state"
 if [ -n "${DOCKER_HOST:-}" ]; then
