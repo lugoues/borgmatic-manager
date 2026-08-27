@@ -242,3 +242,20 @@ func TestManagerOnlyDormantOverrideKeepsDefaultRequired(t *testing.T) {
 	require.Error(t, err, "the dormant group will inherit the default borg; its absence must fail now, not when the group wakes")
 	assert.Contains(t, err.Error(), "PATH")
 }
+
+// A transient probe failure must not be remembered against an unchanged file:
+// cached, it would skip every future cycle until the daemon restarts.
+func TestTransientBorgProbeFailureIsRetried(t *testing.T) {
+	dir := t.TempDir()
+	// Fails exactly once (marker file), then reports a healthy version, with
+	// identical size and mtime irrelevant: only successes may be cached.
+	// ": >" instead of touch: the test's PATH holds only the fake borg.
+	script := "#!/bin/sh\nif [ ! -f \"$0.mark\" ]; then : > \"$0.mark\"; exit 1; fi\necho borg 1.4.5\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "borg"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	require.Error(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil),
+		"the first probe fails")
+	require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil),
+		"the second probe must run and succeed; a cached failure would stall every cycle")
+}

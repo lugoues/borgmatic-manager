@@ -198,3 +198,35 @@ func TestResolveBorgmaticRejectsNoOpToolchainLauncher(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, hp, p, "the silent launcher is rejected; the host fallback is real borgmatic")
 }
+
+// A host shim exiting zero with garbage output is not borgmatic: selecting it
+// would skip provisioning and record no-op runs as backups.
+func TestHealthyHostRejectsGarbageVersion(t *testing.T) {
+	hostWith(t, "#!/bin/sh\necho ok\n")
+	_, ok := healthyHostBorgmatic(context.Background())
+	assert.False(t, ok)
+}
+
+// A broken PATH shim must not hide a healthy install at a well-known
+// location: forcing provisioning (or failing offline) despite a usable host
+// install serves nobody.
+func TestUnhealthyHostCandidateDoesNotHideALaterOne(t *testing.T) {
+	hostWith(t, "#!/bin/sh\nexit 1\n") // broken shim on PATH
+
+	goodDir := t.TempDir()
+	good := filepath.Join(goodDir, "borgmatic")
+	require.NoError(t, os.WriteFile(good, []byte("#!/bin/sh\necho 2.1.7\n"), 0o755))
+	orig := wellKnownBorgmaticPaths
+	wellKnownBorgmaticPaths = []string{good}
+	t.Cleanup(func() { wellKnownBorgmaticPaths = orig })
+
+	p, ok := healthyHostBorgmatic(context.Background())
+	require.True(t, ok)
+	assert.Equal(t, good, p)
+
+	t.Run("resolveBorgmatic walks the same candidates", func(t *testing.T) {
+		p, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, filepath.Join(t.TempDir(), "toolchain"))
+		require.NoError(t, err)
+		assert.Equal(t, good, p)
+	})
+}

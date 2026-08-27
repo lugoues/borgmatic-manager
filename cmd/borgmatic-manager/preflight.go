@@ -165,12 +165,13 @@ type borgVersionEntry struct {
 	mtime time.Time
 	size  int64
 	out   string
-	ok    bool
 }
 
-// cachedBorgVersion is commandOutput --version through the cache. Probe
-// failures are cached too (keyed to the same file identity): a broken binary
-// stays broken until the file changes.
+// cachedBorgVersion is commandOutput --version through the cache. Only
+// successes are cached: a transient probe failure (a timeout under load)
+// cached against an unchanged file would skip every future cycle until the
+// daemon restarts, turning one bad moment into a silent standstill. Failures
+// re-probe next cycle, which is the retry.
 func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
 	info, statErr := os.Stat(path)
 	if statErr != nil {
@@ -180,14 +181,16 @@ func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
 	e, hit := borgVersionCache.m[path]
 	borgVersionCache.mu.Unlock()
 	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() {
-		return e.out, e.ok
+		return e.out, true
 	}
 	out, err := commandOutput(ctx, path, "--version")
-	entry := borgVersionEntry{mtime: info.ModTime(), size: info.Size(), out: out, ok: err == nil}
+	if err != nil {
+		return out, false
+	}
 	borgVersionCache.mu.Lock()
-	borgVersionCache.m[path] = entry
+	borgVersionCache.m[path] = borgVersionEntry{mtime: info.ModTime(), size: info.Size(), out: out}
 	borgVersionCache.mu.Unlock()
-	return out, err == nil
+	return out, true
 }
 
 // borgCommand is one borg executable the generated configs will invoke, where
@@ -377,26 +380,31 @@ func (e *env) launchBorgmatic(ctx context.Context) (string, error) {
 	return tc.Ensure(ctx)
 }
 
-// healthyHostBorgmatic reports a host-installed borgmatic that actually runs
-// and meets the version floor. A shim that exists but cannot exec (the broken
-// pipx case) or an install below the floor is not healthy: the caller
-// provisions the toolchain instead of failing on it.
+// healthyHostBorgmatic reports the first host-installed borgmatic that
+// actually runs, reports a plausible version (a corrupted shim exiting zero
+// with garbage must not be selected: versionAtLeast deliberately passes
+// unparseable tokens), and meets the version floor. Candidates are probed in
+// priority order and an unhealthy one does not hide a healthy one behind it:
+// a broken PATH shim with a good /usr/local install must not force
+// provisioning.
 func healthyHostBorgmatic(ctx context.Context) (string, bool) {
-	p, ok := hostBorgmaticPath()
-	if !ok {
-		return "", false
+	for _, p := range hostBorgmaticCandidates() {
+		out, err := commandOutput(ctx, p, "--version")
+		if err != nil {
+			slog.Warn("host borgmatic is broken; trying the next candidate", "path", p, "error", err)
+			continue
+		}
+		if !toolchain.PlausibleReportedVersion(out) {
+			slog.Warn("host borgmatic reports no usable version; trying the next candidate", "path", p, "reported", strings.TrimSpace(out))
+			continue
+		}
+		if v := borgmaticVersionOf(out); !versionAtLeast(v, minBorgmatic) {
+			slog.Warn("host borgmatic is too old; trying the next candidate", "path", p, "version", v)
+			continue
+		}
+		return p, true
 	}
-	out, err := commandOutput(ctx, p, "--version")
-	if err != nil {
-		slog.Warn("host borgmatic is broken; provisioning the manager's own toolchain instead", "path", p, "error", err)
-		return "", false
-	}
-	v := borgmaticVersionOf(out)
-	if v == "" || !versionAtLeast(v, minBorgmatic) {
-		slog.Warn("host borgmatic is too old or reports no version; provisioning the manager's own toolchain instead", "path", p, "version", strings.TrimSpace(out))
-		return "", false
-	}
-	return p, true
+	return "", false
 }
 
 // borgmaticVersionOf extracts the version token from `borgmatic --version`
@@ -412,17 +420,24 @@ func borgmaticVersionOf(out string) string {
 	return fields[len(fields)-1]
 }
 
-// hostBorgmaticPath finds borgmatic on PATH or in the well-known locations.
-func hostBorgmaticPath() (string, bool) {
+// hostBorgmaticCandidates lists host borgmatic locations in priority order:
+// PATH, then the well-known install dirs systemd's PATH misses.
+func hostBorgmaticCandidates() []string {
+	var out []string
+	seen := map[string]bool{}
 	if p, err := exec.LookPath("borgmatic"); err == nil {
-		return p, true
+		out = append(out, p)
+		seen[p] = true
 	}
 	for _, p := range wellKnownBorgmaticPaths {
+		if seen[p] {
+			continue
+		}
 		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			return p, true
+			out = append(out, p)
 		}
 	}
-	return "", false
+	return out
 }
 
 // sanitizedProbe is commandOutput --version with the host's Python
@@ -483,8 +498,14 @@ func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainD
 		}
 		slog.Warn("toolchain borgmatic is broken or reports no usable version; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)
 	}
-	if p, ok := hostBorgmaticPath(); ok {
-		return p, nil
+	// Host candidates are probed lightly (runnable, plausible version) rather
+	// than floor-checked: for a restore, an old borgmatic that works beats a
+	// refusal. A broken first candidate must not hide a working later one.
+	for _, p := range hostBorgmaticCandidates() {
+		if out, err := commandOutput(ctx, p, "--version"); err == nil && toolchain.PlausibleReportedVersion(out) {
+			return p, nil
+		}
+		slog.Warn("host borgmatic candidate is not usable; trying the next", "path", p)
 	}
 	return "", fmt.Errorf("borgmatic not found: start the daemon or a run once to let the manager provision its own, install it (e.g. 'uv tool install borgmatic'), or set manager.borgmatic_path / BORGMATIC_PATH")
 }

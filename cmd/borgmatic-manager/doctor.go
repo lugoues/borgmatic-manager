@@ -139,7 +139,15 @@ func runDoctor(ctx context.Context) error {
 	// borgmatic binary and version floor.
 	borgmaticPath := ""
 	if path, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir()); err != nil {
-		r.fail("borgmatic", err.Error())
+		// A clean install (no host borgmatic, no override, nothing
+		// provisioned yet) is a supported state: the daemon provisions its
+		// own on first launch. Failing it here would contradict the toolchain
+		// line below that reports exactly that plan.
+		if explicitBorgmaticPath(e.cfg) == "" && !toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler)).Exists() {
+			r.warn("borgmatic", "not installed yet; the daemon provisions its own toolchain on first launch")
+		} else {
+			r.fail("borgmatic", err.Error())
+		}
 	} else {
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
 		version, err := commandOutput(cctx, path, "--version")
