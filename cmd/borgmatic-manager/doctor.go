@@ -223,7 +223,9 @@ func runDoctor(ctx context.Context) error {
 				r.warn("borg", fmt.Sprintf("%s (%s) is older than %d.%d (fine until snapshot hooks are enabled)", version, bc.source, minBorg[0], minBorg[1]))
 			}
 		} else {
-			r.warn("borg", fmt.Sprintf("could not read version from %s", borgPath))
+			// The daemon refuses to start on this; doctor saying "no
+			// failures" while preflight fails would be a lie.
+			r.fail("borg", fmt.Sprintf("running %s --version failed (%s): %v", borgPath, bc.source, err))
 		}
 	}
 

@@ -189,15 +189,14 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 		index[command] = len(cmds)
 		cmds = append(cmds, borgCommand{command: command, source: source, snapshots: snapshots})
 	}
-	defaultCommand := func(snapshots bool) {
-		if globalLP != "" {
-			add(globalLP, "manager.yaml local_path", snapshots)
-		} else {
-			add("borg", "PATH", snapshots)
-		}
-	}
 
 	// Each discovered group's effective borg, merged in generation's order.
+	// Groups that fall through to the default make it required and lend it
+	// their snapshot scope.
+	type layer struct {
+		m      map[string]interface{}
+		source string
+	}
 	groupNames := []string{}
 	if state != nil {
 		for name := range state.Groups {
@@ -206,10 +205,7 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 		sort.Strings(groupNames)
 	}
 	defaultNeeded := state == nil || len(groupNames) == 0
-	type layer struct {
-		m      map[string]interface{}
-		source string
-	}
+	defaultHooks := globalHooks
 	for _, name := range groupNames {
 		chain := []layer{{cfg.Borgmatic, "manager.yaml local_path"}}
 		if o, ok := overrides[name]; ok && o.Borgmatic != nil {
@@ -229,29 +225,47 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 		}
 		if lp == "" {
 			defaultNeeded = true
-			if hooks {
-				defaultCommand(true)
-			}
+			defaultHooks = defaultHooks || hooks
 			continue
 		}
 		add(lp, lpSource, hooks)
 	}
-	if defaultNeeded {
-		defaultCommand(globalHooks)
-	}
 
-	// Overrides for groups not currently discovered still name a borg that
-	// will run when their group returns; check them too.
+	// Overrides for groups not currently discovered still describe borgs that
+	// will run when their group returns, without a rerun of this check. One
+	// with its own local_path is checked directly (a discovered group's
+	// override is NOT re-added here: labels merge after it and may have
+	// superseded it, and demanding an executable generation never invokes
+	// would refuse a working deployment). One without falls through to the
+	// default, dragging its snapshot hooks onto the default's floor.
 	names := make([]string, 0, len(overrides))
 	for name := range overrides {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if o := overrides[name]; o.Borgmatic != nil {
-			if lp, _ := o.Borgmatic["local_path"].(string); lp != "" {
-				add(lp, "group "+name+" local_path", globalHooks || hasSnapshotHooks(o.Borgmatic))
+		if state != nil {
+			if _, discovered := state.Groups[name]; discovered {
+				continue
 			}
+		}
+		o := overrides[name]
+		if o.Borgmatic == nil {
+			continue
+		}
+		if lp, _ := o.Borgmatic["local_path"].(string); lp != "" {
+			add(lp, "group "+name+" local_path", globalHooks || hasSnapshotHooks(o.Borgmatic))
+		} else {
+			defaultNeeded = true
+			defaultHooks = defaultHooks || hasSnapshotHooks(o.Borgmatic)
+		}
+	}
+
+	if defaultNeeded {
+		if globalLP != "" {
+			add(globalLP, "manager.yaml local_path", defaultHooks)
+		} else {
+			add("borg", "PATH", defaultHooks)
 		}
 	}
 	return cmds
@@ -306,7 +320,11 @@ func (e *env) launchBorgmatic(ctx context.Context) (string, error) {
 		// healthy one straight back, refreshes a stale one, and reprovisions
 		// a broken one. Falling back to the host here would silently
 		// re-couple the daemon to the host's Python packaging.
-		return tc.Ensure(ctx)
+		p, err := tc.Ensure(ctx)
+		if err == nil {
+			stripHostPythonEnv()
+		}
+		return p, err
 	}
 	if p, ok := healthyHostBorgmatic(ctx); ok {
 		return p, nil
@@ -362,6 +380,22 @@ func hostBorgmaticPath() (string, bool) {
 	return "", false
 }
 
+// stripHostPythonEnv removes the host's Python environment configuration
+// once a toolchain borgmatic is selected. The managed launcher's shebang
+// still honors PYTHONHOME and PYTHONPATH, so a service environment carrying
+// them could redirect the managed interpreter's standard library or shadow
+// borgmatic's dependencies with host packages, re-coupling every backup to
+// the host Python this toolchain exists to escape. Host installs selected
+// explicitly keep their environment untouched.
+func stripHostPythonEnv() {
+	for _, k := range []string{"PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"} {
+		if v := os.Getenv(k); v != "" {
+			slog.Warn("unsetting host Python variable for the toolchain borgmatic", "variable", k)
+			_ = os.Unsetenv(k)
+		}
+	}
+}
+
 // explicitBorgmaticPath is the operator's override: env, then config.
 func explicitBorgmaticPath(cfg *config.ManagerConfig) string {
 	if p := os.Getenv("BORGMATIC_PATH"); p != "" {
@@ -383,6 +417,7 @@ func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainD
 	}
 	if p, ok := toolchain.CurrentBorgmatic(toolchainDir); ok {
 		if _, err := commandOutput(ctx, p, "--version"); err == nil {
+			stripHostPythonEnv()
 			return p, nil
 		}
 		slog.Warn("toolchain borgmatic is broken; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)
@@ -396,7 +431,14 @@ func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainD
 func commandOutput(ctx context.Context, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).Output() // #nosec G204 -- version preflight of operator-configured binaries
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- version preflight of operator-configured binaries
+	// WaitDelay releases the output-pipe wait after the kill: a probed
+	// binary whose descendant inherits stdout and wedges must not turn this
+	// bounded probe into an unbounded one, or a broken toolchain launcher
+	// would block restore and passthrough from ever reaching the host
+	// fallback.
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.Output()
 	return string(out), err
 }
 

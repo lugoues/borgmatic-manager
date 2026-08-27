@@ -42,8 +42,8 @@ func TestBorgCommandsListsEveryConfiguredBorg(t *testing.T) {
 		}
 		cmds := borgCommands(&config.ManagerConfig{}, overrides, nil)
 		require.Len(t, cmds, 2, "groups without an override still need the default borg")
-		assert.Equal(t, "borg", cmds[0].command)
-		assert.Equal(t, "/opt/borg2/borg", cmds[1].command)
+		got := []string{cmds[0].command, cmds[1].command}
+		assert.ElementsMatch(t, []string{"borg", "/opt/borg2/borg"}, got)
 	})
 }
 
@@ -173,5 +173,55 @@ func TestCheckBorgHonorsLabelLocalPath(t *testing.T) {
 			map[string]interface{}{"local_path": old, "btrfs": map[string]interface{}{}})
 		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, st3)
 		require.Error(t, err, "an old borg under a snapshot-hook group is fatal, label-sourced or not")
+	})
+}
+
+// Generation merges labels after the group's file override, so a label
+// local_path supersedes the override's. The superseded executable is never
+// invoked and must not be able to fail preflight.
+func TestSupersededOverrideBorgIsNotDemanded(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	labelBorg := fakeBorg(t, t.TempDir(), "1.4.5")
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": labelBorg})
+	overrides := map[string]config.GroupOverride{
+		"app": {Borgmatic: map[string]interface{}{"local_path": "/nonexistent/old-borg"}},
+	}
+
+	require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st),
+		"the label superseded the override; generation never invokes /nonexistent/old-borg")
+}
+
+// A dormant group (override present, containers currently gone) that inherits
+// the default borg still runs on it when it returns, without preflight
+// rerunning. Its snapshot hooks must reach the default's version floor, and
+// its fallthrough must keep the default required even when every discovered
+// group brings its own borg.
+func TestDormantSnapshotGroupHardensTheInheritedDefault(t *testing.T) {
+	dir := t.TempDir()
+	fakeBorg(t, dir, "1.2.0") // old default borg
+	t.Setenv("PATH", dir)
+
+	labelBorg := fakeBorg(t, t.TempDir(), "1.4.5")
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": labelBorg})
+
+	overrides := map[string]config.GroupOverride{
+		"dormant": {Borgmatic: map[string]interface{}{"btrfs": map[string]interface{}{}}},
+	}
+	err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st)
+	require.Error(t, err,
+		"the dormant snapshot group inherits the old default borg; waving it through would record snapshot paths when it wakes")
+
+	t.Run("and keeps the default required at all", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir()) // no default borg anywhere
+		err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "PATH")
 	})
 }

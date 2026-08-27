@@ -135,3 +135,21 @@ func TestResolveBorgmaticPrefersToolchainOverPath(t *testing.T) {
 		assert.Equal(t, hp, p)
 	})
 }
+
+// Selecting the toolchain must shed the host's Python configuration: the
+// managed launcher's shebang still honors PYTHONHOME/PYTHONPATH, so a service
+// environment carrying them would re-couple every backup to the host Python.
+func TestSelectingTheToolchainStripsHostPythonEnv(t *testing.T) {
+	stateDir := t.TempDir()
+	tp := seedToolchain(t, stateDir)
+	t.Setenv("BORGMATIC_PATH", "")
+	t.Setenv("PYTHONPATH", "/usr/lib/python3/dist-packages")
+	t.Setenv("PYTHONHOME", "/usr")
+
+	e := &env{cfg: &config.ManagerConfig{}, stateDir: stateDir}
+	p, err := e.launchBorgmatic(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, tp, p)
+	assert.Empty(t, os.Getenv("PYTHONPATH"))
+	assert.Empty(t, os.Getenv("PYTHONHOME"))
+}
