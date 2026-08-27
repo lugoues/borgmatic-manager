@@ -218,3 +218,14 @@ func TestSingleGlobalBorgGate(t *testing.T) {
 		require.Error(t, checkBorg(context.Background(), &config.ManagerConfig{}, overrides, nil))
 	})
 }
+
+// A YAML typo turning the global local_path into a number or list must fail
+// loudly, not silently fall back to PATH with an engine nobody chose.
+func TestMalformedGlobalLocalPathFailsLaunch(t *testing.T) {
+	for _, bad := range []interface{}{42, []interface{}{"/opt/borg"}, ""} {
+		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": bad}}
+		err := checkBorg(context.Background(), cfg, nil, nil)
+		require.Error(t, err, "local_path %#v must be rejected", bad)
+		assert.Contains(t, err.Error(), "must be a non-empty string")
+	}
+}

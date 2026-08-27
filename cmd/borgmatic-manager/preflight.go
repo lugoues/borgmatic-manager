@@ -134,6 +134,15 @@ func detectContainerCLI(cfg *config.ManagerConfig, socketPath string) string {
 // (archive path recording is silently wrong below it); a snapshot-free group
 // may point local_path at an older borg without stopping everything else.
 func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[string]config.GroupOverride, state *models.BackupState) error {
+	// A malformed global local_path (a number or list from a YAML typo) must
+	// fail loudly here: the string assertions downstream would read it as
+	// unset and silently fall back to "borg" on PATH, running backups with an
+	// engine the operator did not choose.
+	if raw, ok := cfg.Borgmatic["local_path"]; ok {
+		if lp, isStr := raw.(string); !isStr || lp == "" {
+			return fmt.Errorf("manager.yaml borgmatic local_path must be a non-empty string, got %T (%v)", raw, raw)
+		}
+	}
 	for _, bc := range borgCommands(cfg, overrides, state) {
 		borgPath, err := resolveBorgCommand(bc.command)
 		if err != nil {
@@ -393,6 +402,16 @@ func sanitizedProbe(ctx context.Context, bin string) (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- probing the toolchain launcher
 	cmd.Env = toolchain.SanitizedEnviron()
+	// Its own process group, killed whole on timeout, like every other probe:
+	// restore, passthrough, and doctor route through here repeatedly and a
+	// damaged launcher's descendants must not accumulate.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.Output()
 	return string(out), err
