@@ -533,7 +533,7 @@ full output from the systemd journal (`journalctl -u borgmatic-manager`, or
 | Key | Default | Description |
 |-----|---------|-------------|
 | `manager.period` | required (shipped config: `"1h"`) | Backup cycle interval (positive Go duration). Creation cadence and retention are independent: without `keep_hourly`, hourly archives collapse to one per day at prune time |
-| `manager.borgmatic_path` | auto | borgmatic binary (PATH, then `/root/.local/bin`) |
+| `manager.borgmatic_path` | managed toolchain | explicit borgmatic binary; the only way to use anything but the manager's own [toolchain](#the-borgmatic-toolchain) |
 | `manager.actions` | `[create, prune, compact, check]` | borgmatic actions per cycle, in order |
 | `manager.container_cli` | derived from socket | CLI for generated dump commands (`docker`/`podman`); default follows the connected socket |
 | `manager.run_timeout` | none | bound one group's run; SIGTERM → SIGKILL escalation |

@@ -335,7 +335,7 @@ func (r *doctorReport) checkGenerate(ctx context.Context, e *env, backupState *m
 // skips this step loudly rather than silently shortening the report.
 func (r *doctorReport) validateGeneratedConfigs(ctx context.Context, files []string, borgmaticPath string) {
 	if borgmaticPath == "" {
-		r.warn("validate", "skipped: borgmatic is not installed, so its schema check cannot run (the configs above still compiled)")
+		r.warn("validate", "skipped: no usable borgmatic (see the borgmatic line above), so its schema check cannot run (the configs above still compiled)")
 		return
 	}
 
