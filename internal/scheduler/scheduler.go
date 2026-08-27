@@ -89,6 +89,7 @@ type Scheduler struct {
 	// cycleObserver, when set, receives each cycle's merged inventory and offline
 	// state (nil when no cache), so metrics can report offline volume counts.
 	cycleObserver func(*models.BackupState, *state.Offline)
+	preRunCheck   func(context.Context, *models.BackupState) error
 }
 
 // SetGroupCache attaches a durable group cache so offline groups survive and
@@ -104,6 +105,16 @@ func (s *Scheduler) SetGroupCache(cache *state.GroupCache) {
 // then fails or never starts. Optional; nil (the default) disables it.
 func (s *Scheduler) SetCycleObserver(f func(*models.BackupState, *state.Offline)) {
 	s.cycleObserver = f
+}
+
+// SetPreRunCheck installs a gate that runs after discovery and cache merge,
+// before anything is generated or run. Labels change between cycles, and a
+// check that only ran at launch (the borg availability and version floor)
+// would miss a group that appeared or relabeled afterwards; failing the gate
+// skips the cycle loudly instead of running configs whose engine is missing
+// or silently wrong.
+func (s *Scheduler) SetPreRunCheck(f func(context.Context, *models.BackupState) error) {
+	s.preRunCheck = f
 }
 
 // SetRepositoryObserver registers a callback invoked once per cycle with each
@@ -470,6 +481,12 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 
 	if s.cycleObserver != nil {
 		s.cycleObserver(backupState, off)
+	}
+
+	if s.preRunCheck != nil {
+		if checkErr := s.preRunCheck(ctx, backupState); checkErr != nil {
+			return fmt.Errorf("pre-run check failed; skipping this cycle: %w", checkErr)
+		}
 	}
 
 	meta, err := s.generateFunc(backupState)

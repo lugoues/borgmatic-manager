@@ -640,6 +640,13 @@ func runDaemon() error {
 	reapStalePendingRuns(ctx, store, locksDir, e.reapRunHelpers)
 	sweepOrphanedPendingLocks(locksDir, store)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
+	// Labels change between cycles: a group appearing or relabeling after
+	// launch can select a borg preflight never saw. The same check reruns per
+	// cycle on the freshly merged state (probes are memoized by file identity,
+	// so an unchanged borg costs a stat, not an exec).
+	s.SetPreRunCheck(func(ctx context.Context, st *models.BackupState) error {
+		return checkBorg(ctx, e.cfg, e.groupOverrides, st)
+	})
 	s.SetGroupCache(state.LoadGroupCache(e.stateDir, slog.Default()))
 
 	// Metrics are best-effort: a failed exporter must never stop backups. The

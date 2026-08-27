@@ -178,3 +178,23 @@ func TestBrokenToolchainFallbackKeepsHostPythonEnv(t *testing.T) {
 	assert.Equal(t, "/opt/host/pythonpath", os.Getenv("PYTHONPATH"),
 		"the host fallback runs in the environment the host install expects")
 }
+
+// A zero-exit no-op launcher must not be selected for passthrough/restore:
+// exit status alone would let those commands silently do nothing.
+func TestResolveBorgmaticRejectsNoOpToolchainLauncher(t *testing.T) {
+	stateDir := t.TempDir()
+	name := toolchain.PinnedVersionDirName()
+	vdir := filepath.Join(stateDir, "toolchain", "versions", name)
+	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\nexit 0\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", name),
+		filepath.Join(stateDir, "toolchain", "current")))
+
+	hp := hostWith(t, "#!/bin/sh\necho 2.1.7\n")
+	t.Setenv("BORGMATIC_PATH", "")
+
+	p, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, filepath.Join(stateDir, "toolchain"))
+	require.NoError(t, err)
+	assert.Equal(t, hp, p, "the silent launcher is rejected; the host fallback is real borgmatic")
+}

@@ -269,6 +269,13 @@ func plausibleVersion(v string) bool {
 	return v != "" && v[0] >= '0' && v[0] <= '9' && strings.ContainsRune(v, '.')
 }
 
+// PlausibleReportedVersion reports whether --version output carries a version
+// a real borgmatic would print. Exported for callers probing a toolchain
+// launcher themselves: exit status alone accepts a truncated no-op script.
+func PlausibleReportedVersion(out string) bool {
+	return plausibleVersion(reportedVersion(out))
+}
+
 // freshAndHealthy accepts the current toolchain only when its name matches
 // the pins AND its binary runs AND it reports the pinned version. Freshness
 // alone is a symlink name: a deleted managed Python or a partially replaced
@@ -331,7 +338,7 @@ func SanitizedEnviron() []string {
 // an error.
 func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 	if p, ok := t.freshAndHealthy(ctx); ok {
-		t.tryCleanOldVersions(t.currentTargetBase())
+		t.tryCleanOldVersions()
 		return p, nil
 	}
 	if err := os.MkdirAll(t.root, 0o700); err != nil {
@@ -652,13 +659,16 @@ func uvEnv(vdir string) []string {
 // superseded; the marker would ride into its life as current and age into an
 // immediate deletion at its real retirement. No lock, no cleanup: whoever
 // holds it cleans up afterwards anyway.
-func (t *Toolchain) tryCleanOldVersions(keep string) {
+func (t *Toolchain) tryCleanOldVersions() {
 	lock, acquired, err := lockfile.TryExclusive(filepath.Join(t.root, "provision.lock"))
 	if err != nil || !acquired {
 		return
 	}
 	defer lock.Release()
-	t.cleanOldVersions(keep)
+	// The keep target is read only under the lock: a value read before it
+	// could predate another process's flip and mark the newly current
+	// generation as superseded.
+	t.cleanOldVersions(t.currentTargetBase())
 }
 
 // supersededGrace is how long a superseded toolchain version survives before

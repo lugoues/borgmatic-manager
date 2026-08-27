@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
@@ -132,13 +133,13 @@ func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[str
 			return fmt.Errorf("borg (%s) not found: %w; install borg from your distribution or fix the path "+
 				"(borg stays host-installed; the manager only provisions borgmatic)", bc.source, err)
 		}
-		out, verErr := commandOutput(ctx, borgPath, "--version")
+		out, ok := cachedBorgVersion(ctx, borgPath)
 		fields := strings.Fields(out)
-		if verErr != nil || len(fields) == 0 {
+		if !ok || len(fields) == 0 {
 			// Existing but unrunnable (a broken shim, a missing loader): every
 			// group invoking it would fail, which is exactly what this check
 			// exists to say before the first cycle does.
-			return fmt.Errorf("borg (%s): running %s --version failed: %v (output %q)", bc.source, borgPath, verErr, strings.TrimSpace(out))
+			return fmt.Errorf("borg (%s): running %s --version failed (output %q)", bc.source, borgPath, strings.TrimSpace(out))
 		}
 		// "borg 1.4.4"
 		borgVersion := fields[len(fields)-1]
@@ -151,6 +152,42 @@ func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[str
 		}
 	}
 	return nil
+}
+
+// borgVersionCache memoizes --version probes by path and file identity, so
+// the per-cycle borg recheck stats an unchanged binary instead of execing it.
+var borgVersionCache = struct {
+	mu sync.Mutex
+	m  map[string]borgVersionEntry
+}{m: map[string]borgVersionEntry{}}
+
+type borgVersionEntry struct {
+	mtime time.Time
+	size  int64
+	out   string
+	ok    bool
+}
+
+// cachedBorgVersion is commandOutput --version through the cache. Probe
+// failures are cached too (keyed to the same file identity): a broken binary
+// stays broken until the file changes.
+func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return "", false
+	}
+	borgVersionCache.mu.Lock()
+	e, hit := borgVersionCache.m[path]
+	borgVersionCache.mu.Unlock()
+	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() {
+		return e.out, e.ok
+	}
+	out, err := commandOutput(ctx, path, "--version")
+	entry := borgVersionEntry{mtime: info.ModTime(), size: info.Size(), out: out, ok: err == nil}
+	borgVersionCache.mu.Lock()
+	borgVersionCache.m[path] = entry
+	borgVersionCache.mu.Unlock()
+	return out, err == nil
 }
 
 // borgCommand is one borg executable the generated configs will invoke, where
@@ -440,11 +477,11 @@ func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainD
 		// the strip commits only once the probe passes. A broken toolchain
 		// must hand restore and passthrough an unaltered host fallback, which
 		// may itself rely on the very variables the toolchain sheds.
-		if _, err := sanitizedProbe(ctx, p); err == nil {
+		if out, err := sanitizedProbe(ctx, p); err == nil && toolchain.PlausibleReportedVersion(out) {
 			stripHostPythonEnv()
 			return p, nil
 		}
-		slog.Warn("toolchain borgmatic is broken; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)
+		slog.Warn("toolchain borgmatic is broken or reports no usable version; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)
 	}
 	if p, ok := hostBorgmaticPath(); ok {
 		return p, nil
