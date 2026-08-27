@@ -176,9 +176,17 @@ func runDoctor(ctx context.Context) error {
 	}
 
 	// borg is required outright: without the engine nothing runs. Every borg
-	// the configuration names is checked (local_path overrides included); the
-	// version floor is hard only for a borg some snapshot-hook group invokes.
-	for _, bc := range borgCommands(e.cfg, e.groupOverrides) {
+	// the configuration names is checked, and labels can point a group at its
+	// own borg, so a quiet discovery feeds the check; nil (socket down) makes
+	// it conservatively demand the default. The labels section below runs its
+	// own discovery with the warning-capturing logger.
+	var discoveredState *models.BackupState
+	if socketOK {
+		if st, err := discovery.Discover(ctx, e.rt, slog.New(slog.DiscardHandler)); err == nil {
+			discoveredState = st
+		}
+	}
+	for _, bc := range borgCommands(e.cfg, e.groupOverrides, discoveredState) {
 		borgPath, err := resolveBorgCommand(bc.command)
 		if err != nil {
 			r.fail("borg", fmt.Sprintf("%s: %v; install it from your distribution (the manager provisions borgmatic, never borg)", bc.source, err))

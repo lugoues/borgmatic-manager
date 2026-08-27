@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/models"
 	"github.com/lugoues/borgmatic-manager/internal/toolchain"
 )
 
@@ -61,8 +62,14 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	// host-owned (its repository format and CLI must match what the operator
 	// uses by hand against the same repositories). Checked before borgmatic so
 	// a missing borg fails cleanly instead of provisioning a toolchain for a
-	// deployment that cannot run anyway.
-	if err := checkBorg(ctx, e.cfg, e.groupOverrides); err != nil {
+	// deployment that cannot run anyway. Discovery runs first because labels
+	// may point groups at their own borg (config.local_path), and demanding a
+	// PATH borg no group will invoke would fail a working deployment.
+	backupState, _, discErr := e.discoverMerged(ctx, slog.Default())
+	if discErr != nil {
+		return nil, fmt.Errorf("discovering groups for the borg check: %w", discErr)
+	}
+	if err := checkBorg(ctx, e.cfg, e.groupOverrides, backupState); err != nil {
 		return nil, err
 	}
 
@@ -118,8 +125,8 @@ func detectContainerCLI(cfg *config.ManagerConfig, socketPath string) string {
 // only for a borg that some snapshot-hook-using group actually invokes
 // (archive path recording is silently wrong below it); a snapshot-free group
 // may point local_path at an older borg without stopping everything else.
-func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[string]config.GroupOverride) error {
-	for _, bc := range borgCommands(cfg, overrides) {
+func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[string]config.GroupOverride, state *models.BackupState) error {
+	for _, bc := range borgCommands(cfg, overrides, state) {
 		borgPath, err := resolveBorgCommand(bc.command)
 		if err != nil {
 			return fmt.Errorf("borg (%s) not found: %w; install borg from your distribution or fix the path "+
@@ -150,13 +157,17 @@ type borgCommand struct {
 	snapshots bool
 }
 
-// borgCommands lists every borg the configuration names: the default "borg"
-// on PATH unless the global config sets borgmatic's local_path, plus each
-// per-group override's local_path. Label-sourced config fragments can also
-// set local_path, but they are discovered per cycle and cannot be seen here;
-// those fail at run time like any other label mistake.
-func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOverride) []borgCommand {
+// borgCommands lists every borg the configuration names, by walking each
+// group's effective config the way generation merges it (global defaults,
+// then the group's file override, then its label fragments, last wins). The
+// default "borg" on PATH is demanded only when some group actually falls
+// through to it: a deployment where every group labels its own local_path
+// worked before this check existed and must keep working. With no discovered
+// state (or none available, doctor with a dead socket) the default is
+// conservatively required.
+func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOverride, state *models.BackupState) []borgCommand {
 	globalHooks := hasSnapshotHooks(cfg.Borgmatic)
+	globalLP, _ := cfg.Borgmatic["local_path"].(string)
 
 	var cmds []borgCommand
 	index := map[string]int{}
@@ -173,25 +184,59 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 		index[command] = len(cmds)
 		cmds = append(cmds, borgCommand{command: command, source: source, snapshots: snapshots})
 	}
+	defaultCommand := func(snapshots bool) {
+		if globalLP != "" {
+			add(globalLP, "manager.yaml local_path", snapshots)
+		} else {
+			add("borg", "PATH", snapshots)
+		}
+	}
 
-	// The default borg serves every group without its own local_path,
-	// including groups discovered later from labels, so its snapshot scope is
-	// "the global config, or any override that keeps the default borg".
-	defaultHooks := globalHooks
-	for _, o := range overrides {
-		if o.Borgmatic == nil {
+	// Each discovered group's effective borg, merged in generation's order.
+	groupNames := []string{}
+	if state != nil {
+		for name := range state.Groups {
+			groupNames = append(groupNames, name)
+		}
+		sort.Strings(groupNames)
+	}
+	defaultNeeded := state == nil || len(groupNames) == 0
+	type layer struct {
+		m      map[string]interface{}
+		source string
+	}
+	for _, name := range groupNames {
+		chain := []layer{{cfg.Borgmatic, "manager.yaml local_path"}}
+		if o, ok := overrides[name]; ok && o.Borgmatic != nil {
+			chain = append(chain, layer{o.Borgmatic, "group " + name + " local_path"})
+		}
+		for _, lc := range state.Groups[name].LabelConfigs {
+			chain = append(chain, layer{lc, "group " + name + " label local_path"})
+		}
+
+		lp, lpSource := "", ""
+		hooks := false
+		for _, l := range chain {
+			if v, _ := l.m["local_path"].(string); v != "" {
+				lp, lpSource = v, l.source
+			}
+			hooks = hooks || hasSnapshotHooks(l.m)
+		}
+		if lp == "" {
+			defaultNeeded = true
+			if hooks {
+				defaultCommand(true)
+			}
 			continue
 		}
-		if lp, _ := o.Borgmatic["local_path"].(string); lp == "" && hasSnapshotHooks(o.Borgmatic) {
-			defaultHooks = true
-		}
+		add(lp, lpSource, hooks)
 	}
-	if global, _ := cfg.Borgmatic["local_path"].(string); global != "" {
-		add(global, "manager.yaml local_path", defaultHooks)
-	} else {
-		add("borg", "PATH", defaultHooks)
+	if defaultNeeded {
+		defaultCommand(globalHooks)
 	}
 
+	// Overrides for groups not currently discovered still name a borg that
+	// will run when their group returns; check them too.
 	names := make([]string, 0, len(overrides))
 	for name := range overrides {
 		names = append(names, name)
