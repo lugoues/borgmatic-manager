@@ -250,13 +250,19 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 			}
 		}
 		o := overrides[name]
-		if o.Borgmatic == nil {
+		lp := ""
+		if o.Borgmatic != nil {
+			lp, _ = o.Borgmatic["local_path"].(string)
+		}
+		if lp != "" {
+			add(lp, "group "+name+" local_path", globalHooks || hasSnapshotHooks(o.Borgmatic))
 			continue
 		}
-		if lp, _ := o.Borgmatic["local_path"].(string); lp != "" {
-			add(lp, "group "+name+" local_path", globalHooks || hasSnapshotHooks(o.Borgmatic))
-		} else {
-			defaultNeeded = true
+		// Even a manager-only override (a period alone) names a group that
+		// will exist and inherit the default borg when it wakes, without a
+		// preflight rerun.
+		defaultNeeded = true
+		if o.Borgmatic != nil {
 			defaultHooks = defaultHooks || hasSnapshotHooks(o.Borgmatic)
 		}
 	}
@@ -320,15 +326,17 @@ func (e *env) launchBorgmatic(ctx context.Context) (string, error) {
 		// healthy one straight back, refreshes a stale one, and reprovisions
 		// a broken one. Falling back to the host here would silently
 		// re-couple the daemon to the host's Python packaging.
-		p, err := tc.Ensure(ctx)
-		if err == nil {
-			stripHostPythonEnv()
-		}
-		return p, err
+		//
+		// Stripped BEFORE the probes inside Ensure, not after: a poisoned
+		// PYTHONHOME failing the health checks would refuse the very
+		// toolchain that exists to escape it.
+		stripHostPythonEnv()
+		return tc.Ensure(ctx)
 	}
 	if p, ok := healthyHostBorgmatic(ctx); ok {
 		return p, nil
 	}
+	stripHostPythonEnv()
 	return tc.Ensure(ctx)
 }
 
@@ -416,8 +424,8 @@ func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainD
 		return p, nil
 	}
 	if p, ok := toolchain.CurrentBorgmatic(toolchainDir); ok {
+		stripHostPythonEnv()
 		if _, err := commandOutput(ctx, p, "--version"); err == nil {
-			stripHostPythonEnv()
 			return p, nil
 		}
 		slog.Warn("toolchain borgmatic is broken; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)

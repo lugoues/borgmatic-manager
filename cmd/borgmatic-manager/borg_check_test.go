@@ -225,3 +225,20 @@ func TestDormantSnapshotGroupHardensTheInheritedDefault(t *testing.T) {
 		assert.Contains(t, err.Error(), "PATH")
 	})
 }
+
+// A dormant group configured only through manager settings (a period alone)
+// still inherits the default borg when it wakes, without a preflight rerun.
+func TestManagerOnlyDormantOverrideKeepsDefaultRequired(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no default borg
+	labelBorg := fakeBorg(t, t.TempDir(), "1.4.5")
+
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": labelBorg})
+
+	overrides := map[string]config.GroupOverride{"dormant": {}}
+	err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, st)
+	require.Error(t, err, "the dormant group will inherit the default borg; its absence must fail now, not when the group wakes")
+	assert.Contains(t, err.Error(), "PATH")
+}
