@@ -241,3 +241,27 @@ func TestUnhealthyHostCandidateDoesNotHideALaterOne(t *testing.T) {
 		assert.Equal(t, good, p)
 	})
 }
+
+// An old-but-working PATH borgmatic behind a current well-known install: the
+// daemon's selection walks past the below-floor one, so it never provisions;
+// restore's resolveBorgmatic deliberately keeps it (an old borgmatic that
+// works beats a refusal). Doctor must predict the daemon's pick, not
+// resolveBorgmatic's: this pins the divergence that made it warn about a
+// provisioning that would never happen (and skip schema validation).
+func TestBelowFloorPathCandidateIsSkippedForAHealthyLaterOne(t *testing.T) {
+	old := hostWith(t, "#!/bin/sh\necho 2.0.5\n")
+	goodDir := t.TempDir()
+	good := filepath.Join(goodDir, "borgmatic")
+	require.NoError(t, os.WriteFile(good, []byte("#!/bin/sh\necho 2.1.7\n"), 0o755))
+	orig := wellKnownBorgmaticPaths
+	wellKnownBorgmaticPaths = []string{good}
+	t.Cleanup(func() { wellKnownBorgmaticPaths = orig })
+
+	p, ok := healthyHostBorgmatic(context.Background())
+	require.True(t, ok)
+	assert.Equal(t, good, p, "the daemon selects the healthy later install; it does not provision")
+
+	rp, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, filepath.Join(t.TempDir(), "toolchain"))
+	require.NoError(t, err)
+	assert.Equal(t, old, rp, "restore keeps the old working one on purpose")
+}

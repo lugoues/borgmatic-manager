@@ -162,8 +162,19 @@ func runDoctor(ctx context.Context) error {
 			// not a failure. An explicit override or an existing toolchain
 			// reporting an old version IS wrong, and stays one.
 			if explicitBorgmaticPath(e.cfg) == "" && !toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler)).Exists() {
-				r.warn("borgmatic", fmt.Sprintf("%s is %s, below %d.%d.%d; the daemon provisions its own toolchain on first launch",
-					path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+				// The daemon walks past a below-floor candidate to a healthy
+				// later one (a current /usr/local install behind an old
+				// distro package, say) before it ever provisions; predicting
+				// provisioning here would skip schema validation against the
+				// borgmatic actually selected.
+				if hp, ok := healthyHostBorgmatic(ctx); ok {
+					borgmaticPath = hp
+					r.pass("borgmatic", fmt.Sprintf("%s (the daemon skips %s: %s is below %d.%d.%d)",
+						hp, path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+				} else {
+					r.warn("borgmatic", fmt.Sprintf("%s is %s, below %d.%d.%d; the daemon provisions its own toolchain on first launch",
+						path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+				}
 			} else {
 				r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d",
 					path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
