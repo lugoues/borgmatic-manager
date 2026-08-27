@@ -44,8 +44,8 @@ reimplements.
 |---|---|---|
 | borgmatic | **2.1.0** (overrides only) | **not needed on the host**: the manager owns its own pinned install (see below). `manager.borgmatic_path` / `BORGMATIC_PATH` is the only way to use another, and that install must be >= 2.1.0 |
 | borg | **1.4** | **required on the host**; the manager refuses to start without it. Deliberately never provisioned: its repository format and CLI must match what you use by hand against the same repositories |
-| Docker or Podman | any | socket access; rootless Podman supported with [limitations](#rootless-podman) |
-| `sqlite3` | any | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers, so no host clients are needed) |
+| Docker or Podman | n/a | socket access; rootless Podman supported with [limitations](#rootless-podman) |
+| `sqlite3` | n/a | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers, so no host clients are needed) |
 
 ### The borgmatic toolchain
 
@@ -330,7 +330,7 @@ Database restores run through the same generated helper containers as dumps
 run: files are replaced atomically and borgmatic reads its config once at
 start, so an in-flight run never sees a partial or changed config.
 
-**Host lost entirely:** borgmatic embeds its config in every archive;
+**Host lost entirely:** borgmatic embeds its config in every archive.
 `borgmatic config bootstrap --repository ssh://…` recovers it, then extract
 as above.
 
