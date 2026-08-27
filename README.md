@@ -3,19 +3,19 @@
 Label-driven backup orchestration for Docker and Podman. A host systemd
 service that discovers labeled containers, generates
 [borgmatic](https://torsion.org/borgmatic/) configurations, and runs periodic,
-snapshot-consistent backups — no per-service config files.
+snapshot-consistent backups, with no per-service config files.
 
 ## How it works
 
-1. **Discover** — watches the Docker/Podman socket for containers with
+1. **Discover**: watches the Docker/Podman socket for containers with
    `borgmatic-manager.*` labels (periodically and on create/remove events);
    a labeled container's named volumes and databases join its backup group
-2. **Generate** — compiles per-group borgmatic YAML from labels + your defaults
-3. **Backup** — runs borgmatic (the manager's own pinned toolchain) per
+2. **Generate**: compiles per-group borgmatic YAML from labels + your defaults
+3. **Backup**: runs borgmatic (the manager's own pinned toolchain) per
    group:
    `create prune compact check`; database dumps run in short-lived helper
    containers joined to the database's network namespace
-4. **Snapshots** — on btrfs/zfs/LVM hosts, borgmatic's built-in hooks snapshot
+4. **Snapshots**: on btrfs/zfs/LVM hosts, borgmatic's built-in hooks snapshot
    the filesystem for crash-consistent backups
 
 ```
@@ -35,7 +35,7 @@ snapshot-consistent backups — no per-service config files.
 
 The manager is deliberately thin: it is a **label-to-config compiler plus
 scheduler**. Retention, consistency checks, database dumps, snapshots, and
-notifications are all borgmatic features the manager configures — never
+notifications are all borgmatic features the manager configures, never
 reimplements.
 
 ## Requirements
@@ -44,13 +44,13 @@ reimplements.
 |---|---|---|
 | borgmatic | **2.1.0** (overrides only) | **not needed on the host**: the manager owns its own pinned install (see below). `manager.borgmatic_path` / `BORGMATIC_PATH` is the only way to use another, and that install must be >= 2.1.0 |
 | borg | **1.4** | **required on the host**; the manager refuses to start without it. Deliberately never provisioned: its repository format and CLI must match what you use by hand against the same repositories |
-| Docker or Podman | — | socket access; rootless Podman supported with [limitations](#rootless-podman) |
-| `sqlite3` | — | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers — no host clients needed) |
+| Docker or Podman | any | socket access; rootless Podman supported with [limitations](#rootless-podman) |
+| `sqlite3` | any | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers, so no host clients are needed) |
 
 ### The borgmatic toolchain
 
-The manager owns its borgmatic. On first use — daemon launch, a restore, a
-passthrough command, even `doctor` — it provisions a pinned toolchain: a pinned
+The manager owns its borgmatic. On first use (daemon launch, a restore, a
+passthrough command, even `doctor`) it provisions a pinned toolchain: a pinned
 [uv](https://docs.astral.sh/uv/) (checksum-verified static binary) installs a
 pinned borgmatic with a uv-managed Python under `<state-dir>/toolchain/`
 (`/var/lib/borgmatic-manager/toolchain/` for the system unit,
@@ -64,7 +64,7 @@ the manager's backups.
   fallback; if provisioning fails (say, offline on first launch) the command
   fails and the next attempt retries.
 - Version bumps ship as manager releases: a new release reprovisions on next
-  launch, atomically — a failed download leaves the previous toolchain working.
+  launch, atomically; a failed download leaves the previous toolchain working.
 - `manager.borgmatic_path` / `BORGMATIC_PATH` is the single exception: it
   overrides the toolchain and disables provisioning entirely. Setting it means
   keeping that install working is on you.
@@ -100,7 +100,7 @@ host. borgmatic does not: the manager provisions its own isolated
 borgmatic is ignored unless `manager.borgmatic_path` or `BORGMATIC_PATH`
 points at it.
 
-**2. Label your containers** — labels live on the *service*, not the volume,
+**2. Label your containers.** Labels live on the *service*, not the volume,
 so a normal `docker compose up` after editing applies them:
 
 ```yaml
@@ -130,7 +130,7 @@ borgmatic:
   keep_daily: 7
 ```
 
-**4. Start, then initialize the repository** — repositories are never created
+**4. Start, then initialize the repository.** Repositories are never created
 automatically. The first cycle fails with a guided error that prints the
 exact command:
 
@@ -146,7 +146,7 @@ The next cycle backs up. Verify labels any time with
 
 ## Labels reference
 
-All labels go on **containers** (volume labels are not supported — they are
+All labels go on **containers** (volume labels are not supported: they are
 immutable after creation, which made them a trap).
 
 | Label | Description |
@@ -156,12 +156,12 @@ immutable after creation, which made them a trap).
 | `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Omitted or empty: all named volumes (anonymous volumes excluded). |
 | `borgmatic-manager.db.{n}.*` | Database dump definitions (below). |
 | `borgmatic-manager.config.<option>` | Any borgmatic option for this group (below). |
-| `borgmatic-manager.spec` | The whole configuration as one JSON blob (below) — alternative to all of the above. |
+| `borgmatic-manager.spec` | The whole configuration as one JSON blob (below), an alternative to all of the above. |
 
 Only `local`-driver volumes are supported; volumes with mount options
 (NFS/CIFS) are backed up only while mounted; other drivers are skipped with a
-warning. A `borgmatic-manager.*` label that doesn't parse or validate —
-unknown field names included — fails the cycle loudly rather than silently
+warning. A `borgmatic-manager.*` label that doesn't parse or validate,
+unknown field names included, fails the cycle loudly rather than silently
 shrinking the backup set (`borgmatic-manager discover` shows the result).
 The one soft spot: `config.*` option names pass through to borgmatic, so a
 typo there surfaces one step later, as that group's per-cycle
@@ -175,7 +175,7 @@ typo there surfaces one step later, as that group's per-cycle
 | `borgmatic-manager.db.{n}.name` | Yes | Database name |
 | `borgmatic-manager.db.{n}.username` | Yes* | DB user (*not for sqlite*) |
 | `borgmatic-manager.db.{n}.password` | No | DB password (see [Secrets](#secrets)) |
-| `borgmatic-manager.db.{n}.hostname` | No | Host-reachable address — switches to hostname mode (host client tools required) |
+| `borgmatic-manager.db.{n}.hostname` | No | Host-reachable address; switches to hostname mode (host client tools required) |
 | `borgmatic-manager.db.{n}.port` | No | Database port (container-internal in the default mode) |
 | `borgmatic-manager.db.{n}.mode` | No | `exec` to exec into the DB container instead of a helper (postgresql only) |
 | `borgmatic-manager.db.{n}.volume` | sqlite | Volume containing the database file |
@@ -185,7 +185,7 @@ typo there surfaces one step later, as that group's per-cycle
 is deprecated and ignored.
 
 Each group backs up into one archive per cycle, containing every volume at
-a volume-named path (`myvol/_data/...` — the storage location under
+a volume-named path (`myvol/_data/...`; the storage location under
 `/var/lib/docker` is stripped) plus any database dumps. Exception: groups
 with snapshot hooks keep full host paths (the hooks own the path rewriting).
 
@@ -200,7 +200,7 @@ borgmatic:
 ```
 
 Safety rule, enforced at generation: when groups share a repository, the format
-must contain the literal `{group}` token — retention is scoped by archive name,
+must contain the literal `{group}` token: retention is scoped by archive name,
 so indistinguishable formats would let one group's prune eat another group's
 history. The token is required, not merely the group's name: a format like
 `{hostname}-appdata-{now}` happens to contain both "app" and "data" yet names
@@ -213,8 +213,8 @@ By default the manager generates borgmatic commands that spawn a
 **short-lived helper container from the database container's own image**,
 joined to its network namespace (`--network container:<name>`):
 
-- works with **any** network setup — bridge, custom, internal, host, none,
-  pods, rootless — no published ports needed
+- works with **any** network setup (bridge, custom, internal, host, none,
+  pods, rootless), with no published ports needed
 - the dump client is always the **same version as the server** (it ships in
   the same image)
 - zero database client tools on the host
@@ -227,20 +227,20 @@ helper still wearing it (a mariadb-dump blocked on its dump FIFO ignores
 SIGTERM as PID 1 and would otherwise run forever, pinning a volume). IDs
 pending from a crashed manager are reaped at the next startup. Manual
 `borgmatic-manager borgmatic <group>` runs mint their own IDs but bypass
-the daemon, so their cleanup is not guaranteed — find strays with
+the daemon, so their cleanup is not guaranteed; find strays with
 `docker ps --filter label=borgmatic-manager.helper`.
 
 You never write these commands; `borgmatic-manager generate` shows what is
 produced. Setting `db.{n}.hostname` switches that database to a plain
 host-side connection instead (requires `pg_dump`/`mariadb-dump`/`mysqldump`
 on the host), and `db.{n}.mode: exec` runs the client inside the DB container
-itself (postgresql only — mysql/mariadb dumps stream through a FIFO that an
+itself (postgresql only: mysql/mariadb dumps stream through a FIFO that an
 exec'd client cannot reach).
 
 ### Config labels (traefik-style)
 
-Any borgmatic option can be set per group straight from a label — dotted
-paths become nested YAML, values are parsed as YAML (numbers, booleans,
+Any borgmatic option can be set per group straight from a label. Dotted
+paths become nested YAML, and values are parsed as YAML (numbers, booleans,
 `[flow, lists]`):
 
 ```yaml
@@ -287,7 +287,7 @@ Label='borgmatic-manager.spec={"group": "myapp", "enable": true, "volumes": ["ap
 
 Parsing is strict, and deliberately drastic: an unknown or misspelled field,
 or a database entry failing per-type validation, is an **error that fails
-the entire discovery cycle** — no group backs up until the label is fixed.
+the entire discovery cycle**: no group backs up until the label is fixed.
 That blast radius is the point: a broken label that silently shrank the
 backup set would be worse, and a stopped cycle alerts through logs and
 monitoring within one period. If `spec` is present, any other
@@ -298,7 +298,7 @@ listing them): pick one style per container.
 
 - **Labels are visible** to anyone with socket access (`docker inspect`).
   For sensitive credentials use borgmatic's credential syntax as the label
-  value — it passes through generation and resolves at backup time:
+  value; it passes through generation and resolves at backup time:
   `borgmatic-manager.db.0.password: "{credential container db_password}"`
 - **Repository passphrase** without plaintext:
   ```bash
@@ -312,7 +312,7 @@ listing them): pick one style per container.
 
 ## Restoring
 
-Everything goes through the passthrough subcommand — it regenerates the
+Everything goes through the passthrough subcommand: it regenerates the
 group's config from live labels and hands you borgmatic, so it works even
 after a reboot cleared the runtime directory:
 
@@ -330,13 +330,13 @@ Database restores run through the same generated helper containers as dumps
 run: files are replaced atomically and borgmatic reads its config once at
 start, so an in-flight run never sees a partial or changed config.
 
-**Host lost entirely:** borgmatic embeds its config in every archive —
+**Host lost entirely:** borgmatic embeds its config in every archive;
 `borgmatic config bootstrap --repository ssh://…` recovers it, then extract
 as above.
 
 ## Monitoring
 
-Put any borgmatic monitoring hook in the `borgmatic:` map — it applies to
+Put any borgmatic monitoring hook in the `borgmatic:` map; it applies to
 every group. A dead manager means missed pings, which your monitor alerts on:
 
 ```yaml
@@ -436,8 +436,8 @@ backup is a recorded data point rather than a gap.
 
 ## Rootless Podman
 
-Two deployment modes. **Recommended: rootless containers, root manager** —
-the containers stay unprivileged, but the manager runs as the normal system
+Two deployment modes. **Recommended: rootless containers, root manager.**
+The containers stay unprivileged, but the manager runs as the normal system
 unit and watches the user's podman socket:
 
 ```bash
@@ -457,16 +457,16 @@ Environment=CONTAINER_HOST=unix:///run/user/1000/podman/podman.sock
 dump commands, so helper containers are created in the *user's* podman, not
 root's.) Snapshot hooks work, files owned by subordinate UIDs are
 readable, and restores put the original (subuid) owners back so
-applications can read their restored data — an unprivileged borg cannot
+applications can read their restored data. An unprivileged borg cannot
 chown, so user-mode restores hand everything to the user. Two caveats:
 mysql/mariadb helper dumps don't work in this mode (their dump FIFO lives
 in the root-owned runtime dir, which the user-namespace helper can neither
-mount nor write; postgres and sqlite are unaffected — postgres streams
+mount nor write; postgres and sqlite are unaffected: postgres streams
 over stdout). And the container user's labels now program a root process
-(see [Security model](#security-model)) — fine when that user is you, a
+(see [Security model](#security-model)): fine when that user is you, a
 real escalation in multi-tenant setups.
 
-**Fully rootless (user unit)** — zero root anywhere, via
+**Fully rootless (user unit)**: zero root anywhere, via
 [deploy/systemd/borgmatic-manager.user.service](deploy/systemd/borgmatic-manager.user.service):
 
 ```bash
@@ -480,13 +480,13 @@ loginctl enable-linger $USER
 
 This mode is only clean when your containers write volume data as
 container root (which maps to your user). Anything running as a non-root
-user in-container — databases especially — writes files owned by
+user in-container, databases especially, writes files owned by
 subordinate UIDs that your user cannot read: those volumes are skipped
 with a warning, and restores can't recreate subuid ownership. The often
 suggested `podman unshare chown` fix only suits container-root data
 (chowning a database's files breaks the database). Databases are still
 fine via dumps (the helper joins the DB container's network namespace, no
-routable IP needed) — exclude their volumes with a `volumes` filter and
+routable IP needed); exclude their volumes with a `volumes` filter and
 rely on the dump. Snapshot hooks don't work except btrfs's documented
 non-root path.
 
@@ -512,7 +512,7 @@ is the long-lived daemon that the systemd unit starts; it backs up on
 `manager.period` and reacts to container events.
 
 **Upgrading from v1.5 or earlier:** bare `run` used to start the daemon and now
-requires an explicit target, so it errors instead. This is deliberate — a stale
+requires an explicit target, so it errors instead. This is deliberate: a stale
 `ExecStart=… run` would otherwise run a full backup and exit, leaving the unit
 dead and scheduled backups silently stopped. Packaged units are updated on
 upgrade; a **hand-copied** user unit is not, so change its `ExecStart` to
@@ -523,7 +523,7 @@ live `running (Nm)` while a backup is in flight (`running?` past
 `run_timeout`, in case it is stuck). When a group shows `failed` it points you to
 `inspect <group>`, which shows the failure reason, a bounded tail of the last
 run's log, a size-over-time trend, recent runs, and the group's compiled
-config — all from persisted state, no journal needed. `logs <group>` reads the
+config, all from persisted state, no journal needed. `logs <group>` reads the
 full output from the systemd journal (`journalctl -u borgmatic-manager`, or
 `--user` when not root; `-f` follows a run live).
 
@@ -538,9 +538,9 @@ full output from the systemd journal (`journalctl -u borgmatic-manager`, or
 | `manager.actions` | `[create, prune, compact, check]` | borgmatic actions per cycle, in order |
 | `manager.container_cli` | derived from socket | CLI for generated dump commands (`docker`/`podman`); default follows the connected socket |
 | `manager.run_timeout` | none | bound one group's run; SIGTERM → SIGKILL escalation |
-| `borgmatic.*` | — | defaults merged into every group's config |
+| `borgmatic.*` | none | defaults merged into every group's config |
 
-Local tweaks belong in `/etc/borgmatic-manager/conf.d/*.yaml` (`.yml` works too) — full config
+Local tweaks belong in `/etc/borgmatic-manager/conf.d/*.yaml` (`.yml` works too): full config
 fragments (`manager:` and/or `borgmatic:` sections) deep-merged over
 `manager.yaml` in lexical filename order. Package upgrades never touch
 `/etc`; the shipped default lives at
@@ -548,9 +548,9 @@ fragments (`manager:` and/or `borgmatic:` sections) deep-merged over
 install, so improvements to it reach you via that reference copy without
 upgrade prompts.
 
-Per-group overrides live in `/etc/borgmatic-manager/groups/{group}.yaml` —
+Per-group overrides live in `/etc/borgmatic-manager/groups/{group}.yaml`;
 each file is a borgmatic config fragment (top-level options) deep-merged over
-the defaults (lists replace). Anything borgmatic supports is valid — including
+the defaults (lists replace). Anything borgmatic supports is valid, including
 backing up **bind-mounted host paths** by adding `source_directories` to a
 group override.
 
@@ -576,14 +576,14 @@ labels for overrides instead).
 | `RUNTIME_DIR` | `/run/borgmatic-manager` | generated configs, borgmatic runtime dir |
 | `STATE_DIR` | `/var/lib/borgmatic-manager` | schedule state (`schedule.json`) + borgmatic check-frequency state |
 | `CONTAINER_SOCKET` | autodetected | Docker/Podman socket; probes `/var/run/docker.sock`, `/run/podman/podman.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock` |
-| `BORGMATIC_PATH` | — | borgmatic binary override |
+| `BORGMATIC_PATH` | unset | borgmatic binary override |
 
 ## Scheduling
 
 The schedule is persistent (like a systemd timer with `Persistent=true`):
 each group's last successful run is recorded in `$STATE_DIR/schedule.json`,
 and a group only runs when its period has elapsed since then **or its
-membership changed** (a volume or database joined/left — so a newly labeled
+membership changed** (a volume or database joined/left, so a newly labeled
 container is backed up within seconds, without re-running everything else).
 Consequences:
 
@@ -594,7 +594,7 @@ Consequences:
   run groups whose membership actually changed.
 - Failed or interrupted groups stay due and retry; only borgmatic exit 0
   marks success.
-- Missing or corrupt schedule state degrades to "everything is due" — the
+- Missing or corrupt schedule state degrades to "everything is due": the
   failure direction is an extra backup, never a skipped one.
 - To back up now regardless of the schedule, run `borgmatic-manager run --all`
   (every group) or `borgmatic-manager run <group>` (just one). It records its
@@ -603,7 +603,7 @@ Consequences:
 
 `borgmatic-manager status` shows the resulting schedule: each group's last
 run, its outcome (duration, warnings, exit code, file count and sizes from
-borgmatic's create result — captured during the run, so no repository
+borgmatic's create result, captured during the run, so no repository
 access is needed), and when the next run is due. Groups whose config
 generation was refused (shared-repo safety) show as `refused`, and groups
 failing the per-cycle config validation show `config-invalid`. For
@@ -616,13 +616,13 @@ runs bypass the schedule and don't update it.
 ## Security model
 
 Labels are the manager's control surface, so **anyone who can create or
-label a container controls what the manager backs up — and, via
+label a container controls what the manager backs up and, via
 `config.*`/`spec.config` command hooks, can run commands as the manager's
 user (root under the system unit)**. On most hosts that's no new privilege:
 whoever can label containers can reach the container socket, which is
 already root-equivalent. It matters when label-setting is delegated more
 broadly than root (a CI deploy identity, `docker`-group users, multi-tenant
-rootless setups) — in those environments, treat label write access as root
+rootless setups); in those environments, treat label write access as root
 on this host, and don't grant it more widely than you would sudo.
 
 What the manager enforces at the boundary: group names must be safe slugs
@@ -642,13 +642,13 @@ are skipped, never queued.
 per-repository and snapshot locks are held as `flock`s in `$STATE_DIR/locks/`,
 wrapping the **entire** borgmatic run. This matters because borgmatic creates
 filesystem snapshots *before* it ever invokes Borg, so Borg's own repository
-lock (and `lock_wait`) can't protect the snapshot phase — two borgmatic
+lock (and `lock_wait`) can't protect the snapshot phase: two borgmatic
 processes snapshotting the same subvolume would collide on a fixed snapshot path
 and one's cleanup could delete the other's live snapshot. The flock closes that.
 `flock`s release automatically if a process dies, so a crash never strands one.
 
 Ad-hoc `run` **never queues**: if a group's lock is already held (by the daemon
-or another run), it reports the group as `locked` and exits non-zero — retry
+or another run), it reports the group as `locked` and exits non-zero; retry
 once the in-progress run finishes. The daemon skips a group locked elsewhere and
 waits out a period before retrying, rather than re-attempting on every wake.
 
@@ -657,8 +657,8 @@ by removing the sharing or coordinating it explicitly:
 
 - **Generated configs.** Every process except the daemon generates into its own
   private directory. Sharing the daemon's would let one process's reconcile
-  delete a config mid-run, and — because borgmatic re-reads the config when it
-  spawns — hand a running backup a different run ID than its reaper looks for,
+  delete a config mid-run, and, because borgmatic re-reads the config when it
+  spawns, hand a running backup a different run ID than its reaper looks for,
   stranding dump helper containers.
 - **`schedule.json`.** Every write re-reads the file under an exclusive `flock`
   and merges, so concurrent processes can't erase each other's history, success
@@ -678,20 +678,20 @@ scheduled or ad-hoc backup may touch the same repository.
 
 ## Troubleshooting
 
-- `sudo borgmatic-manager status` — per-group last run, result (duration,
+- `sudo borgmatic-manager status`: per-group last run, result (duration,
   warnings, exit code), file count and archive size, the next due time, and
   `running` while a backup is in flight; failed groups point you to `inspect`
-- `sudo borgmatic-manager inspect <group>` — why a group failed (captured
+- `sudo borgmatic-manager inspect <group>`: why a group failed (captured
   reason + last-run log tail), its size trend and recent runs, and the compiled
   config, all from persisted state
-- `sudo borgmatic-manager logs <group>` — that group's full borgmatic output
+- `sudo borgmatic-manager logs <group>`: that group's full borgmatic output
   from the journal (`-f` to follow a run live)
-- `sudo borgmatic-manager discover` — did my labels work? (near-miss labels
+- `sudo borgmatic-manager discover`: did my labels work? (near-miss labels
   warn here and in the journal)
-- `journalctl -u borgmatic-manager` — raw JSON logs; per-group results include
+- `journalctl -u borgmatic-manager`: raw JSON logs; per-group results include
   `exit_code`, `warnings`, `duration`
-- "repository does not exist" — run the printed `repo-create` command (once)
-- database dumps fail — is the DB container running? (helper containers join
+- "repository does not exist": run the printed `repo-create` command (once)
+- database dumps fail: is the DB container running? (helper containers join
   its network namespace, so it must be up); in hostname mode, is the client
   tool on the host and the address reachable?
 
@@ -708,12 +708,12 @@ borgmatic:
 
 borgmatic snapshots the subvolume/dataset **containing** each source
 directory and cleans up afterward; archives record the original paths (needs
-borg ≥ 1.4). Groups with snapshot hooks serialize with each other — borgmatic
+borg ≥ 1.4). Groups with snapshot hooks serialize with each other: borgmatic
 snapshot cleanup is not concurrency-safe.
 
 **Granularity matters.** Docker/Podman create volumes as plain directories,
 so the snapshot unit is whatever subvolume/dataset contains
-`/var/lib/docker/volumes`. On many hosts that's the root filesystem — the
+`/var/lib/docker/volumes`. On many hosts that's the root filesystem; the
 manager warns when the volumes directory is not its own boundary. Dedicated
 setup (greenfield):
 
@@ -760,7 +760,7 @@ mise run e2e-dind  # hermetic e2e inside a docker-in-docker host (needs only doc
 mise run build     # bin/borgmatic-manager
 ```
 
-Architecture: `internal/{runtime,discovery,config,runner,scheduler,events,orchestrator}` —
+Architecture: `internal/{runtime,discovery,config,runner,scheduler,events,orchestrator}`;
 see [.planning/v2-host-pivot-SPEC.md](.planning/v2-host-pivot-SPEC.md) for
 the full design and its rationale.
 
