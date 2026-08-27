@@ -47,8 +47,9 @@ func TestReportHandlerLevelGate(t *testing.T) {
 	assert.True(t, h.Enabled(ctx, slog.LevelError))
 }
 
-// doctor exists to diagnose a broken setup, and "borgmatic is not installed" is
-// one of the setups it must still be useful in. Label and config-shape problems
+// doctor exists to diagnose a broken setup, and "no usable borgmatic" (not yet
+// provisioned and provisioning failed, a broken override) is one of the setups
+// it must still be useful in. Label and config-shape problems
 // are the manager's own to find, so generation runs regardless; only borgmatic's
 // schema check is skipped, and it says so rather than going quiet.
 func TestValidateGeneratedConfigsSkipsLoudlyWithoutBorgmatic(t *testing.T) {
@@ -58,10 +59,10 @@ func TestValidateGeneratedConfigsSkipsLoudlyWithoutBorgmatic(t *testing.T) {
 	out := captureStdout(t, func() { r.validateGeneratedConfigs(context.Background(), files, "") })
 
 	assert.Contains(t, out, "skipped")
-	assert.Contains(t, out, "borgmatic is not installed")
+	assert.Contains(t, out, "no usable borgmatic")
 	assert.Contains(t, out, "still compiled", "the operator is told what did get checked")
 	assert.Equal(t, 1, r.warned, "a skipped check is a warning, not a silent pass")
-	assert.Equal(t, 0, r.failed, "a missing binary is not a config failure")
+	assert.Equal(t, 0, r.failed, "an unusable binary is not a config failure")
 	assert.NotContains(t, out, "validate:alpha", "no per-group verdict can be claimed without borgmatic")
 }
 
