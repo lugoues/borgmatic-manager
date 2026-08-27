@@ -153,3 +153,28 @@ func TestSelectingTheToolchainStripsHostPythonEnv(t *testing.T) {
 	assert.Empty(t, os.Getenv("PYTHONPATH"))
 	assert.Empty(t, os.Getenv("PYTHONHOME"))
 }
+
+// A broken toolchain must hand restore/passthrough an unaltered host
+// fallback: the host install may itself rely on the Python variables the
+// toolchain sheds, and stripping them before the probe's verdict would break
+// the very fallback being reached for.
+func TestBrokenToolchainFallbackKeepsHostPythonEnv(t *testing.T) {
+	stateDir := t.TempDir()
+	name := toolchain.PinnedVersionDirName()
+	vdir := filepath.Join(stateDir, "toolchain", "versions", name)
+	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\nexit 1\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", name),
+		filepath.Join(stateDir, "toolchain", "current")))
+
+	hp := hostWith(t, "#!/bin/sh\necho 2.1.7\n")
+	t.Setenv("BORGMATIC_PATH", "")
+	t.Setenv("PYTHONPATH", "/opt/host/pythonpath")
+
+	p, err := resolveBorgmatic(context.Background(), &config.ManagerConfig{}, filepath.Join(stateDir, "toolchain"))
+	require.NoError(t, err)
+	assert.Equal(t, hp, p, "the broken toolchain falls through to the host")
+	assert.Equal(t, "/opt/host/pythonpath", os.Getenv("PYTHONPATH"),
+		"the host fallback runs in the environment the host install expects")
+}

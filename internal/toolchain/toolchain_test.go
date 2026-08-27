@@ -567,3 +567,26 @@ func TestFastPathCleanupSkipsWhileProvisionLockHeld(t *testing.T) {
 	_, statErr := os.Stat(filepath.Join(old, ".superseded"))
 	assert.True(t, os.IsNotExist(statErr), "no retirement while another process provisions")
 }
+
+// A launcher truncated into a zero-exit no-op must not degrade-pass: it would
+// sail through preflight's floor (unparseable versions pass there by design)
+// and record no-op invocations as successful backups.
+func TestDegradeRejectsANoOpLauncher(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, "versions", "uv0.0.1-py3.12-borgmatic2.0.0")
+	require.NoError(t, os.MkdirAll(filepath.Join(old, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(old, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\nexit 0\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(old, "manifest.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.Symlink(filepath.Join("versions", "uv0.0.1-py3.12-borgmatic2.0.0"), filepath.Join(root, "current")))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no network", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	tc := New(root, slog.New(slog.DiscardHandler))
+	tc.downloadBase = srv.URL
+
+	_, err := tc.Ensure(context.Background())
+	require.Error(t, err, "exit 0 with no version is not borgmatic; degrading to it would fake successful backups")
+}

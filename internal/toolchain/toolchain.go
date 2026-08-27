@@ -147,7 +147,7 @@ func New(root string, logger *slog.Logger) *Toolchain {
 			// configuration, and that includes these probes: a poisoned
 			// PYTHONHOME failing the health check would refuse the very
 			// toolchain that escapes it.
-			cmd.Env = hostPythonEnvSanitized()
+			cmd.Env = SanitizedEnviron()
 			// WaitDelay releases the output-pipe wait after the kill: a hung
 			// launcher's child (a wedged Python holding stdout) must not turn
 			// a bounded probe back into an unbounded one.
@@ -241,9 +241,13 @@ func (t *Toolchain) Info() (Manifest, bool, error) {
 	return m, t.Fresh(), nil
 }
 
-// healthy reports whether the toolchain borgmatic at p actually runs. Used
-// for the degrade fallback, where a stale (older-versioned) toolchain is
-// acceptable, so only the exit status is judged.
+// healthy reports whether the toolchain borgmatic at p actually runs and
+// reports a plausible version. Used for the degrade fallback, where a stale
+// (older-versioned) toolchain is acceptable, so the version is not compared
+// to the pin; but it must exist and parse. A launcher truncated into a
+// zero-exit no-op would otherwise degrade-pass, sail through preflight's
+// floor (which deliberately passes unparseable versions), and record no-op
+// invocations as successful backups that created nothing.
 func (t *Toolchain) healthy(ctx context.Context, p string) bool {
 	ctx, cancel := context.WithTimeout(ctx, t.probeTimeout)
 	defer cancel()
@@ -252,7 +256,17 @@ func (t *Toolchain) healthy(ctx context.Context, p string) bool {
 		t.logger.Warn("toolchain borgmatic failed its health check", "borgmatic", p, "error", err, "output", out)
 		return false
 	}
+	if !plausibleVersion(reportedVersion(out)) {
+		t.logger.Warn("toolchain borgmatic reports no usable version; treating it as broken", "borgmatic", p, "reported", out)
+		return false
+	}
 	return true
+}
+
+// plausibleVersion reports whether v looks like a release version: a real
+// borgmatic always prints one, and anything that does not is not borgmatic.
+func plausibleVersion(v string) bool {
+	return v != "" && v[0] >= '0' && v[0] <= '9' && strings.ContainsRune(v, '.')
 }
 
 // freshAndHealthy accepts the current toolchain only when its name matches
@@ -292,9 +306,11 @@ func reportedVersion(out string) string {
 	return fields[len(fields)-1]
 }
 
-// hostPythonEnvSanitized is the process environment minus the host's Python
-// configuration, which the managed interpreter must never read.
-func hostPythonEnvSanitized() []string {
+// SanitizedEnviron is the process environment minus the host's Python
+// configuration, which the managed interpreter must never read. Exported so
+// callers probing a toolchain binary can sanitize their probe without
+// mutating the process environment before the probe's verdict is in.
+func SanitizedEnviron() []string {
 	env := os.Environ()
 	out := make([]string, 0, len(env))
 	for _, kv := range env {

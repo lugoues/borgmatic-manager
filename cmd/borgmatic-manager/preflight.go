@@ -388,6 +388,18 @@ func hostBorgmaticPath() (string, bool) {
 	return "", false
 }
 
+// sanitizedProbe is commandOutput --version with the host's Python
+// configuration removed from the probe's own environment only.
+func sanitizedProbe(ctx context.Context, bin string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- probing the toolchain launcher
+	cmd.Env = toolchain.SanitizedEnviron()
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.Output()
+	return string(out), err
+}
+
 // stripHostPythonEnv removes the host's Python environment configuration
 // once a toolchain borgmatic is selected. The managed launcher's shebang
 // still honors PYTHONHOME and PYTHONPATH, so a service environment carrying
@@ -424,8 +436,12 @@ func resolveBorgmatic(ctx context.Context, cfg *config.ManagerConfig, toolchainD
 		return p, nil
 	}
 	if p, ok := toolchain.CurrentBorgmatic(toolchainDir); ok {
-		stripHostPythonEnv()
-		if _, err := commandOutput(ctx, p, "--version"); err == nil {
+		// Probed on a sanitized environment WITHOUT touching the process env:
+		// the strip commits only once the probe passes. A broken toolchain
+		// must hand restore and passthrough an unaltered host fallback, which
+		// may itself rely on the very variables the toolchain sheds.
+		if _, err := sanitizedProbe(ctx, p); err == nil {
+			stripHostPythonEnv()
 			return p, nil
 		}
 		slog.Warn("toolchain borgmatic is broken; falling back to a host install for this command (the next daemon launch repairs the toolchain)", "path", p)
