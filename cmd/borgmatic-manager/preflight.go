@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
@@ -164,7 +165,20 @@ var borgVersionCache = struct {
 type borgVersionEntry struct {
 	mtime time.Time
 	size  int64
+	dev   uint64
+	ino   uint64
 	out   string
+}
+
+// fileIdentity is (device, inode): size and mtime alone can be preserved
+// across an atomic replacement (a symlink repointed at a packaged binary with
+// matching metadata), and a version cache blind to that would keep enforcing
+// the old binary's verdict on the new one.
+func fileIdentity(info os.FileInfo) (uint64, uint64) {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Dev, st.Ino
+	}
+	return 0, 0
 }
 
 // cachedBorgVersion is commandOutput --version through the cache. Only
@@ -177,10 +191,11 @@ func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
 	if statErr != nil {
 		return "", false
 	}
+	dev, ino := fileIdentity(info)
 	borgVersionCache.mu.Lock()
 	e, hit := borgVersionCache.m[path]
 	borgVersionCache.mu.Unlock()
-	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() {
+	if hit && e.mtime.Equal(info.ModTime()) && e.size == info.Size() && e.dev == dev && e.ino == ino {
 		return e.out, true
 	}
 	out, err := commandOutput(ctx, path, "--version")
@@ -188,7 +203,7 @@ func cachedBorgVersion(ctx context.Context, path string) (string, bool) {
 		return out, false
 	}
 	borgVersionCache.mu.Lock()
-	borgVersionCache.m[path] = borgVersionEntry{mtime: info.ModTime(), size: info.Size(), out: out}
+	borgVersionCache.m[path] = borgVersionEntry{mtime: info.ModTime(), size: info.Size(), dev: dev, ino: ino, out: out}
 	borgVersionCache.mu.Unlock()
 	return out, true
 }

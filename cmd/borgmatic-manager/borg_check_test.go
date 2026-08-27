@@ -259,3 +259,32 @@ func TestTransientBorgProbeFailureIsRetried(t *testing.T) {
 	require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil),
 		"the second probe must run and succeed; a cached failure would stall every cycle")
 }
+
+// An atomic replacement can preserve size and mtime (a repointed symlink, a
+// same-sized package); the cache must still see the new binary.
+func TestBorgVersionCacheSeesAtomicReplacement(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "borg")
+	// Two same-length scripts reporting different versions.
+	oldScript := "#!/bin/sh\necho borg 1.4.5 #pad\n"
+	newScript := "#!/bin/sh\necho borg 1.2.0 #pad\n"
+	require.Len(t, newScript, len(oldScript))
+	require.NoError(t, os.WriteFile(target, []byte(oldScript), 0o755))
+	info, err := os.Stat(target)
+	require.NoError(t, err)
+	t.Setenv("PATH", dir)
+
+	require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil),
+		"1.4.5 passes and is cached")
+
+	// Atomic replacement with identical size and mtime, new inode.
+	repl := filepath.Join(dir, "borg.new")
+	require.NoError(t, os.WriteFile(repl, []byte(newScript), 0o755))
+	require.NoError(t, os.Chtimes(repl, info.ModTime(), info.ModTime()))
+	require.NoError(t, os.Rename(repl, target))
+	require.NoError(t, os.Chtimes(target, info.ModTime(), info.ModTime()))
+
+	hooked := &config.ManagerConfig{Borgmatic: map[string]interface{}{"btrfs": map[string]interface{}{}}}
+	require.Error(t, checkBorg(context.Background(), hooked, nil, nil),
+		"the downgraded borg must be re-probed and fail the snapshot floor, not served from cache")
+}
