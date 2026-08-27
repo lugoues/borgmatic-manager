@@ -601,3 +601,26 @@ func TestGenerationInUseDetection(t *testing.T) {
 	assert.False(t, generationInUse(filepath.Join(t.TempDir(), "empty")),
 		"nothing maps a fresh directory")
 }
+
+// "current" restored as a real directory (a backup restore, a manual copy)
+// must be repairable: rename cannot replace a directory with a symlink, and
+// without clearing it every launch would rebuild perfectly and fail the flip.
+func TestMalformedCurrentDirectoryIsReplaced(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "current", "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "current", "bin", "borgmatic"),
+		[]byte("#!/bin/sh\nexit 1\n"), 0o755))
+
+	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
+	tc, _ := newTestToolchain(t, root, tarball, sum)
+	require.True(t, tc.Exists(), "a directory named current is provisioned evidence, however malformed")
+
+	p, err := tc.Ensure(context.Background())
+	require.NoError(t, err)
+	info, lerr := os.Lstat(filepath.Join(root, "current"))
+	require.NoError(t, lerr)
+	assert.NotZero(t, info.Mode()&os.ModeSymlink, "the malformed directory is replaced by the ordinary symlink")
+	out, rerr := os.ReadFile(p)
+	require.NoError(t, rerr)
+	assert.Contains(t, string(out), BorgmaticVersion)
+}

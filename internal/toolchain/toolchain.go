@@ -505,7 +505,19 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 	if err := os.Symlink(filepath.Join("versions", name), tmp); err != nil {
 		return fmt.Errorf("staging current symlink: %w", err)
 	}
-	if err := os.Rename(tmp, filepath.Join(t.root, "current")); err != nil {
+	// Rename atomically replaces a symlink but refuses to replace a real
+	// directory, which "current" can have become through a backup restore or
+	// a manual copy. Under provision.lock, and only for that malformed
+	// shape, clear it so the repair this whole rebuild exists for can
+	// actually commit; the ordinary flip stays rename-over-symlink.
+	currentPath := filepath.Join(t.root, "current")
+	if info, err := os.Lstat(currentPath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+		t.logger.Warn("current toolchain entry is not a symlink; replacing the malformed entry", "path", currentPath)
+		if err := os.RemoveAll(currentPath); err != nil {
+			return fmt.Errorf("clearing malformed current entry: %w", err)
+		}
+	}
+	if err := os.Rename(tmp, currentPath); err != nil {
 		return fmt.Errorf("switching current toolchain: %w", err)
 	}
 	// The new current must not carry a retirement clock from any past life or

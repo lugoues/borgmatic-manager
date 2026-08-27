@@ -156,8 +156,18 @@ func runDoctor(ctx context.Context) error {
 		case err != nil:
 			r.fail("borgmatic", fmt.Sprintf("running %s --version: %v", path, err))
 		case !versionAtLeast(borgmaticVersionOf(version), minBorgmatic):
-			r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d (distro packages often lag; use uv or pipx)",
-				path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+			// The daemon does not run on this either: launchBorgmatic rejects
+			// a below-floor host install and provisions the toolchain, so an
+			// unprovisioned setup here is the supported first-launch plan,
+			// not a failure. An explicit override or an existing toolchain
+			// reporting an old version IS wrong, and stays one.
+			if explicitBorgmaticPath(e.cfg) == "" && !toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler)).Exists() {
+				r.warn("borgmatic", fmt.Sprintf("%s is %s, below %d.%d.%d; the daemon provisions its own toolchain on first launch",
+					path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+			} else {
+				r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d",
+					path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+			}
 		default:
 			borgmaticPath = path
 			r.pass("borgmatic", fmt.Sprintf("%s (%s)", path, strings.TrimSpace(version)))

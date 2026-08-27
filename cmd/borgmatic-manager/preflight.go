@@ -467,11 +467,18 @@ func commandOutput(ctx context.Context, name string, args ...string) (string, er
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- version preflight of operator-configured binaries
-	// WaitDelay releases the output-pipe wait after the kill: a probed
-	// binary whose descendant inherits stdout and wedges must not turn this
-	// bounded probe into an unbounded one, or a broken toolchain launcher
-	// would block restore and passthrough from ever reaching the host
-	// fallback.
+	// Its own process group, killed whole on timeout: the per-cycle borg gate
+	// probes through here with failures deliberately uncached, and a hanging
+	// launcher's surviving descendant per cycle would slowly exhaust the
+	// host. WaitDelay additionally releases the output-pipe wait, so a
+	// descendant holding stdout cannot turn the bound into an unbounded one.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.Output()
 	return string(out), err
