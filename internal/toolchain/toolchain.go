@@ -394,6 +394,7 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 	// anyway; drop it rather than carry megabytes per version.
 	_ = os.RemoveAll(filepath.Join(vdir, "cache"))
 
+	_ = os.Remove(filepath.Join(vdir, ".superseded"))
 	manifest, err := json.Marshal(Manifest{
 		UVVersion:        uvVersion,
 		PythonVersion:    pythonVersion,
@@ -605,6 +606,14 @@ func (t *Toolchain) cleanOldVersions(keep string) {
 			continue
 		}
 		dir := filepath.Join(t.root, "versions", e.Name())
+		// A directory without a manifest was never finished: either another
+		// process is provisioning it right now (this fast-path cleanup does
+		// not hold provision.lock) or it is crash debris, which reapUnfinished
+		// removes under the lock. Marking it here would leave a stale
+		// retirement clock inside a directory that may yet become current.
+		if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
+			continue
+		}
 		marker := filepath.Join(dir, ".superseded")
 		info, err := os.Stat(marker)
 		if err != nil {

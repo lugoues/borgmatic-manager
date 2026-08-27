@@ -122,6 +122,9 @@ func TestStaleToolchainIsReprovisionedAndOldRemoved(t *testing.T) {
 	old := filepath.Join(root, "versions", "uv0.0.1-py3.12-borgmatic2.0.0")
 	require.NoError(t, os.MkdirAll(filepath.Join(old, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(old, "bin", "borgmatic"), []byte("#!/bin/sh\necho borgmatic 2.0.0\n"), 0o755))
+	// A manifest marks it finished: retirement only ever touches completed
+	// toolchains, never a directory another process may still be building.
+	require.NoError(t, os.WriteFile(filepath.Join(old, "manifest.json"), []byte("{}"), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", "uv0.0.1-py3.12-borgmatic2.0.0"), filepath.Join(root, "current")))
 
 	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
@@ -333,7 +336,7 @@ func TestDownloadedUVIsInvokedFromItsVersionDir(t *testing.T) {
 	// The real runUV execs the downloaded file; prove the plumbing holds by
 	// letting the fake uv script do the install itself.
 	root := t.TempDir()
-	script := fmt.Sprintf("#!/bin/sh\nmkdir -p \"$(dirname \"$0\")/bin\"\nprintf '#!/bin/sh\\necho borgmatic %s\\n' > \"$(dirname \"$0\")/bin/borgmatic\"\nchmod 0755 \"$(dirname \"$0\")/bin/borgmatic\"\n", BorgmaticVersion)
+	script := fmt.Sprintf("#!/bin/sh\nmkdir -p \"$(dirname \"$0\")/bin\"\nprintf '#!/bin/sh\necho borgmatic %s\n' > \"$(dirname \"$0\")/bin/borgmatic\"\nchmod 0755 \"$(dirname \"$0\")/bin/borgmatic\"\n", BorgmaticVersion)
 	tarball, sum := uvTarball(t, script)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
