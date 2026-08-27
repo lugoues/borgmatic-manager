@@ -179,13 +179,29 @@ func (t *Toolchain) Info() (Manifest, bool, error) {
 	return m, t.Fresh(), nil
 }
 
+// healthy reports whether the toolchain borgmatic at p actually runs and
+// reports a version. Freshness alone is a symlink name: a deleted managed
+// Python or a corrupted package tree keeps the launcher in place while every
+// exec of it fails, and trusting the name would return that broken toolchain
+// on every launch without ever reprovisioning.
+func (t *Toolchain) healthy(ctx context.Context, p string) bool {
+	out, err := t.binVersion(ctx, p)
+	if err != nil {
+		t.logger.Warn("toolchain borgmatic failed its health check", "borgmatic", p, "error", err, "output", out)
+		return false
+	}
+	return true
+}
+
 // Ensure returns a working toolchain borgmatic, provisioning or refreshing
-// first when the current one is missing or does not match the pins. A failed
-// refresh degrades to the existing toolchain rather than failing the launch:
-// a stale borgmatic that works beats no borgmatic at all. Only "nothing
-// provisioned and provisioning failed" is an error.
+// first when the current one is missing, does not match the pins, or no
+// longer runs. A failed refresh degrades to the existing toolchain (if it
+// still works) rather than failing the launch: a stale borgmatic that works
+// beats no borgmatic at all. Only "nothing usable and provisioning failed" is
+// an error.
 func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
-	if p, ok := t.BorgmaticPath(); ok && t.Fresh() {
+	if p, ok := t.BorgmaticPath(); ok && t.Fresh() && t.healthy(ctx, p) {
+		t.cleanOldVersions(versionDirName())
 		return p, nil
 	}
 	if err := os.MkdirAll(t.root, 0o700); err != nil {
@@ -201,14 +217,14 @@ func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 	defer lock.Release()
 
 	// Whoever held the lock may have provisioned exactly what was needed.
-	if p, ok := t.BorgmaticPath(); ok && t.Fresh() {
+	if p, ok := t.BorgmaticPath(); ok && t.Fresh() && t.healthy(ctx, p) {
 		return p, nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, provisionTimeout)
 	defer cancel()
 	if err := t.provision(ctx); err != nil {
-		if p, ok := t.BorgmaticPath(); ok {
+		if p, ok := t.BorgmaticPath(); ok && t.healthy(ctx, p) {
 			t.logger.Warn("toolchain provisioning failed; continuing with the existing toolchain",
 				"error", err, "borgmatic", p)
 			return p, nil
@@ -405,8 +421,18 @@ func uvEnv(vdir string) []string {
 	return env
 }
 
-// cleanOldVersions removes every version directory except keep. Best effort:
-// a leftover costs disk, not correctness.
+// supersededGrace is how long a superseded toolchain version survives before
+// deletion. A borgmatic started from it (a scheduled run, a restore, or a
+// passthrough that holds none of the manager's locks) keeps importing modules
+// from its environment for as long as it runs; deleting on the flip would
+// pull the interpreter's files out from under it mid-backup. A day outlives
+// any sane run, and the cost of waiting is one ~150MB directory.
+const supersededGrace = 24 * time.Hour
+
+// cleanOldVersions retires every version directory except keep, in two
+// stages: a directory is first marked superseded, and only removed by a later
+// pass once the mark has aged past supersededGrace. Best effort throughout: a
+// leftover costs disk, not correctness.
 func (t *Toolchain) cleanOldVersions(keep string) {
 	entries, err := os.ReadDir(filepath.Join(t.root, "versions"))
 	if err != nil {
@@ -416,7 +442,20 @@ func (t *Toolchain) cleanOldVersions(keep string) {
 		if e.Name() == keep {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(t.root, "versions", e.Name())); err != nil {
+		dir := filepath.Join(t.root, "versions", e.Name())
+		marker := filepath.Join(dir, ".superseded")
+		info, err := os.Stat(marker)
+		if err != nil {
+			if err := os.WriteFile(marker, nil, 0o600); err == nil {
+				t.logger.Info("toolchain version superseded; removed after a grace period in case a running borgmatic still uses it",
+					"version", e.Name(), "grace", supersededGrace)
+			}
+			continue
+		}
+		if time.Since(info.ModTime()) < supersededGrace {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
 			t.logger.Warn("could not remove old toolchain version", "version", e.Name(), "error", err)
 		} else {
 			t.logger.Info("removed old toolchain version", "version", e.Name())

@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -129,8 +130,65 @@ func TestStaleToolchainIsReprovisionedAndOldRemoved(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(root, "current", "bin", "borgmatic"), p)
 	assert.True(t, tc.Fresh())
-	_, statErr := os.Stat(old)
-	assert.True(t, os.IsNotExist(statErr), "the superseded version directory is removed")
+
+	// The superseded directory is not removed on the flip: a borgmatic
+	// started from it (a passthrough holds none of the manager's locks) may
+	// still be importing from its environment. It is marked, and removed only
+	// once the mark has aged past the grace period.
+	marker := filepath.Join(old, ".superseded")
+	_, statErr := os.Stat(marker)
+	require.NoError(t, statErr, "the old version is marked, not deleted")
+
+	aged := time.Now().Add(-supersededGrace - time.Hour)
+	require.NoError(t, os.Chtimes(marker, aged, aged))
+	_, err = tc.Ensure(context.Background())
+	require.NoError(t, err)
+	_, statErr = os.Stat(old)
+	assert.True(t, os.IsNotExist(statErr), "aged past the grace period, the old version is removed")
+}
+
+// Freshness is only a symlink name. A toolchain whose environment was deleted
+// or corrupted keeps its launcher and its name, and returning it on that
+// evidence would fail every launch without ever self-healing.
+func TestBrokenFreshToolchainIsReprovisioned(t *testing.T) {
+	root := t.TempDir()
+	vdir := filepath.Join(root, "versions", versionDirName())
+	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\necho 'ModuleNotFoundError: borgmatic' >&2\nexit 1\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
+
+	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
+	tc, envs := newTestToolchain(t, root, tarball, sum)
+	require.True(t, tc.Fresh(), "the name says fresh; only the health check knows better")
+
+	p, err := tc.Ensure(context.Background())
+	require.NoError(t, err)
+	require.Len(t, *envs, 1, "the broken toolchain must be rebuilt")
+	out, err := os.ReadFile(p)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), BorgmaticVersion)
+}
+
+// Degrading to the existing toolchain is only safe when it still runs: handing
+// back a broken binary would just move the failure one step later.
+func TestDegradeRequiresAWorkingToolchain(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, "versions", "uv0.0.1-py3.12-borgmatic2.0.0")
+	require.NoError(t, os.MkdirAll(filepath.Join(old, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(old, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\nexit 1\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", "uv0.0.1-py3.12-borgmatic2.0.0"), filepath.Join(root, "current")))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no network", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	tc := New(root, slog.New(slog.DiscardHandler))
+	tc.downloadBase = srv.URL
+
+	_, err := tc.Ensure(context.Background())
+	require.Error(t, err, "a broken toolchain plus a failed provision is a real failure, not a degrade")
 }
 
 func TestProvisionFailureDegradesToExistingToolchain(t *testing.T) {
