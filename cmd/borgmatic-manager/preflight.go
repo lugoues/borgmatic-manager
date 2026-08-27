@@ -258,7 +258,11 @@ func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOv
 		groupLP := ""
 		hooks := hasSnapshotHooks(cfg.Borgmatic)
 		for _, m := range groupLayers {
-			if v, _ := m["local_path"].(string); v != "" {
+			// A group layer repeating the global path verbatim is inheritance
+			// restated, not a group-specific borg: generation skips it by the
+			// same equality, and letting it suppress the default gate here
+			// would leave that path validated nowhere.
+			if v, _ := m["local_path"].(string); v != "" && v != globalLP {
 				groupLP = v
 			}
 			hooks = hooks || hasSnapshotHooks(m)

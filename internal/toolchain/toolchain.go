@@ -148,6 +148,16 @@ func New(root string, logger *slog.Logger) *Toolchain {
 			// PYTHONHOME failing the health check would refuse the very
 			// toolchain that escapes it.
 			cmd.Env = SanitizedEnviron()
+			// Its own process group, killed whole on timeout: a damaged
+			// launcher's descendant must not survive the probe, or repeated
+			// health checks would accumulate orphans.
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Cancel = func() error {
+				if cmd.Process == nil {
+					return nil
+				}
+				return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
 			// WaitDelay releases the output-pipe wait after the kill: a hung
 			// launcher's child (a wedged Python holding stdout) must not turn
 			// a bounded probe back into an unbounded one.
@@ -713,12 +723,46 @@ func (t *Toolchain) cleanOldVersions(keep string) {
 		if time.Since(info.ModTime()) < supersededGrace {
 			continue
 		}
+		// The grace period covers ordinary runs; a passthrough or an
+		// unlimited-timeout backup can legitimately outlive it. A generation
+		// some live process still maps stays until it lets go.
+		if generationInUse(dir) {
+			t.logger.Info("superseded toolchain version is still in use; keeping it", "version", e.Name())
+			continue
+		}
 		if err := os.RemoveAll(dir); err != nil {
 			t.logger.Warn("could not remove old toolchain version", "version", e.Name(), "error", err)
 		} else {
 			t.logger.Info("removed old toolchain version", "version", e.Name())
 		}
 	}
+}
+
+// generationInUse reports whether any live process maps files from dir (a
+// borgmatic started from that generation keeps its interpreter and modules
+// mapped for its whole run). Best effort: unreadable /proc entries are
+// treated as not using the directory, and the scan only runs when a deletion
+// is already due.
+func generationInUse(dir string) bool {
+	prefix := dir + string(os.PathSeparator)
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
+	}
+	for _, p := range procs {
+		name := p.Name()
+		if name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		maps, err := os.ReadFile("/proc/" + name + "/maps") // #nosec G304 -- name is a numeric pid from /proc
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(maps), prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // tail returns the last n bytes of s: uv failures put the useful part

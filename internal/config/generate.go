@@ -485,9 +485,12 @@ func (g *Generator) refuseBrokenGroupBorgs(kept []*pending, refusals []Refusal) 
 // borgProbeResult is one local_path's raw probe outcome, shared by every
 // group naming it within a plan.
 type borgProbeResult struct {
-	problem string // resolution/exec problems; version judged per group
+	problem string // deterministic problems; version judged per group
 	version string
 	out     string
+	// transientProbeFailure marks an exec failure that may be momentary; the
+	// group runs and the run's own failure handling judges it.
+	transientProbeFailure bool
 }
 
 // probeGroupBorg resolves and probes one configured borg.
@@ -503,9 +506,21 @@ func (g *Generator) probeGroupBorg(lp string) borgProbeResult {
 		return borgProbeResult{problem: "not an executable file"}
 	}
 	out, err := g.borgVersion(path)
+	if err != nil {
+		// Exec failure can be transient (load, a probe timeout). Refusing on
+		// it would drop a NEW group from the schedule entirely, and with no
+		// persisted record nothing re-wakes for it before the global period.
+		// Keeping the group hands the same broken borg to the actual run,
+		// which fails loudly through the normal recorded-failure path and its
+		// retry cadence. Deterministic problems (missing, not executable,
+		// zero-exit with no version) still refuse.
+		g.logger.Warn("group borg probe failed; letting the run judge it",
+			"local_path", lp, "error", err, "output", strings.TrimSpace(out))
+		return borgProbeResult{transientProbeFailure: true}
+	}
 	fields := strings.Fields(out)
-	if err != nil || len(fields) == 0 {
-		return borgProbeResult{problem: fmt.Sprintf("--version failed (output %q)", strings.TrimSpace(out))}
+	if len(fields) == 0 {
+		return borgProbeResult{problem: "reports no usable version (empty output)"}
 	}
 	// "borg 1.4.4". Plausibility here: borgVersionAtLeast deliberately passes
 	// unparseable tokens, and a zero-exit shim printing garbage would
@@ -519,6 +534,9 @@ func (g *Generator) probeGroupBorg(lp string) borgProbeResult {
 
 // judgeGroupBorg applies one group's requirements to a shared probe result.
 func (g *Generator) judgeGroupBorg(lp string, probe borgProbeResult, snapshots bool) string {
+	if probe.transientProbeFailure {
+		return ""
+	}
 	if probe.problem != "" {
 		return probe.problem
 	}

@@ -590,3 +590,14 @@ func TestDegradeRejectsANoOpLauncher(t *testing.T) {
 	_, err := tc.Ensure(context.Background())
 	require.Error(t, err, "exit 0 with no version is not borgmatic; degrading to it would fake successful backups")
 }
+
+// A generation some live process still maps must survive its grace period: a
+// passthrough or an unlimited-timeout run can legitimately outlive 24 hours.
+func TestGenerationInUseDetection(t *testing.T) {
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	assert.True(t, generationInUse(filepath.Dir(exe)),
+		"this test binary maps its own directory")
+	assert.False(t, generationInUse(filepath.Join(t.TempDir(), "empty")),
+		"nothing maps a fresh directory")
+}

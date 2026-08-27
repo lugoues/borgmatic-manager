@@ -223,6 +223,8 @@ func runDoctor(ctx context.Context) error {
 		if fields := strings.Fields(out); err == nil && len(fields) > 0 {
 			version := fields[len(fields)-1]
 			switch {
+			case !toolchain.PlausibleReportedVersion(out):
+				r.fail("borg", fmt.Sprintf("%s reports no usable version (output %q); the daemon refuses to start on it", borgPath, strings.TrimSpace(out)))
 			case versionAtLeast(version, minBorg):
 				r.pass("borg", fmt.Sprintf("%s (%s, %s)", borgPath, version, bc.source))
 			case bc.snapshots:

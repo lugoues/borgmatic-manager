@@ -1756,3 +1756,21 @@ func TestRenderGroupForRestoreStillJudgesTheGroupBorg(t *testing.T) {
 	assert.Empty(t, yamlStr)
 	assert.Contains(t, reason, "local_path", "a no-op borg must not run a merge restore either")
 }
+
+// An exec failure probing a group's borg may be momentary; refusing would
+// drop a NEW group from the schedule with nothing to re-wake it before the
+// global period. The group runs and the run's own failure handling judges it.
+func TestTransientGroupBorgProbeFailureDoesNotRefuse(t *testing.T) {
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": "flaky-borg",
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
+
+	g, _ := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
+	g.SetBorgVersion(func(string) (string, error) { return "", fmt.Errorf("timeout") })
+	meta, refusals, err := g.Generate(st)
+	require.NoError(t, err)
+	require.Contains(t, meta, "app", "the run will judge the flaky borg and record a normal failure")
+	require.Empty(t, refusals)
+}

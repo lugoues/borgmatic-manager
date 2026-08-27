@@ -301,3 +301,18 @@ func TestGlobalLocalPathStaysInTheDefaultGate(t *testing.T) {
 		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st2))
 	})
 }
+
+// A group layer repeating the global local_path verbatim is inheritance
+// restated: it must not suppress the default gate, or the path would be
+// validated nowhere (generation skips it by the same equality).
+func TestOverrideRepeatingGlobalPathKeepsDefaultGate(t *testing.T) {
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": "/nonexistent/global-borg"})
+
+	cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": "/nonexistent/global-borg"}}
+	err := checkBorg(context.Background(), cfg, nil, st)
+	require.Error(t, err, "every group repeats the broken global path; the default gate must still catch it")
+	assert.Contains(t, err.Error(), "manager.yaml local_path")
+}
