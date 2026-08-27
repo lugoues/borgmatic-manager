@@ -89,9 +89,12 @@ sudo apt install ./borgmatic-manager_*_linux_amd64.deb
 
 # Or from source
 mise run install      # builds and installs binary, unit, default config (sudo inside)
-
-sudo uv tool install borgmatic   # if you don't have borgmatic >= 2.1
 ```
+
+Only [borg](https://borgbackup.readthedocs.io/) >= 1.4 needs to be on the
+host. borgmatic does not: the manager provisions its own isolated
+[toolchain](#the-borgmatic-toolchain) on first launch (a healthy host
+borgmatic >= 2.1 is used instead if you already have one).
 
 **2. Label your containers** — labels live on the *service*, not the volume,
 so a normal `docker compose up` after editing applies them:
