@@ -9,6 +9,10 @@ After=network-online.target docker.service podman.socket
 
 [Service]
 Type=notify
+# First launch may provision the borgmatic toolchain (a download plus a Python
+# install, bounded at ten minutes in the manager); systemd's default 90s would
+# kill the startup mid-provision and loop forever on a slow link.
+TimeoutStartSec=15min
 ExecStart=/usr/bin/borgmatic-manager run --scheduler
 Restart=on-failure
 RestartSec=10
