@@ -175,16 +175,16 @@ func runDoctor(ctx context.Context) error {
 		}
 	}
 
-	// borg is required outright: without the engine nothing runs. The version
-	// floor is hard only when snapshot hooks are configured.
+	// borg is required outright: without the engine nothing runs. Every borg
+	// the configuration names is checked (local_path overrides included); the
+	// version floor is hard only when snapshot hooks are configured.
 	snapshots := snapshotHooksConfigured(e.cfg, e.groupOverrides)
-	if borgPath, err := exec.LookPath("borg"); err != nil {
-		if snapshots {
-			r.fail("borg", "not on PATH, and snapshot hooks are configured")
-		} else {
-			r.fail("borg", "not on PATH; install it from your distribution (the manager provisions borgmatic, never borg)")
+	for _, bc := range borgCommands(e.cfg, e.groupOverrides) {
+		borgPath, err := resolveBorgCommand(bc.command)
+		if err != nil {
+			r.fail("borg", fmt.Sprintf("%s: %v; install it from your distribution (the manager provisions borgmatic, never borg)", bc.source, err))
+			continue
 		}
-	} else {
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
 		out, err := commandOutput(cctx, borgPath, "--version")
 		cancel()
@@ -192,11 +192,11 @@ func runDoctor(ctx context.Context) error {
 			version := fields[len(fields)-1]
 			switch {
 			case versionAtLeast(version, minBorg):
-				r.pass("borg", fmt.Sprintf("%s (%s)", borgPath, version))
+				r.pass("borg", fmt.Sprintf("%s (%s, %s)", borgPath, version, bc.source))
 			case snapshots:
-				r.fail("borg", fmt.Sprintf("%s is older than %d.%d and snapshot hooks are configured: archives would record snapshot paths", version, minBorg[0], minBorg[1]))
+				r.fail("borg", fmt.Sprintf("%s (%s) is older than %d.%d and snapshot hooks are configured: archives would record snapshot paths", version, bc.source, minBorg[0], minBorg[1]))
 			default:
-				r.warn("borg", fmt.Sprintf("%s is older than %d.%d (fine until snapshot hooks are enabled)", version, minBorg[0], minBorg[1]))
+				r.warn("borg", fmt.Sprintf("%s (%s) is older than %d.%d (fine until snapshot hooks are enabled)", version, bc.source, minBorg[0], minBorg[1]))
 			}
 		} else {
 			r.warn("borg", fmt.Sprintf("could not read version from %s", borgPath))

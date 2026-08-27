@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,7 +62,7 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 	// uses by hand against the same repositories). Checked before borgmatic so
 	// a missing borg fails cleanly instead of provisioning a toolchain for a
 	// deployment that cannot run anyway.
-	if err := checkBorg(ctx, snapshotHooksConfigured(e.cfg, e.groupOverrides)); err != nil {
+	if err := checkBorg(ctx, e.cfg, e.groupOverrides, snapshotHooksConfigured(e.cfg, e.groupOverrides)); err != nil {
 		return nil, err
 	}
 
@@ -111,29 +112,90 @@ func detectContainerCLI(cfg *config.ManagerConfig, socketPath string) string {
 	return ""
 }
 
-// checkBorg fails the launch when borg is absent: without the engine nothing
-// can back up or restore, and discovering that one failed cycle at a time
-// serves nobody. The version floor stays advisory unless snapshot hooks are
-// configured (archive path recording is silently wrong below it).
-func checkBorg(ctx context.Context, snapshotsConfigured bool) error {
-	borgPath, err := exec.LookPath("borg")
-	if err != nil {
-		return fmt.Errorf("borg not found on PATH: install it from your distribution or the official binaries " +
-			"(borg stays host-installed; the manager only provisions borgmatic)")
-	}
-	if out, err := commandOutput(ctx, borgPath, "--version"); err == nil && len(strings.Fields(out)) > 0 {
-		// "borg 1.4.4"
-		fields := strings.Fields(out)
-		borgVersion := fields[len(fields)-1]
-		if !versionAtLeast(borgVersion, minBorg) {
-			msg := fmt.Sprintf("borg %s is older than %d.%d: snapshot-hook archives would record snapshot paths instead of original paths", borgVersion, minBorg[0], minBorg[1])
-			if snapshotsConfigured {
-				return fmt.Errorf("%s, upgrade borg or disable the snapshot hooks", msg)
+// checkBorg fails the launch when a borg the generated configs will invoke is
+// absent: without the engine nothing can back up or restore, and discovering
+// that one failed cycle at a time serves nobody. The version floor stays
+// advisory unless snapshot hooks are configured (archive path recording is
+// silently wrong below it).
+func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[string]config.GroupOverride, snapshotsConfigured bool) error {
+	for _, bc := range borgCommands(cfg, overrides) {
+		borgPath, err := resolveBorgCommand(bc.command)
+		if err != nil {
+			return fmt.Errorf("borg (%s) not found: %w; install borg from your distribution or fix the path "+
+				"(borg stays host-installed; the manager only provisions borgmatic)", bc.source, err)
+		}
+		if out, err := commandOutput(ctx, borgPath, "--version"); err == nil && len(strings.Fields(out)) > 0 {
+			// "borg 1.4.4"
+			fields := strings.Fields(out)
+			borgVersion := fields[len(fields)-1]
+			if !versionAtLeast(borgVersion, minBorg) {
+				msg := fmt.Sprintf("borg %s (%s) is older than %d.%d: snapshot-hook archives would record snapshot paths instead of original paths", borgVersion, bc.source, minBorg[0], minBorg[1])
+				if snapshotsConfigured {
+					return fmt.Errorf("%s, upgrade borg or disable the snapshot hooks", msg)
+				}
+				slog.Warn(msg + " (not fatal: no snapshot hooks configured)")
 			}
-			slog.Warn(msg + " (not fatal: no snapshot hooks configured)")
 		}
 	}
 	return nil
+}
+
+// borgCommand is one borg executable the generated configs will invoke, and
+// where its name came from (for error messages).
+type borgCommand struct {
+	command string
+	source  string
+}
+
+// borgCommands lists every borg the configuration names: the default "borg"
+// on PATH unless the global config sets borgmatic's local_path, plus each
+// per-group override's local_path. Label-sourced config fragments can also
+// set local_path, but they are discovered per cycle and cannot be seen here;
+// those fail at run time like any other label mistake.
+func borgCommands(cfg *config.ManagerConfig, overrides map[string]config.GroupOverride) []borgCommand {
+	var cmds []borgCommand
+	seen := map[string]bool{}
+	add := func(command, source string) {
+		if command == "" || seen[command] {
+			return
+		}
+		seen[command] = true
+		cmds = append(cmds, borgCommand{command: command, source: source})
+	}
+	if global, _ := cfg.Borgmatic["local_path"].(string); global != "" {
+		add(global, "manager.yaml local_path")
+	} else {
+		add("borg", "PATH")
+	}
+	names := make([]string, 0, len(overrides))
+	for name := range overrides {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if o := overrides[name]; o.Borgmatic != nil {
+			if lp, _ := o.Borgmatic["local_path"].(string); lp != "" {
+				add(lp, "group "+name+" local_path")
+			}
+		}
+	}
+	return cmds
+}
+
+// resolveBorgCommand resolves a configured borg the way borgmatic will: a
+// bare name through PATH, anything with a separator as a direct executable.
+func resolveBorgCommand(command string) (string, error) {
+	if !strings.ContainsRune(command, os.PathSeparator) {
+		return exec.LookPath(command)
+	}
+	info, err := os.Stat(command)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("%s is not an executable file", command)
+	}
+	return command, nil
 }
 
 // launchBorgmatic picks the borgmatic a launch runs with, provisioning the
@@ -153,10 +215,9 @@ func (e *env) launchBorgmatic(ctx context.Context) (string, error) {
 		return p, nil
 	}
 	tc := toolchain.New(e.toolchainDir(), slog.Default())
-	if p, ok := tc.BorgmaticPath(); ok {
-		if tc.Fresh() {
-			return p, nil
-		}
+	if _, ok := tc.BorgmaticPath(); ok {
+		// Ensure hands a fresh healthy toolchain straight back, refreshes a
+		// stale one, and reprovisions one that no longer runs.
 		return tc.Ensure(ctx)
 	}
 	if p, ok := healthyHostBorgmatic(ctx); ok {
