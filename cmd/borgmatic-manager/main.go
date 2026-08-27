@@ -317,6 +317,9 @@ type env struct {
 // reaps against.
 func (e *env) locksDir() string { return filepath.Join(e.stateDir, "locks") }
 
+// toolchainDir holds the manager-provisioned borgmatic toolchain.
+func (e *env) toolchainDir() string { return filepath.Join(e.stateDir, "toolchain") }
+
 func loadEnv() (*env, error) {
 	e := &env{
 		configDir:  getEnv("CONFIG_DIR", "/etc/borgmatic-manager"),
@@ -637,6 +640,13 @@ func runDaemon() error {
 	reapStalePendingRuns(ctx, store, locksDir, e.reapRunHelpers)
 	sweepOrphanedPendingLocks(locksDir, store)
 	s := scheduler.NewScheduler(r, e.rt, slog.Default(), e.cfg, gen, store)
+	// Labels change between cycles: a group appearing or relabeling after
+	// launch can select a borg preflight never saw. The same check reruns per
+	// cycle on the freshly merged state (probes are memoized by file identity,
+	// so an unchanged borg costs a stat, not an exec).
+	s.SetPreRunCheck(func(ctx context.Context, st *models.BackupState) error {
+		return checkBorg(ctx, e.cfg, e.groupOverrides, st)
+	})
 	s.SetGroupCache(state.LoadGroupCache(e.stateDir, slog.Default()))
 
 	// Metrics are best-effort: a failed exporter must never stop backups. The
@@ -701,6 +711,14 @@ func runAdhoc(ctx context.Context, groups []string) error {
 		return err
 	}
 	stripOfflineDatabases(backupState, offline, logger)
+
+	// The default-borg check reruns on THIS discovery, not preflight's: a
+	// group appearing between the two would otherwise run unvalidated (its
+	// group-specific borg is judged by generation regardless). Probes are
+	// memoized, so an unchanged borg costs a stat.
+	if borgErr := checkBorg(ctx, e.cfg, e.groupOverrides, backupState); borgErr != nil {
+		return borgErr
+	}
 
 	// Generate into a private tmpfs directory, never the daemon's live configs
 	// dir: sharing it races the daemon (deleted configs, mismatched RunIDs that
@@ -1005,7 +1023,7 @@ func runBorgmaticPassthrough(args []string) error {
 		logger.Warn("group is offline: its container is not running, using the last cached config"+lastSeen+"; membership may be stale", "group", group)
 	}
 
-	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	borgmaticPath, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir())
 	if err != nil {
 		return err
 	}
@@ -1371,7 +1389,7 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		meta[group] = gm
 	}
 
-	borgmaticPath, err := resolveBorgmatic(e.cfg)
+	borgmaticPath, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir())
 	if err != nil {
 		return err
 	}

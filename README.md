@@ -11,7 +11,8 @@ snapshot-consistent backups — no per-service config files.
    `borgmatic-manager.*` labels (periodically and on create/remove events);
    a labeled container's named volumes and databases join its backup group
 2. **Generate** — compiles per-group borgmatic YAML from labels + your defaults
-3. **Backup** — runs host-installed borgmatic per group:
+3. **Backup** — runs borgmatic (the manager's own toolchain, or a host
+   install) per group:
    `create prune compact check`; database dumps run in short-lived helper
    containers joined to the database's network namespace
 4. **Snapshots** — on btrfs/zfs/LVM hosts, borgmatic's built-in hooks snapshot
@@ -26,7 +27,7 @@ snapshot-consistent backups — no per-service config files.
    │  scheduler ──► discover ──► generate ──► run  │
    └──────────────────────────────────────────┼────┘
                                               ▼
-                                    borgmatic (host)
+                              borgmatic (toolchain or host)
                                     ├─ btrfs/zfs/lvm snapshots
                                     ├─ borg create/prune/check
                                     └─ database dumps
@@ -41,10 +42,35 @@ reimplements.
 
 | Dependency | Minimum | Notes |
 |---|---|---|
-| borgmatic | **2.1.0** | distro packages usually too old — use `sudo uv tool install borgmatic` or `pipx install borgmatic` (as root) |
-| borg | **1.4** | needed for original-path recording with snapshot hooks |
+| borgmatic | **2.1.0** | optional to preinstall: the manager provisions its own if the host has none (see below) |
+| borg | **1.4** | **required on the host**; the manager refuses to start without it. Deliberately never provisioned: its repository format and CLI must match what you use by hand against the same repositories |
 | Docker or Podman | — | socket access; rootless Podman supported with [limitations](#rootless-podman) |
 | `sqlite3` | — | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers — no host clients needed) |
+
+### The borgmatic toolchain
+
+At launch the manager checks for a usable borgmatic and, if the host has none —
+not installed, a broken shim (a pipx upgrade that rebuilt its environments), or
+one below the version floor — it provisions its own: a pinned
+[uv](https://docs.astral.sh/uv/) (checksum-verified static binary) installs a
+pinned borgmatic with a uv-managed Python under `<state-dir>/toolchain/`
+(`/var/lib/borgmatic-manager/toolchain/` for the system unit,
+`~/.local/state/borgmatic-manager/toolchain/` for the rootless user unit).
+Nothing there touches the host's Python, so no host package upgrade can break
+the manager's backups.
+
+- A healthy host install is respected: nothing is downloaded behind its back.
+  Once a toolchain exists it is preferred, so the borgmatic in use stays stable.
+- Version bumps ship as manager releases: a new release reprovisions on next
+  launch, atomically — a failed download leaves the previous toolchain working.
+- `manager.borgmatic_path` / `BORGMATIC_PATH` overrides everything and disables
+  provisioning entirely.
+- The **borg binary is global-only**: `borg` on PATH, or `local_path` in
+  `manager.yaml`'s borgmatic defaults. A `local_path` in a group override or a
+  container label is ignored with a warning; from a label it would hand root
+  code execution to anyone who can label a container.
+- `borgmatic-manager doctor` reports which borgmatic is in use and the
+  toolchain's state.
 
 ## Quick start
 
@@ -63,9 +89,12 @@ sudo apt install ./borgmatic-manager_*_linux_amd64.deb
 
 # Or from source
 mise run install      # builds and installs binary, unit, default config (sudo inside)
-
-sudo uv tool install borgmatic   # if you don't have borgmatic >= 2.1
 ```
+
+Only [borg](https://borgbackup.readthedocs.io/) >= 1.4 needs to be on the
+host. borgmatic does not: the manager provisions its own isolated
+[toolchain](#the-borgmatic-toolchain) on first launch (a healthy host
+borgmatic >= 2.1 is used instead if you already have one).
 
 **2. Label your containers** — labels live on the *service*, not the volume,
 so a normal `docker compose up` after editing applies them:

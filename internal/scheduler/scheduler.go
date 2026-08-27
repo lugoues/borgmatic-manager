@@ -64,6 +64,17 @@ type Scheduler struct {
 	mu          sync.Mutex
 	lastAttempt map[string]time.Time
 
+	// rearm pokes the Start loop to recompute NextWake after a cycle it did
+	// not drive (an event-triggered RunCycle) changes scheduling state: a
+	// sleeping timer would otherwise ignore a new bounded retry until it
+	// fired on its own, possibly a full period out. Buffered so RunCycle
+	// never blocks; a coalesced poke is enough, the loop re-reads all state.
+	rearm chan struct{}
+	// preRunRetry, when set, is when a failed pre-run check should be retried.
+	// A transient borg probe failure before a NEW group's first record would
+	// otherwise leave nothing for NextWake to schedule around, delaying the
+	// first backup by the full global period.
+	preRunRetry time.Time
 	// lockedRetry holds per-group retry times for lock-blocked runs, so NextWake
 	// wakes in lockRetryInterval rather than a full period.
 	lockedRetry map[string]time.Time
@@ -89,6 +100,7 @@ type Scheduler struct {
 	// cycleObserver, when set, receives each cycle's merged inventory and offline
 	// state (nil when no cache), so metrics can report offline volume counts.
 	cycleObserver func(*models.BackupState, *state.Offline)
+	preRunCheck   func(context.Context, *models.BackupState) error
 }
 
 // SetGroupCache attaches a durable group cache so offline groups survive and
@@ -104,6 +116,16 @@ func (s *Scheduler) SetGroupCache(cache *state.GroupCache) {
 // then fails or never starts. Optional; nil (the default) disables it.
 func (s *Scheduler) SetCycleObserver(f func(*models.BackupState, *state.Offline)) {
 	s.cycleObserver = f
+}
+
+// SetPreRunCheck installs a gate that runs after discovery and cache merge,
+// before anything is generated or run. Labels change between cycles, and a
+// check that only ran at launch (the borg availability and version floor)
+// would miss a group that appeared or relabeled afterwards; failing the gate
+// skips the cycle loudly instead of running configs whose engine is missing
+// or silently wrong.
+func (s *Scheduler) SetPreRunCheck(f func(context.Context, *models.BackupState) error) {
+	s.preRunCheck = f
 }
 
 // SetRepositoryObserver registers a callback invoked once per cycle with each
@@ -216,6 +238,7 @@ func NewScheduler(
 		lastAttempt:  map[string]time.Time{},
 		groupPeriods: map[string]time.Duration{},
 		lockedRetry:  map[string]time.Time{},
+		rearm:        make(chan struct{}, 1),
 		now:          time.Now,
 	}
 
@@ -438,6 +461,16 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 func (s *Scheduler) RunCycle(ctx context.Context) error {
 	s.cycleMu.Lock()
 	defer s.cycleMu.Unlock()
+	// Every completed cycle can move the next due time (new records, lock or
+	// gate retries); tell a sleeping Start loop to recompute. Coalesced and
+	// non-blocking; the loop's own post-RunCycle recompute makes it a no-op
+	// for timer-driven cycles.
+	defer func() {
+		select {
+		case s.rearm <- struct{}{}:
+		default:
+		}
+	}()
 
 	s.logger.Info("starting backup cycle")
 
@@ -472,6 +505,18 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 		s.cycleObserver(backupState, off)
 	}
 
+	if s.preRunCheck != nil {
+		if checkErr := s.preRunCheck(ctx, backupState); checkErr != nil {
+			s.mu.Lock()
+			s.preRunRetry = s.now().Add(preRunRetryInterval)
+			s.mu.Unlock()
+			return fmt.Errorf("pre-run check failed; skipping this cycle (retrying in %s): %w", preRunRetryInterval, checkErr)
+		}
+		s.mu.Lock()
+		s.preRunRetry = time.Time{}
+		s.mu.Unlock()
+	}
+
 	meta, err := s.generateFunc(backupState)
 	if err != nil {
 		return err
@@ -487,6 +532,10 @@ func (s *Scheduler) RunCycle(ctx context.Context) error {
 
 // NextWake returns the sleep until the earliest group comes due, clamped to
 // [minWake, period]; with no history it is one full period.
+// preRunRetryInterval is how soon a cycle skipped by the pre-run gate is
+// retried.
+const preRunRetryInterval = 5 * time.Minute
+
 func (s *Scheduler) NextWake() time.Duration {
 	if s.store == nil || s.period <= 0 {
 		return s.period
@@ -508,6 +557,13 @@ func (s *Scheduler) NextWake() time.Duration {
 	// period out (the optimistic attempt mark above would otherwise hide it).
 	for _, retry := range s.lockedRetry {
 		if d := retry.Sub(now); d < wake {
+			wake = d
+		}
+	}
+	// Same for a cycle skipped by the pre-run gate: a transient borg probe
+	// failure must retry on its own bounded clock, not the global period.
+	if !s.preRunRetry.IsZero() {
+		if d := s.preRunRetry.Sub(now); d < wake {
 			wake = d
 		}
 	}
@@ -557,8 +613,24 @@ func (s *Scheduler) Start(ctx context.Context) error {
 			if err := s.RunCycle(ctx); err != nil {
 				s.logger.Error("cycle failed", "error", err)
 			}
+			// Drain our own cycle's poke so it cannot fire a redundant wake.
+			select {
+			case <-s.rearm:
+			default:
+			}
 			wake := s.NextWake()
 			s.logger.Debug("scheduler sleeping", "until_next_due", wake.Round(time.Second).String())
+			timer.Reset(wake)
+		case <-s.rearm:
+			// An event-triggered cycle ran elsewhere; re-arm around its outcome.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			wake := s.NextWake()
+			s.logger.Debug("scheduler re-armed by external cycle", "until_next_due", wake.Round(time.Second).String())
 			timer.Reset(wake)
 		case <-ctx.Done():
 			s.logger.Info("scheduler stopping")

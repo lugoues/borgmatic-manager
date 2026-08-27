@@ -298,6 +298,26 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			base = DeepMerge(base, labelCfg)
 		}
 
+		// The borg binary is global-only: manager.yaml's local_path or "borg"
+		// on PATH, validated once at launch and each cycle. A group override
+		// or container label choosing its own borg is a footgun (and, from a
+		// label, root code execution for anyone who can label a container),
+		// so whatever a group layer merged in, string, empty, or null, is
+		// normalized back to the global value and warned about. An empty or
+		// null override would otherwise hand the group a config borgmatic
+		// cannot run at all.
+		if globalLP, _ := g.cfg.Borgmatic["local_path"].(string); globalLP != "" {
+			if v, ok := base["local_path"]; !ok || v != any(globalLP) {
+				g.logger.Warn("ignoring group-level local_path: the borg binary is global-only, set it in manager.yaml",
+					"group", groupName, "local_path", fmt.Sprint(v))
+				base["local_path"] = globalLP
+			}
+		} else if v, ok := base["local_path"]; ok {
+			g.logger.Warn("ignoring group-level local_path: the borg binary is global-only, set it in manager.yaml",
+				"group", groupName, "local_path", fmt.Sprint(v))
+			delete(base, "local_path")
+		}
+
 		// 3. Build discovered data. Volume-named /./ paths are disabled when
 		// snapshot hooks are enabled: borg allows only one /./ marker per path.
 		runID, err := mintRunID()
@@ -396,29 +416,36 @@ func (g *Generator) plan(state *models.BackupState, groupNames []string, mintRun
 			keptRepoGroups[repo] = append(keptRepoGroups[repo], e.name)
 		}
 	}
-	if g.keepOvermatched {
-		return kept, refusals, nil
-	}
-	if overmatching := overmatchingPatterns(keptRepoGroups, patterns, samples, g.logger); len(overmatching) > 0 {
-		final := kept[:0]
-		for _, e := range kept {
-			if reason, ok := overmatching[e.name]; ok {
-				refusals = append(refusals, Refusal{
-					Group:             e.name,
-					Reason:            reason,
-					Repositories:      e.meta.Repositories,
-					RepositoriesKnown: e.meta.RepositoriesKnown,
-				})
-				continue
+	// keepOvermatched (the restore-only render) bypasses EXACTLY this overlap
+	// refusal: an extract neither prunes nor creates. Every other judgment,
+	// the group-borg validation below included, still applies to it — a
+	// zero-exit no-op borg is as unusable for a restore as for a backup.
+	if !g.keepOvermatched {
+		if overmatching := overmatchingPatterns(keptRepoGroups, patterns, samples, g.logger); len(overmatching) > 0 {
+			final := kept[:0]
+			for _, e := range kept {
+				if reason, ok := overmatching[e.name]; ok {
+					refusals = append(refusals, Refusal{
+						Group:             e.name,
+						Reason:            reason,
+						Repositories:      e.meta.Repositories,
+						RepositoriesKnown: e.meta.RepositoriesKnown,
+					})
+					continue
+				}
+				final = append(final, e)
 			}
-			final = append(final, e)
+			kept = final
 		}
-		kept = final
 	}
 
 	return kept, refusals, nil
 }
 
+// refuseBrokenGroupBorgs drops groups whose own borg (a non-default
+// local_path) is missing, cannot run, reports no version, or sits below the
+// snapshot floor while the group uses snapshot hooks. The floor stays
+// advisory without hooks, matching the default borg's rules.
 // hookKeys are borgmatic options that execute shell commands as the user
 // running borgmatic (root under the system unit).
 var hookKeys = map[string]bool{

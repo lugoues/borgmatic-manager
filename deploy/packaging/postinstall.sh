@@ -93,8 +93,10 @@ cat <<'EOF'
 borgmatic-manager installed.
 
 Next steps:
-  1. Install borgmatic >= 2.1 and borg >= 1.4 (distro packages often lag):
-       sudo uv tool install borgmatic   # or: pipx install borgmatic
+  1. Install borg >= 1.4 (the only hard dependency; distro packages often
+     lag). borgmatic is NOT needed: the manager provisions its own isolated
+     toolchain on first launch. A host borgmatic >= 2.1, if present and
+     healthy, is used instead.
   2. Edit /etc/borgmatic-manager/manager.yaml (repository, passphrase);
      local tweaks belong in /etc/borgmatic-manager/conf.d/*.yaml, which
      package upgrades never touch (the shipped default lives at

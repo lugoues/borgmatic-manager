@@ -14,6 +14,7 @@ import (
 
 	"github.com/lugoues/borgmatic-manager/internal/discovery"
 	"github.com/lugoues/borgmatic-manager/internal/models"
+	"github.com/lugoues/borgmatic-manager/internal/toolchain"
 )
 
 // doctorTimeout bounds each external command the checks run.
@@ -137,8 +138,16 @@ func runDoctor(ctx context.Context) error {
 
 	// borgmatic binary and version floor.
 	borgmaticPath := ""
-	if path, err := resolveBorgmatic(e.cfg); err != nil {
-		r.fail("borgmatic", err.Error())
+	if path, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir()); err != nil {
+		// A clean install (no host borgmatic, no override, nothing
+		// provisioned yet) is a supported state: the daemon provisions its
+		// own on first launch. Failing it here would contradict the toolchain
+		// line below that reports exactly that plan.
+		if explicitBorgmaticPath(e.cfg) == "" && !toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler)).Exists() {
+			r.warn("borgmatic", "not installed yet; the daemon provisions its own toolchain on first launch")
+		} else {
+			r.fail("borgmatic", err.Error())
+		}
 	} else {
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
 		version, err := commandOutput(cctx, path, "--version")
@@ -146,39 +155,113 @@ func runDoctor(ctx context.Context) error {
 		switch {
 		case err != nil:
 			r.fail("borgmatic", fmt.Sprintf("running %s --version: %v", path, err))
-		case !versionAtLeast(strings.TrimSpace(version), minBorgmatic):
-			r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d (distro packages often lag; use uv or pipx)",
-				path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+		case !versionAtLeast(borgmaticVersionOf(version), minBorgmatic):
+			// The daemon does not run on this either: launchBorgmatic rejects
+			// a below-floor host install and provisions the toolchain, so an
+			// unprovisioned setup here is the supported first-launch plan,
+			// not a failure. An explicit override or an existing toolchain
+			// reporting an old version IS wrong, and stays one.
+			if explicitBorgmaticPath(e.cfg) == "" && !toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler)).Exists() {
+				// The daemon walks past a below-floor candidate to a healthy
+				// later one (a current /usr/local install behind an old
+				// distro package, say) before it ever provisions; predicting
+				// provisioning here would skip schema validation against the
+				// borgmatic actually selected.
+				if hp, ok := healthyHostBorgmatic(ctx); ok {
+					borgmaticPath = hp
+					r.pass("borgmatic", fmt.Sprintf("%s (the daemon skips %s: %s is below %d.%d.%d)",
+						hp, path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+				} else {
+					r.warn("borgmatic", fmt.Sprintf("%s is %s, below %d.%d.%d; the daemon provisions its own toolchain on first launch",
+						path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+				}
+			} else {
+				r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d",
+					path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
+			}
 		default:
 			borgmaticPath = path
 			r.pass("borgmatic", fmt.Sprintf("%s (%s)", path, strings.TrimSpace(version)))
 		}
 	}
 
-	// borg: hard floor only when snapshot hooks are configured.
-	snapshots := snapshotHooksConfigured(e.cfg, e.groupOverrides)
-	if borgPath, err := exec.LookPath("borg"); err != nil {
-		if snapshots {
-			r.fail("borg", "not on PATH, and snapshot hooks are configured")
+	// Which borgmatic is in use and whether the manager's own toolchain backs
+	// it: the first question when "it works in my shell but not in the unit".
+	// Judged by the path actually selected above, not the manifest: a broken
+	// toolchain keeps valid metadata while resolveBorgmatic falls back to the
+	// host, and reporting it as in-use would contradict the borgmatic line in
+	// exactly the scenario this line exists to explain.
+	tc := toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler))
+	selectedToolchain := borgmaticPath != "" && strings.HasPrefix(borgmaticPath, e.toolchainDir()+string(filepath.Separator))
+	switch {
+	case explicitBorgmaticPath(e.cfg) != "":
+		r.pass("toolchain", "not in use: manager.borgmatic_path / BORGMATIC_PATH overrides it")
+	case selectedToolchain:
+		if m, fresh, err := tc.Info(); err == nil {
+			state := "current"
+			if !fresh {
+				state = "stale; the next daemon launch refreshes it"
+			}
+			r.pass("toolchain", fmt.Sprintf("in use: borgmatic %s (uv %s, python %s), %s",
+				m.BorgmaticVersion, m.UVVersion, m.PythonVersion, state))
 		} else {
-			r.warn("borg", "not on PATH; borgmatic will fail until it is installed")
+			r.pass("toolchain", "in use")
 		}
-	} else {
+	case tc.Exists():
+		fallback := "no usable fallback was found"
+		if borgmaticPath != "" {
+			fallback = fmt.Sprintf("commands fall back to %s", borgmaticPath)
+		}
+		r.warn("toolchain", fmt.Sprintf("provisioned but not usable; %s (the next daemon launch repairs it)", fallback))
+	default:
+		r.pass("toolchain", "not provisioned; the daemon provisions one only when no healthy host borgmatic exists")
+	}
+
+	// borg is required outright: without the engine nothing runs. The same
+	// verdict as the daemon's gates, malformed global local_path included: the
+	// daemon refuses to start on that, and doctor probing PATH borg instead
+	// would report a passing setup the daemon rejects.
+	if err := globalLocalPathError(e.cfg); err != nil {
+		r.fail("borg", err.Error())
+	}
+	// A quiet discovery feeds the hooks scan; nil (socket down) is fine. The
+	// labels section below runs its own discovery with the warning-capturing
+	// logger.
+	// Merged with the durable cache, exactly as preflight and the cycle see
+	// it: a group whose containers are all offline keeps its cached label
+	// config (a label-sourced local_path included), and diagnosing live-only
+	// state would fail a configuration the daemon starts fine on.
+	var discoveredState *models.BackupState
+	if socketOK {
+		if st, _, err := e.discoverMerged(ctx, slog.New(slog.DiscardHandler)); err == nil {
+			discoveredState = st
+		}
+	}
+	for _, bc := range borgCommands(e.cfg, e.groupOverrides, discoveredState) {
+		borgPath, err := resolveBorgCommand(bc.command)
+		if err != nil {
+			r.fail("borg", fmt.Sprintf("%s: %v; install it from your distribution (the manager provisions borgmatic, never borg)", bc.source, err))
+			continue
+		}
 		cctx, cancel := context.WithTimeout(ctx, doctorTimeout)
 		out, err := commandOutput(cctx, borgPath, "--version")
 		cancel()
 		if fields := strings.Fields(out); err == nil && len(fields) > 0 {
 			version := fields[len(fields)-1]
 			switch {
+			case !toolchain.PlausibleReportedVersion(out):
+				r.fail("borg", fmt.Sprintf("%s reports no usable version (output %q); the daemon refuses to start on it", borgPath, strings.TrimSpace(out)))
 			case versionAtLeast(version, minBorg):
-				r.pass("borg", fmt.Sprintf("%s (%s)", borgPath, version))
-			case snapshots:
-				r.fail("borg", fmt.Sprintf("%s is older than %d.%d and snapshot hooks are configured: archives would record snapshot paths", version, minBorg[0], minBorg[1]))
+				r.pass("borg", fmt.Sprintf("%s (%s, %s)", borgPath, version, bc.source))
+			case bc.snapshots:
+				r.fail("borg", fmt.Sprintf("%s (%s) is older than %d.%d and a snapshot-hook group uses it: archives would record snapshot paths", version, bc.source, minBorg[0], minBorg[1]))
 			default:
-				r.warn("borg", fmt.Sprintf("%s is older than %d.%d (fine until snapshot hooks are enabled)", version, minBorg[0], minBorg[1]))
+				r.warn("borg", fmt.Sprintf("%s (%s) is older than %d.%d (fine until snapshot hooks are enabled)", version, bc.source, minBorg[0], minBorg[1]))
 			}
 		} else {
-			r.warn("borg", fmt.Sprintf("could not read version from %s", borgPath))
+			// The daemon refuses to start on this; doctor saying "no
+			// failures" while preflight fails would be a lie.
+			r.fail("borg", fmt.Sprintf("running %s --version failed (%s): %v", borgPath, bc.source, err))
 		}
 	}
 
@@ -214,7 +297,16 @@ func runDoctor(ctx context.Context) error {
 			// problems are exactly what an operator is running doctor for, and
 			// they are diagnosable without it. Only the `config validate`
 			// sub-step needs the binary, and it says so when it is missing.
-			r.checkGenerate(ctx, e, backupState, borgmaticPath)
+			//
+			// The merged (cache-included) state when available, live otherwise:
+			// an offline group's cached label config (a broken local_path
+			// included) is judged by every cycle, and doctor diagnosing the
+			// live-only view would miss what those cycles refuse.
+			genState := backupState
+			if discoveredState != nil {
+				genState = discoveredState
+			}
+			r.checkGenerate(ctx, e, genState, borgmaticPath)
 		}
 	}
 

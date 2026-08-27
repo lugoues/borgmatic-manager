@@ -38,6 +38,12 @@ command -v borg >/dev/null || fail "borg not found on PATH"
 # The manager and every borg/borgmatic invocation share this environment.
 export BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes
 export BORG_RELOCATED_REPO_ACCESS_IS_OK=yes
+# The harness reads the repository the manager writes. An archive appears the
+# moment create finishes, but the manager's cycle still holds borg's
+# repository lock through prune/compact/check; borg's default 1s lock wait
+# turns that overlap into a flaky "Failed to create/acquire the lock" instead
+# of a short wait.
+export BORG_LOCK_WAIT=120
 export BORGMATIC_PATH
 export CONFIG_DIR="$WORK/etc" RUNTIME_DIR="$WORK/run" STATE_DIR="$WORK/state"
 if [ -n "${DOCKER_HOST:-}" ]; then
@@ -50,17 +56,68 @@ MANAGER_PID=""
 
 compose() { docker compose -f "$HERE/compose.yaml" "$@"; }
 
-# stack_up ARGS...: compose up gated by healthchecks; on failure, dump every
-# container's state and logs so CI/DinD failures are diagnosable from output.
-stack_up() {
-  if ! compose "$@" up -d --wait; then
-    echo "=== stack state ===" >&2
-    compose "$@" ps -a >&2 || true
-    echo "=== stack logs ===" >&2
-    compose "$@" logs --no-color --timestamps >&2 || true
-    fail "stack failed to become healthy"
-  fi
+# probe_ready NAME: the service's own readiness command, exec'd directly so
+# readiness does not depend on the runtime's healthcheck engine. Podman on
+# 2026-08 GitHub runner images stopped firing healthchecks: containers ran
+# fine but stayed unhealthy forever and `up --wait` never returned. These
+# mirror the healthchecks in compose.yaml, which remain for documentation and
+# for plain docker use.
+probe_ready() {
+  case "$1" in
+    e2e-app-a)    docker exec e2e-app-a test -f /data/file-a.txt ;;
+    e2e-app-b)    docker exec e2e-app-b test -f /data/file-b.txt ;;
+    e2e-postgres) docker exec e2e-postgres pg_isready -U postgres -h 127.0.0.1 >/dev/null ;;
+    e2e-mariadb)  docker exec e2e-mariadb healthcheck.sh --connect --innodb_initialized >/dev/null ;;
+    *)            return 0 ;;
+  esac
 }
+
+# stack_up ARGS...: compose up, then poll every expected service's readiness
+# probe. Bounded, and on failure every container's state and logs are dumped
+# so CI failures are diagnosable from output.
+stack_up() {
+  if ! compose "$@" up -d; then
+    stack_dump "$@"
+    fail "stack failed to start"
+  fi
+  local services="e2e-app-a e2e-postgres e2e-mariadb"
+  case "$*" in *late*) services="$services e2e-app-b" ;; esac
+  local deadline=$((SECONDS + 300))
+  local pending
+  while :; do
+    pending=""
+    for c in $services; do
+      probe_ready "$c" >/dev/null 2>&1 || pending="$pending $c"
+    done
+    [ -z "$pending" ] && return 0
+    # A container that already exited will never become ready; waiting out
+    # the deadline on it would just delay the same failure.
+    for c in $pending; do
+      state=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)
+      case "$state" in
+        exited|dead|missing)
+          echo "=== container $c is $state; it will never become ready ===" >&2
+          stack_dump "$@"
+          fail "stack failed to become ready"
+          ;;
+      esac
+    done
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "=== stack not ready after 300s; pending:$pending ===" >&2
+      stack_dump "$@"
+      fail "stack failed to become ready"
+    fi
+    sleep 2
+  done
+}
+
+stack_dump() {
+  echo "=== stack state ===" >&2
+  compose "$@" ps -a >&2 || true
+  echo "=== stack logs ===" >&2
+  compose "$@" logs --no-color --timestamps >&2 || true
+}
+
 manager() { "$WORK/borgmatic-manager" "$@"; }
 
 cleanup() {

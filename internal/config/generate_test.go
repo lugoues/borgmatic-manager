@@ -1594,3 +1594,34 @@ func TestLocaleDependentDirectivesAreNotModelledInEnglishOnly(t *testing.T) {
 	assert.True(t, config.PatternOvermatchesForTest(
 		"Juli-*", "{now:%B}-other"))
 }
+
+// The borg binary is global-only: a group override or label choosing its own
+// local_path is ignored with a warning and the group runs on the default
+// engine. From a label it would otherwise be root code execution for anyone
+// who can label a container.
+func TestGroupLevelLocalPathIsStripped(t *testing.T) {
+	st := models.NewBackupState()
+	st.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
+	st.Groups["app"].LabelConfigs = append(st.Groups["app"].LabelConfigs,
+		map[string]interface{}{"local_path": "/evil/borg",
+			"repositories": []interface{}{map[string]interface{}{"path": "/mnt/r1"}}})
+
+	t.Run("with no global local_path the key is dropped", func(t *testing.T) {
+		g, outDir := newTestGenerator(t, &config.ManagerConfig{}, nil, config.GeneratorOptions{})
+		meta, refusals, err := g.Generate(st)
+		require.NoError(t, err)
+		require.Contains(t, meta, "app", "the group keeps running, on the default borg")
+		require.Empty(t, refusals)
+		final := readGenerated(t, outDir, "app")
+		_, present := final["local_path"]
+		assert.False(t, present, "the label's borg must not reach the rendered config")
+	})
+
+	t.Run("with a global local_path the global value wins", func(t *testing.T) {
+		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": "/opt/borg/borg"}}
+		g, outDir := newTestGenerator(t, cfg, nil, config.GeneratorOptions{})
+		_, _, err := g.Generate(st)
+		require.NoError(t, err)
+		assert.Equal(t, "/opt/borg/borg", readGenerated(t, outDir, "app")["local_path"])
+	})
+}
