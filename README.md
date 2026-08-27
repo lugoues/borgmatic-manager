@@ -42,7 +42,7 @@ reimplements.
 
 | Dependency | Minimum | Notes |
 |---|---|---|
-| borgmatic | — | **not needed on the host**: the manager owns its own pinned install (see below); `manager.borgmatic_path` is the only way to use another |
+| borgmatic | — | **not needed on the host**: the manager owns its own pinned install (see below); `manager.borgmatic_path` / `BORGMATIC_PATH` is the only way to use another |
 | borg | **1.4** | **required on the host**; the manager refuses to start without it. Deliberately never provisioned: its repository format and CLI must match what you use by hand against the same repositories |
 | Docker or Podman | — | socket access; rootless Podman supported with [limitations](#rootless-podman) |
 | `sqlite3` | — | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers — no host clients needed) |
@@ -97,7 +97,8 @@ mise run install      # builds and installs binary, unit, default config (sudo i
 Only [borg](https://borgbackup.readthedocs.io/) >= 1.4 needs to be on the
 host. borgmatic does not: the manager provisions its own isolated
 [toolchain](#the-borgmatic-toolchain) on first use, and a host-installed
-borgmatic is ignored unless you point `manager.borgmatic_path` at it.
+borgmatic is ignored unless `manager.borgmatic_path` or `BORGMATIC_PATH`
+points at it.
 
 **2. Label your containers** — labels live on the *service*, not the volume,
 so a normal `docker compose up` after editing applies them:

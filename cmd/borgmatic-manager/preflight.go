@@ -313,34 +313,6 @@ func borgmaticVersionOf(out string) string {
 	return fields[len(fields)-1]
 }
 
-// sanitizedProbe is commandOutput --version with the host's Python
-// configuration removed from the probe's own environment only.
-func sanitizedProbe(ctx context.Context, bin string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "--version") // #nosec G204 -- probing the toolchain launcher
-	cmd.Env = toolchain.SanitizedEnviron()
-	// Its own process group, killed whole on timeout, like every other probe:
-	// restore, passthrough, and doctor route through here repeatedly and a
-	// damaged launcher's descendants must not accumulate.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.WaitDelay = 5 * time.Second
-	out, err := cmd.Output()
-	if errors.Is(err, exec.ErrWaitDelay) && cmd.Process != nil {
-		// The delay fired because a descendant held the pipes past the
-		// parent's exit; the context never expired, so Cancel never ran.
-		// Sweep the group before it becomes an orphan-per-cycle.
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	return string(out), err
-}
-
 // stripHostPythonEnv removes the host's Python environment configuration
 // once a toolchain borgmatic is selected. The managed launcher's shebang
 // still honors PYTHONHOME and PYTHONPATH, so a service environment carrying
