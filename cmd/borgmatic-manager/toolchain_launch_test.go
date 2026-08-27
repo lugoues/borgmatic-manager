@@ -90,6 +90,18 @@ func TestHealthyHostBorgmaticRejectsBrokenAndOldInstalls(t *testing.T) {
 		_, ok := healthyHostBorgmatic(context.Background())
 		assert.False(t, ok)
 	})
+	t.Run("a prefixed version report is parsed, not waved through", func(t *testing.T) {
+		// versionAtLeast passes unparseable strings by design, so "borgmatic
+		// 2.0.0" fed whole would read as healthy and block provisioning.
+		hostWith(t, "#!/bin/sh\necho borgmatic 2.0.0\n")
+		_, ok := healthyHostBorgmatic(context.Background())
+		assert.False(t, ok)
+
+		hp := hostWith(t, "#!/bin/sh\necho borgmatic 2.1.7\n")
+		p, ok := healthyHostBorgmatic(context.Background())
+		require.True(t, ok, "a prefixed but current version is healthy")
+		assert.Equal(t, hp, p)
+	})
 	t.Run("a working install at the floor is healthy", func(t *testing.T) {
 		hp := hostWith(t, "#!/bin/sh\necho 2.1.0\n")
 		p, ok := healthyHostBorgmatic(context.Background())

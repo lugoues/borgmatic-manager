@@ -75,6 +75,23 @@ func TestCheckBorgHonorsLocalPath(t *testing.T) {
 		assert.Contains(t, err.Error(), "PATH")
 	})
 
+	t.Run("a borg that exists but cannot run fails, naming its source", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "borg"),
+			[]byte("#!/bin/sh\necho 'error while loading shared libraries' >&2\nexit 127\n"), 0o755))
+		t.Setenv("PATH", dir)
+		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil)
+		require.Error(t, err, "an unrunnable borg fails every group; the daemon must not start on it")
+		assert.Contains(t, err.Error(), "--version failed")
+	})
+
+	t.Run("a borg reporting nothing fails too", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "borg"), []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		t.Setenv("PATH", dir)
+		require.Error(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil))
+	})
+
 	t.Run("missing default borg fails outright", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
 		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil)

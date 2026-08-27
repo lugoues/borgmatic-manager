@@ -84,7 +84,7 @@ func preflight(ctx context.Context, e *env) (*preflightResult, error) {
 		return nil, fmt.Errorf("running %s --version: %w", path, err)
 	}
 	res.borgmaticVersion = strings.TrimSpace(bmVersion)
-	if !versionAtLeast(res.borgmaticVersion, minBorgmatic) {
+	if !versionAtLeast(borgmaticVersionOf(res.borgmaticVersion), minBorgmatic) {
 		return nil, fmt.Errorf("borgmatic %s is too old: need >= %d.%d.%d (unset manager.borgmatic_path / BORGMATIC_PATH to let the manager provision its own)",
 			res.borgmaticVersion, minBorgmatic[0], minBorgmatic[1], minBorgmatic[2])
 	}
@@ -132,17 +132,22 @@ func checkBorg(ctx context.Context, cfg *config.ManagerConfig, overrides map[str
 			return fmt.Errorf("borg (%s) not found: %w; install borg from your distribution or fix the path "+
 				"(borg stays host-installed; the manager only provisions borgmatic)", bc.source, err)
 		}
-		if out, err := commandOutput(ctx, borgPath, "--version"); err == nil && len(strings.Fields(out)) > 0 {
-			// "borg 1.4.4"
-			fields := strings.Fields(out)
-			borgVersion := fields[len(fields)-1]
-			if !versionAtLeast(borgVersion, minBorg) {
-				msg := fmt.Sprintf("borg %s (%s) is older than %d.%d: snapshot-hook archives would record snapshot paths instead of original paths", borgVersion, bc.source, minBorg[0], minBorg[1])
-				if bc.snapshots {
-					return fmt.Errorf("%s, upgrade borg or disable the snapshot hooks", msg)
-				}
-				slog.Warn(msg + " (not fatal: no group using this borg has snapshot hooks)")
+		out, verErr := commandOutput(ctx, borgPath, "--version")
+		fields := strings.Fields(out)
+		if verErr != nil || len(fields) == 0 {
+			// Existing but unrunnable (a broken shim, a missing loader): every
+			// group invoking it would fail, which is exactly what this check
+			// exists to say before the first cycle does.
+			return fmt.Errorf("borg (%s): running %s --version failed: %v (output %q)", bc.source, borgPath, verErr, strings.TrimSpace(out))
+		}
+		// "borg 1.4.4"
+		borgVersion := fields[len(fields)-1]
+		if !versionAtLeast(borgVersion, minBorg) {
+			msg := fmt.Sprintf("borg %s (%s) is older than %d.%d: snapshot-hook archives would record snapshot paths instead of original paths", borgVersion, bc.source, minBorg[0], minBorg[1])
+			if bc.snapshots {
+				return fmt.Errorf("%s, upgrade borg or disable the snapshot hooks", msg)
 			}
+			slog.Warn(msg + " (not fatal: no group using this borg has snapshot hooks)")
 		}
 	}
 	return nil
@@ -323,11 +328,25 @@ func healthyHostBorgmatic(ctx context.Context) (string, bool) {
 		slog.Warn("host borgmatic is broken; provisioning the manager's own toolchain instead", "path", p, "error", err)
 		return "", false
 	}
-	if v := strings.TrimSpace(out); !versionAtLeast(v, minBorgmatic) {
-		slog.Warn("host borgmatic is too old; provisioning the manager's own toolchain instead", "path", p, "version", v)
+	v := borgmaticVersionOf(out)
+	if v == "" || !versionAtLeast(v, minBorgmatic) {
+		slog.Warn("host borgmatic is too old or reports no version; provisioning the manager's own toolchain instead", "path", p, "version", strings.TrimSpace(out))
 		return "", false
 	}
 	return p, true
+}
+
+// borgmaticVersionOf extracts the version token from `borgmatic --version`
+// output: bare ("2.1.7") in current releases, prefixed ("borgmatic 2.1.7") in
+// some packagings. versionAtLeast deliberately passes unparseable strings
+// (dev builds), so handing it the prefixed form whole would wave an old
+// install through the floor.
+func borgmaticVersionOf(out string) string {
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[len(fields)-1]
 }
 
 // hostBorgmaticPath finds borgmatic on PATH or in the well-known locations.

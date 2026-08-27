@@ -147,7 +147,7 @@ func runDoctor(ctx context.Context) error {
 		switch {
 		case err != nil:
 			r.fail("borgmatic", fmt.Sprintf("running %s --version: %v", path, err))
-		case !versionAtLeast(strings.TrimSpace(version), minBorgmatic):
+		case !versionAtLeast(borgmaticVersionOf(version), minBorgmatic):
 			r.fail("borgmatic", fmt.Sprintf("%s is %s, need >= %d.%d.%d (distro packages often lag; use uv or pipx)",
 				path, strings.TrimSpace(version), minBorgmatic[0], minBorgmatic[1], minBorgmatic[2]))
 		default:
@@ -158,21 +158,34 @@ func runDoctor(ctx context.Context) error {
 
 	// Which borgmatic is in use and whether the manager's own toolchain backs
 	// it: the first question when "it works in my shell but not in the unit".
+	// Judged by the path actually selected above, not the manifest: a broken
+	// toolchain keeps valid metadata while resolveBorgmatic falls back to the
+	// host, and reporting it as in-use would contradict the borgmatic line in
+	// exactly the scenario this line exists to explain.
+	tc := toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler))
+	selectedToolchain := borgmaticPath != "" && strings.HasPrefix(borgmaticPath, e.toolchainDir()+string(filepath.Separator))
 	switch {
 	case explicitBorgmaticPath(e.cfg) != "":
 		r.pass("toolchain", "not in use: manager.borgmatic_path / BORGMATIC_PATH overrides it")
-	default:
-		tc := toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler))
+	case selectedToolchain:
 		if m, fresh, err := tc.Info(); err == nil {
 			state := "current"
 			if !fresh {
 				state = "stale; the next daemon launch refreshes it"
 			}
-			r.pass("toolchain", fmt.Sprintf("borgmatic %s (uv %s, python %s), %s",
+			r.pass("toolchain", fmt.Sprintf("in use: borgmatic %s (uv %s, python %s), %s",
 				m.BorgmaticVersion, m.UVVersion, m.PythonVersion, state))
 		} else {
-			r.pass("toolchain", "not provisioned; the daemon provisions one only when no healthy host borgmatic exists")
+			r.pass("toolchain", "in use")
 		}
+	case tc.Exists():
+		fallback := "no usable fallback was found"
+		if borgmaticPath != "" {
+			fallback = fmt.Sprintf("commands fall back to %s", borgmaticPath)
+		}
+		r.warn("toolchain", fmt.Sprintf("provisioned but not usable; %s (the next daemon launch repairs it)", fallback))
+	default:
+		r.pass("toolchain", "not provisioned; the daemon provisions one only when no healthy host borgmatic exists")
 	}
 
 	// borg is required outright: without the engine nothing runs. Every borg
@@ -180,9 +193,13 @@ func runDoctor(ctx context.Context) error {
 	// own borg, so a quiet discovery feeds the check; nil (socket down) makes
 	// it conservatively demand the default. The labels section below runs its
 	// own discovery with the warning-capturing logger.
+	// Merged with the durable cache, exactly as preflight and the cycle see
+	// it: a group whose containers are all offline keeps its cached label
+	// config (a label-sourced local_path included), and diagnosing live-only
+	// state would fail a configuration the daemon starts fine on.
 	var discoveredState *models.BackupState
 	if socketOK {
-		if st, err := discovery.Discover(ctx, e.rt, slog.New(slog.DiscardHandler)); err == nil {
+		if st, _, err := e.discoverMerged(ctx, slog.New(slog.DiscardHandler)); err == nil {
 			discoveredState = st
 		}
 	}
