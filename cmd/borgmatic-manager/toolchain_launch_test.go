@@ -10,19 +10,21 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	"github.com/lugoues/borgmatic-manager/internal/toolchain"
 )
 
-// seedToolchain lays down a provisioned-looking toolchain under stateDir and
-// returns its borgmatic path.
+// seedToolchain lays down a fresh, healthy-looking toolchain under stateDir
+// and returns its borgmatic path. Fresh and healthy on purpose: anything less
+// sends launchBorgmatic through Ensure's provisioning path, and a unit test
+// must never reach for the network.
 func seedToolchain(t *testing.T, stateDir string) string {
 	t.Helper()
-	// The version directory name only matters for freshness, which these
-	// tests don't depend on; any provisioned layout resolves.
-	vdir := filepath.Join(stateDir, "toolchain", "versions", "seeded")
+	name := toolchain.PinnedVersionDirName()
+	vdir := filepath.Join(stateDir, "toolchain", "versions", name)
 	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
-		[]byte("#!/bin/sh\necho 2.1.7\n"), 0o755))
-	require.NoError(t, os.Symlink(filepath.Join("versions", "seeded"),
+		[]byte("#!/bin/sh\necho "+toolchain.BorgmaticVersion+"\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", name),
 		filepath.Join(stateDir, "toolchain", "current")))
 	return filepath.Join(stateDir, "toolchain", "current", "bin", "borgmatic")
 }

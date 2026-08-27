@@ -250,9 +250,12 @@ func (e *env) launchBorgmatic(ctx context.Context) (string, error) {
 		return p, nil
 	}
 	tc := toolchain.New(e.toolchainDir(), slog.Default())
-	if _, ok := tc.BorgmaticPath(); ok {
-		// Ensure hands a fresh healthy toolchain straight back, refreshes a
-		// stale one, and reprovisions one that no longer runs.
+	if tc.Exists() {
+		// Any provisioned toolchain, however damaged (a vanished launcher
+		// included), is repaired rather than abandoned: Ensure hands a fresh
+		// healthy one straight back, refreshes a stale one, and reprovisions
+		// a broken one. Falling back to the host here would silently
+		// re-couple the daemon to the host's Python packaging.
 		return tc.Ensure(ctx)
 	}
 	if p, ok := healthyHostBorgmatic(ctx); ok {

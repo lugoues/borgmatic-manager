@@ -443,3 +443,59 @@ func TestHungProbeIsUnhealthyAndReprovisions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(out), BorgmaticVersion)
 }
+
+// Under Restart=on-failure a transient outage retries provisioning every few
+// seconds. Each failed attempt must clean up after itself, and crash leftovers
+// must be reaped, or the attempts pile up partial Python environments until
+// the disk or the generation namespace runs out.
+func TestFailedProvisioningLeavesNoDebris(t *testing.T) {
+	root := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no network", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	tc := New(root, slog.New(slog.DiscardHandler))
+	tc.downloadBase = srv.URL
+
+	for range 3 {
+		_, err := tc.Ensure(context.Background())
+		require.Error(t, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "versions"))
+	require.NoError(t, err)
+	assert.Empty(t, entries, "every failed attempt removes its own directory")
+
+	// A crash leftover (directory without a manifest, from a provisioner that
+	// died before its own cleanup) is reaped by the next attempt, which then
+	// builds under the ordinary pinned name.
+	crashed := filepath.Join(root, "versions", versionDirName())
+	require.NoError(t, os.MkdirAll(filepath.Join(crashed, "bin"), 0o755))
+
+	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
+	tc2, _ := newTestToolchain(t, root, tarball, sum)
+	_, err = tc2.Ensure(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, versionDirName(), tc2.currentTargetBase(),
+		"the reaped leftover frees the pinned name instead of forcing a generation")
+}
+
+// A toolchain whose launcher or whole target directory vanished is repair
+// evidence, not absence. Exists() reports it, and Ensure rebuilds it.
+func TestVanishedLauncherIsReprovisioned(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(root, 0o700))
+	require.NoError(t, os.Symlink(filepath.Join("versions", "gone"), filepath.Join(root, "current")))
+
+	tc0 := New(root, slog.New(slog.DiscardHandler))
+	require.True(t, tc0.Exists(), "a dangling current symlink is provisioned evidence")
+	_, ok := tc0.BorgmaticPath()
+	require.False(t, ok)
+
+	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
+	tc, _ := newTestToolchain(t, root, tarball, sum)
+	p, err := tc.Ensure(context.Background())
+	require.NoError(t, err)
+	out, err := os.ReadFile(p)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), BorgmaticVersion)
+}

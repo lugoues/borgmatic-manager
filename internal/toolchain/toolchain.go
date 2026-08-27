@@ -154,6 +154,21 @@ func versionDirName() string {
 	return fmt.Sprintf("uv%s-py%s-borgmatic%s", uvVersion, pythonVersion, BorgmaticVersion)
 }
 
+// PinnedVersionDirName is the directory name the current pins provision into.
+// Exported for tests that seed a provisioned-looking toolchain and need it to
+// read as fresh, so nothing tries to provision over it.
+func PinnedVersionDirName() string { return versionDirName() }
+
+// Exists reports whether a toolchain was ever provisioned here, judged by the
+// "current" symlink alone (even dangling). A toolchain whose launcher or whole
+// target directory vanished is repair evidence, not absence: falling back to a
+// host install on it would silently re-couple the daemon to the host's Python
+// packaging, which is exactly what the toolchain exists to prevent.
+func (t *Toolchain) Exists() bool {
+	_, err := os.Lstat(filepath.Join(t.root, "current"))
+	return err == nil
+}
+
 // BorgmaticPath returns the current toolchain's borgmatic, if a provisioned
 // toolchain exists at all (fresh or stale).
 func (t *Toolchain) BorgmaticPath() (string, bool) {
@@ -325,19 +340,34 @@ func (t *Toolchain) acquireProvisionLock(ctx context.Context) (*lockfile.Lock, e
 }
 
 // provision builds the pinned version directory and flips "current" to it.
-func (t *Toolchain) provision(ctx context.Context) error {
+func (t *Toolchain) provision(ctx context.Context) (err error) {
+	// Reap unfinished directories first: no manifest means no provisioner
+	// completed them, and holding provision.lock means no live provisioner
+	// owns them either. Under Restart=on-failure a transient outage retries
+	// here every few seconds, and without this each attempt would abandon
+	// another partial Python environment until the disk or the generation
+	// namespace ran out.
+	t.reapUnfinished()
+
 	name, nameErr := t.buildDirName()
 	if nameErr != nil {
 		return nameErr
 	}
 	vdir := filepath.Join(t.root, "versions", name)
-	if err := os.MkdirAll(filepath.Join(vdir, "bin"), 0o700); err != nil {
-		return fmt.Errorf("creating toolchain version directory: %w", err)
+	if mkErr := os.MkdirAll(filepath.Join(vdir, "bin"), 0o700); mkErr != nil {
+		return fmt.Errorf("creating toolchain version directory: %w", mkErr)
 	}
+	// This attempt's directory is nothing anyone uses until the flip; on any
+	// failure it is removed rather than left to block its generation name.
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(vdir)
+		}
+	}()
 
 	uvPath := filepath.Join(vdir, "uv")
-	if err := t.downloadUV(ctx, uvPath); err != nil {
-		return err
+	if dlErr := t.downloadUV(ctx, uvPath); dlErr != nil {
+		return dlErr
 	}
 
 	t.logger.Info("installing borgmatic into the toolchain",
@@ -391,6 +421,32 @@ func (t *Toolchain) provision(ctx context.Context) error {
 
 	t.cleanOldVersions(name)
 	return nil
+}
+
+// reapUnfinished removes version directories no completed provisioning ever
+// produced: not the current target, and no manifest (the manifest is written
+// only after the smoke test). Callers hold provision.lock, so such a
+// directory can only be a crashed provisioner's leftover, never live work.
+// Finished-but-superseded directories keep their grace period; this touches
+// only the never-finished.
+func (t *Toolchain) reapUnfinished() {
+	entries, err := os.ReadDir(filepath.Join(t.root, "versions"))
+	if err != nil {
+		return
+	}
+	current := t.currentTargetBase()
+	for _, e := range entries {
+		if e.Name() == current {
+			continue
+		}
+		dir := filepath.Join(t.root, "versions", e.Name())
+		if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err == nil {
+			continue
+		}
+		if err := os.RemoveAll(dir); err == nil {
+			t.logger.Info("removed unfinished toolchain directory left by a crashed provisioning attempt", "version", e.Name())
+		}
+	}
 }
 
 // buildDirName picks the directory this provisioning run builds into: the
