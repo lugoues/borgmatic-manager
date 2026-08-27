@@ -64,6 +64,12 @@ type Scheduler struct {
 	mu          sync.Mutex
 	lastAttempt map[string]time.Time
 
+	// rearm pokes the Start loop to recompute NextWake after a cycle it did
+	// not drive (an event-triggered RunCycle) changes scheduling state: a
+	// sleeping timer would otherwise ignore a new bounded retry until it
+	// fired on its own, possibly a full period out. Buffered so RunCycle
+	// never blocks; a coalesced poke is enough, the loop re-reads all state.
+	rearm chan struct{}
 	// preRunRetry, when set, is when a failed pre-run check should be retried.
 	// A transient borg probe failure before a NEW group's first record would
 	// otherwise leave nothing for NextWake to schedule around, delaying the
@@ -232,6 +238,7 @@ func NewScheduler(
 		lastAttempt:  map[string]time.Time{},
 		groupPeriods: map[string]time.Duration{},
 		lockedRetry:  map[string]time.Time{},
+		rearm:        make(chan struct{}, 1),
 		now:          time.Now,
 	}
 
@@ -454,6 +461,16 @@ func (s *Scheduler) RunAllGroups(ctx context.Context, backupState *models.Backup
 func (s *Scheduler) RunCycle(ctx context.Context) error {
 	s.cycleMu.Lock()
 	defer s.cycleMu.Unlock()
+	// Every completed cycle can move the next due time (new records, lock or
+	// gate retries); tell a sleeping Start loop to recompute. Coalesced and
+	// non-blocking; the loop's own post-RunCycle recompute makes it a no-op
+	// for timer-driven cycles.
+	defer func() {
+		select {
+		case s.rearm <- struct{}{}:
+		default:
+		}
+	}()
 
 	s.logger.Info("starting backup cycle")
 
@@ -596,8 +613,24 @@ func (s *Scheduler) Start(ctx context.Context) error {
 			if err := s.RunCycle(ctx); err != nil {
 				s.logger.Error("cycle failed", "error", err)
 			}
+			// Drain our own cycle's poke so it cannot fire a redundant wake.
+			select {
+			case <-s.rearm:
+			default:
+			}
 			wake := s.NextWake()
 			s.logger.Debug("scheduler sleeping", "until_next_due", wake.Round(time.Second).String())
+			timer.Reset(wake)
+		case <-s.rearm:
+			// An event-triggered cycle ran elsewhere; re-arm around its outcome.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			wake := s.NextWake()
+			s.logger.Debug("scheduler re-armed by external cycle", "until_next_due", wake.Round(time.Second).String())
 			timer.Reset(wake)
 		case <-ctx.Done():
 			s.logger.Info("scheduler stopping")

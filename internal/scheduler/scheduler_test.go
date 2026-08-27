@@ -1,11 +1,13 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -797,5 +799,67 @@ func TestNextWake_PreRunGateFailureRetriesOnBoundedInterval(t *testing.T) {
 	}
 	if got := s.NextWake(); got != time.Hour {
 		t.Fatalf("after recovery the retry clock must clear and the period resume, got %v", got)
+	}
+}
+
+// lockedLogBuffer lets the test read what the Start goroutine logs.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// An event-triggered cycle runs outside the Start loop; when it fails the
+// pre-run gate, the loop's timer is already sleeping for the old wake and
+// would ignore the bounded retry until it fired on its own. The cycle must
+// poke the loop into recomputing.
+func TestStartRearmsAfterExternalGateFailure(t *testing.T) {
+	buf := &lockedLogBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	cfg := &config.ManagerConfig{Manager: config.ManagerSettings{Period: "1h"}}
+	s := NewScheduler(newMockGroupRunner(), nil, logger, cfg, nil, testStore(t))
+	t0 := time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return t0 }
+	s.discoverFunc = func(ctx context.Context) (*models.BackupState, error) {
+		return singleGroupState(), nil
+	}
+	s.generateFunc = func(st *models.BackupState) (map[string]config.GroupRunMeta, error) {
+		return metaFor(st), nil
+	}
+	s.SetPreRunCheck(func(ctx context.Context, bs *models.BackupState) error {
+		return errors.New("borg probe timed out")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+
+	// The event path: the orchestrator calls RunCycle directly.
+	if err := s.RunCycle(ctx); err == nil {
+		t.Fatal("the gated cycle must fail")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "re-armed by external cycle") {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("the sleeping Start loop never recomputed its wake after the external cycle set a bounded retry")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start returned an error: %v", err)
 	}
 }
