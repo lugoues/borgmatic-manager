@@ -712,6 +712,14 @@ func runAdhoc(ctx context.Context, groups []string) error {
 	}
 	stripOfflineDatabases(backupState, offline, logger)
 
+	// The default-borg check reruns on THIS discovery, not preflight's: a
+	// group appearing between the two would otherwise run unvalidated (its
+	// group-specific borg is judged by generation regardless). Probes are
+	// memoized, so an unchanged borg costs a stat.
+	if borgErr := checkBorg(ctx, e.cfg, e.groupOverrides, backupState); borgErr != nil {
+		return borgErr
+	}
+
 	// Generate into a private tmpfs directory, never the daemon's live configs
 	// dir: sharing it races the daemon (deleted configs, mismatched RunIDs that
 	// leak dump helpers), and the configs carry credentials so never /tmp.

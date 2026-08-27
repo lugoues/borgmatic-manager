@@ -35,15 +35,14 @@ func TestBorgCommandsListsEveryConfiguredBorg(t *testing.T) {
 		assert.Equal(t, "/opt/borg2/borg", cmds[0].command)
 	})
 
-	t.Run("a group override adds its borg beside the default", func(t *testing.T) {
+	t.Run("group-specific borgs are not listed; generation judges them per group", func(t *testing.T) {
 		overrides := map[string]config.GroupOverride{
 			"special": {Borgmatic: map[string]interface{}{"local_path": "/opt/borg2/borg"}},
 			"plain":   {Borgmatic: map[string]interface{}{"keep_daily": 7}},
 		}
 		cmds := borgCommands(&config.ManagerConfig{}, overrides, nil)
-		require.Len(t, cmds, 2, "groups without an override still need the default borg")
-		got := []string{cmds[0].command, cmds[1].command}
-		assert.ElementsMatch(t, []string{"borg", "/opt/borg2/borg"}, got)
+		require.Len(t, cmds, 1, "only the default: a group's own borg failing must refuse that group, not the launch")
+		assert.Equal(t, "borg", cmds[0].command)
 	})
 }
 
@@ -64,14 +63,14 @@ func TestCheckBorgHonorsLocalPath(t *testing.T) {
 		assert.Contains(t, err.Error(), "manager.yaml local_path")
 	})
 
-	t.Run("a group override is checked and the default still required", func(t *testing.T) {
+	t.Run("the default is still required with no discovered state", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir()) // no default borg
 		lp := fakeBorg(t, t.TempDir(), "1.4.5")
 		overrides := map[string]config.GroupOverride{
 			"g": {Borgmatic: map[string]interface{}{"local_path": lp}},
 		}
 		err := checkBorg(context.Background(), &config.ManagerConfig{}, overrides, nil)
-		require.Error(t, err, "groups without the override still invoke the default borg")
+		require.Error(t, err, "no state means the default must be assumed needed")
 		assert.Contains(t, err.Error(), "PATH")
 	})
 
@@ -107,29 +106,19 @@ func TestCheckBorgHonorsLocalPath(t *testing.T) {
 		require.Error(t, checkBorg(context.Background(), hooked, nil, nil))
 	})
 
-	// One group's snapshot hooks must not harden the floor for a different
-	// group's private borg: below-1.4 is supported without snapshot hooks, and
-	// a mixed configuration is valid.
-	t.Run("the floor is scoped to the groups using each borg", func(t *testing.T) {
+	// A group's private borg never reaches the launch check at all: its
+	// problems refuse only that group at generation time.
+	t.Run("a group's own borg does not harden or fail the default", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
 		newBorg := fakeBorg(t, t.TempDir(), "1.4.5")
-		oldDir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(oldDir, "borg-old"), []byte("#!/bin/sh\necho borg 1.2.0\n"), 0o755))
-		oldBorg := filepath.Join(oldDir, "borg-old")
 
 		cfg := &config.ManagerConfig{Borgmatic: map[string]interface{}{"local_path": newBorg}}
 		overrides := map[string]config.GroupOverride{
 			"snappy": {Borgmatic: map[string]interface{}{"btrfs": map[string]interface{}{}}},
-			"legacy": {Borgmatic: map[string]interface{}{"local_path": oldBorg}},
+			"legacy": {Borgmatic: map[string]interface{}{"local_path": "/nonexistent/old-borg", "zfs": map[string]interface{}{}}},
 		}
 		require.NoError(t, checkBorg(context.Background(), cfg, overrides, nil),
-			"the old borg belongs to a snapshot-free group; only the default borg carries the snapshot floor")
-
-		overrides["legacy"] = config.GroupOverride{Borgmatic: map[string]interface{}{
-			"local_path": oldBorg, "zfs": map[string]interface{}{},
-		}}
-		require.Error(t, checkBorg(context.Background(), cfg, overrides, nil),
-			"the same old borg with hooks in its own group is fatal")
+			"legacy's broken borg is its own refusal at generation, never a launch failure")
 	})
 }
 
@@ -155,24 +144,14 @@ func TestCheckBorgHonorsLabelLocalPath(t *testing.T) {
 		assert.Contains(t, err.Error(), "PATH")
 	})
 
-	t.Run("a broken label borg names its source", func(t *testing.T) {
+	t.Run("a broken label borg is not a launch failure", func(t *testing.T) {
+		// Its group is refused at generation instead (see the config package's
+		// refusal tests): one container's bad label must not stop the fleet.
 		st2 := models.NewBackupState()
 		st2.AddVolume("app", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
 		st2.Groups["app"].LabelConfigs = append(st2.Groups["app"].LabelConfigs,
 			map[string]interface{}{"local_path": "/nonexistent/borg"})
-		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, st2)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "label local_path")
-	})
-
-	t.Run("label snapshot hooks harden that group's borg floor", func(t *testing.T) {
-		old := fakeBorg(t, t.TempDir(), "1.2.0")
-		st3 := models.NewBackupState()
-		st3.AddVolume("snappy", models.VolumeInfo{Name: "v1", HostPath: "/mnt/v1"})
-		st3.Groups["snappy"].LabelConfigs = append(st3.Groups["snappy"].LabelConfigs,
-			map[string]interface{}{"local_path": old, "btrfs": map[string]interface{}{}})
-		err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, st3)
-		require.Error(t, err, "an old borg under a snapshot-hook group is fatal, label-sourced or not")
+		require.NoError(t, checkBorg(context.Background(), &config.ManagerConfig{}, nil, st2))
 	})
 }
 
@@ -287,4 +266,15 @@ func TestBorgVersionCacheSeesAtomicReplacement(t *testing.T) {
 	hooked := &config.ManagerConfig{Borgmatic: map[string]interface{}{"btrfs": map[string]interface{}{}}}
 	require.Error(t, checkBorg(context.Background(), hooked, nil, nil),
 		"the downgraded borg must be re-probed and fail the snapshot floor, not served from cache")
+}
+
+// A zero-exit borg shim printing garbage is not borg: versionAtLeast waves
+// unparseable tokens through the floor, so plausibility must gate first.
+func TestCheckBorgRejectsGarbageVersionOutput(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "borg"), []byte("#!/bin/sh\necho ok\n"), 0o755))
+	t.Setenv("PATH", dir)
+	err := checkBorg(context.Background(), &config.ManagerConfig{}, nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no usable version")
 }
