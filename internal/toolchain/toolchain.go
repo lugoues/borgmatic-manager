@@ -96,11 +96,12 @@ type Toolchain struct {
 
 	// Seams for tests: where releases are fetched from, the expected uv
 	// checksums, how uv is executed, and how a binary's version is probed.
-	downloadBase string
-	uvSums       map[string]string
-	client       *http.Client
-	runUV        func(ctx context.Context, uvPath string, env []string, args ...string) ([]byte, error)
-	binVersion   func(ctx context.Context, bin string) (string, error)
+	downloadBase     string
+	uvSums           map[string]string
+	provisionTimeout time.Duration
+	client           *http.Client
+	runUV            func(ctx context.Context, uvPath string, env []string, args ...string) ([]byte, error)
+	binVersion       func(ctx context.Context, bin string) (string, error)
 }
 
 // New manages the toolchain rooted at root (conventionally
@@ -108,11 +109,12 @@ type Toolchain struct {
 // degradation warnings.
 func New(root string, logger *slog.Logger) *Toolchain {
 	return &Toolchain{
-		root:         root,
-		logger:       logger,
-		downloadBase: defaultDownloadBase,
-		uvSums:       uvSHA256,
-		client:       &http.Client{},
+		root:             root,
+		logger:           logger,
+		downloadBase:     defaultDownloadBase,
+		uvSums:           uvSHA256,
+		provisionTimeout: provisionTimeout,
+		client:           &http.Client{},
 		runUV: func(ctx context.Context, uvPath string, env []string, args ...string) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, uvPath, args...) // #nosec G204 -- executing the checksum-verified uv this package just installed
 			cmd.Env = env
@@ -152,9 +154,24 @@ func (t *Toolchain) BorgmaticPath() (string, bool) {
 }
 
 // Fresh reports whether the current toolchain matches the compiled-in pins.
+// Repair generations of the same pins ("<name>-r2", built when a broken
+// current had to be replaced in place) are the same composition and count.
 func (t *Toolchain) Fresh() bool {
+	return freshDirName(t.currentTargetBase())
+}
+
+func freshDirName(base string) bool {
+	name := versionDirName()
+	return base == name || strings.HasPrefix(base, name+"-r")
+}
+
+// currentTargetBase is the directory name "current" points at, or "".
+func (t *Toolchain) currentTargetBase() string {
 	target, err := os.Readlink(filepath.Join(t.root, "current"))
-	return err == nil && filepath.Base(target) == versionDirName()
+	if err != nil {
+		return ""
+	}
+	return filepath.Base(target)
 }
 
 // Manifest records what a version directory holds, for doctor output.
@@ -179,11 +196,9 @@ func (t *Toolchain) Info() (Manifest, bool, error) {
 	return m, t.Fresh(), nil
 }
 
-// healthy reports whether the toolchain borgmatic at p actually runs and
-// reports a version. Freshness alone is a symlink name: a deleted managed
-// Python or a corrupted package tree keeps the launcher in place while every
-// exec of it fails, and trusting the name would return that broken toolchain
-// on every launch without ever reprovisioning.
+// healthy reports whether the toolchain borgmatic at p actually runs. Used
+// for the degrade fallback, where a stale (older-versioned) toolchain is
+// acceptable, so only the exit status is judged.
 func (t *Toolchain) healthy(ctx context.Context, p string) bool {
 	out, err := t.binVersion(ctx, p)
 	if err != nil {
@@ -193,6 +208,30 @@ func (t *Toolchain) healthy(ctx context.Context, p string) bool {
 	return true
 }
 
+// freshAndHealthy accepts the current toolchain only when its name matches
+// the pins AND its binary runs AND it reports the pinned version. Freshness
+// alone is a symlink name: a deleted managed Python or a partially replaced
+// launcher keeps the name while every exec fails, or exits zero reporting
+// some other version, and trusting either would return a broken toolchain on
+// every launch without ever reprovisioning.
+func (t *Toolchain) freshAndHealthy(ctx context.Context) (string, bool) {
+	p, ok := t.BorgmaticPath()
+	if !ok || !t.Fresh() {
+		return "", false
+	}
+	out, err := t.binVersion(ctx, p)
+	if err != nil {
+		t.logger.Warn("toolchain borgmatic failed its health check", "borgmatic", p, "error", err, "output", out)
+		return "", false
+	}
+	if !strings.Contains(out, BorgmaticVersion) {
+		t.logger.Warn("toolchain borgmatic reports the wrong version; reprovisioning",
+			"borgmatic", p, "reported", out, "expected", BorgmaticVersion)
+		return "", false
+	}
+	return p, true
+}
+
 // Ensure returns a working toolchain borgmatic, provisioning or refreshing
 // first when the current one is missing, does not match the pins, or no
 // longer runs. A failed refresh degrades to the existing toolchain (if it
@@ -200,8 +239,8 @@ func (t *Toolchain) healthy(ctx context.Context, p string) bool {
 // beats no borgmatic at all. Only "nothing usable and provisioning failed" is
 // an error.
 func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
-	if p, ok := t.BorgmaticPath(); ok && t.Fresh() && t.healthy(ctx, p) {
-		t.cleanOldVersions(versionDirName())
+	if p, ok := t.freshAndHealthy(ctx); ok {
+		t.cleanOldVersions(t.currentTargetBase())
 		return p, nil
 	}
 	if err := os.MkdirAll(t.root, 0o700); err != nil {
@@ -217,14 +256,20 @@ func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 	defer lock.Release()
 
 	// Whoever held the lock may have provisioned exactly what was needed.
-	if p, ok := t.BorgmaticPath(); ok && t.Fresh() && t.healthy(ctx, p) {
+	if p, ok := t.freshAndHealthy(ctx); ok {
 		return p, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, provisionTimeout)
+	pctx, cancel := context.WithTimeout(ctx, t.provisionTimeout)
 	defer cancel()
-	if err := t.provision(ctx); err != nil {
-		if p, ok := t.BorgmaticPath(); ok && t.healthy(ctx, p) {
+	if err := t.provision(pctx); err != nil {
+		// The degrade probe runs on its own context: a provisioning attempt
+		// that died by its deadline must not take the fallback's health check
+		// down with it, or a stalled download turns into a failed launch even
+		// though the existing toolchain still works.
+		hctx, hcancel := context.WithTimeout(ctx, time.Minute)
+		defer hcancel()
+		if p, ok := t.BorgmaticPath(); ok && t.healthy(hctx, p) {
 			t.logger.Warn("toolchain provisioning failed; continuing with the existing toolchain",
 				"error", err, "borgmatic", p)
 			return p, nil
@@ -244,6 +289,16 @@ func (t *Toolchain) Ensure(ctx context.Context) (string, error) {
 // provision builds the pinned version directory and flips "current" to it.
 func (t *Toolchain) provision(ctx context.Context) error {
 	name := versionDirName()
+	// A repair of the very composition "current" points at must not build in
+	// place: the live directory would be destroyed before its replacement
+	// exists, and a borgmatic already running from it would lose its files.
+	// Stage under a generation sibling instead and let the flip retire the
+	// old one through the usual grace period.
+	if name == t.currentTargetBase() {
+		name += "-r2"
+	} else if base := t.currentTargetBase(); base == name+"-r2" {
+		name += "-r3"
+	}
 	vdir := filepath.Join(t.root, "versions", name)
 
 	// A directory left by a crashed provisioner is unfinished by definition

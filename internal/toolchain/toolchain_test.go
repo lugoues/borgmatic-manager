@@ -170,6 +170,76 @@ func TestBrokenFreshToolchainIsReprovisioned(t *testing.T) {
 	assert.Contains(t, string(out), BorgmaticVersion)
 }
 
+// A repair of the composition "current" already points at must never build in
+// the live directory: the running toolchain would be destroyed before its
+// replacement exists. It stages into a generation sibling and flips.
+func TestSameVersionRepairStagesBesideTheLiveDirectory(t *testing.T) {
+	root := t.TempDir()
+	name := versionDirName()
+	live := filepath.Join(root, "versions", name)
+	require.NoError(t, os.MkdirAll(filepath.Join(live, "bin"), 0o755))
+	// Healthy exit, wrong version: the health gate demands a rebuild.
+	require.NoError(t, os.WriteFile(filepath.Join(live, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\necho 0.0.0\n"), 0o755))
+	sentinel := filepath.Join(live, "keepsake")
+	require.NoError(t, os.WriteFile(sentinel, []byte("x"), 0o600))
+	require.NoError(t, os.Symlink(filepath.Join("versions", name), filepath.Join(root, "current")))
+
+	t.Run("a failed rebuild leaves the live directory untouched", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "no network", http.StatusBadGateway)
+		}))
+		defer srv.Close()
+		tc := New(root, slog.New(slog.DiscardHandler))
+		tc.downloadBase = srv.URL
+
+		p, err := tc.Ensure(context.Background())
+		require.NoError(t, err, "an executing toolchain degrades even at the wrong version; preflight's floor judges it")
+		assert.Equal(t, filepath.Join(root, "current", "bin", "borgmatic"), p)
+		_, statErr := os.Stat(sentinel)
+		require.NoError(t, statErr, "the live directory must not be cleared for a repair that never completed")
+	})
+
+	t.Run("a successful rebuild flips to a generation sibling", func(t *testing.T) {
+		tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
+		tc, _ := newTestToolchain(t, root, tarball, sum)
+		p, err := tc.Ensure(context.Background())
+		require.NoError(t, err)
+		assert.True(t, tc.Fresh(), "a repair generation still counts as the pinned composition")
+		assert.Equal(t, name+"-r2", tc.currentTargetBase())
+		out, err := os.ReadFile(p)
+		require.NoError(t, err)
+		assert.Contains(t, string(out), BorgmaticVersion)
+		_, statErr := os.Stat(sentinel)
+		require.NoError(t, statErr, "the old directory survives into the grace period")
+	})
+}
+
+// A provisioning attempt that dies by its own deadline must not poison the
+// degrade fallback: the stale toolchain still works and the launch must keep
+// running on it.
+func TestExpiredProvisionDeadlineStillDegrades(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, "versions", "uv0.0.1-py3.12-borgmatic2.0.0")
+	require.NoError(t, os.MkdirAll(filepath.Join(old, "bin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(old, "bin", "borgmatic"),
+		[]byte("#!/bin/sh\necho 2.0.0\n"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("versions", "uv0.0.1-py3.12-borgmatic2.0.0"), filepath.Join(root, "current")))
+
+	// The download stalls past the provisioning deadline.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+	}))
+	defer srv.Close()
+	tc := New(root, slog.New(slog.DiscardHandler))
+	tc.downloadBase = srv.URL
+	tc.provisionTimeout = 100 * time.Millisecond
+
+	p, err := tc.Ensure(context.Background())
+	require.NoError(t, err, "the fallback health check must not run on the expired provisioning context")
+	assert.Equal(t, filepath.Join(root, "current", "bin", "borgmatic"), p)
+}
+
 // Degrading to the existing toolchain is only safe when it still runs: handing
 // back a broken binary would just move the failure one step later.
 func TestDegradeRequiresAWorkingToolchain(t *testing.T) {
