@@ -94,9 +94,9 @@ borgmatic-manager installed.
 
 Next steps:
   1. Install borg >= 1.4 (the only hard dependency; distro packages often
-     lag). borgmatic is NOT needed: the manager provisions its own isolated
-     toolchain on first launch. A host borgmatic >= 2.1, if present and
-     healthy, is used instead.
+     lag). borgmatic is NOT needed: the manager provisions and uses its own
+     isolated toolchain on first use. A host-installed borgmatic is ignored
+     unless manager.borgmatic_path points at it.
   2. Edit /etc/borgmatic-manager/manager.yaml (repository, passphrase);
      local tweaks belong in /etc/borgmatic-manager/conf.d/*.yaml, which
      package upgrades never touch (the shipped default lives at

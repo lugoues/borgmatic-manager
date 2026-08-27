@@ -11,8 +11,8 @@ snapshot-consistent backups — no per-service config files.
    `borgmatic-manager.*` labels (periodically and on create/remove events);
    a labeled container's named volumes and databases join its backup group
 2. **Generate** — compiles per-group borgmatic YAML from labels + your defaults
-3. **Backup** — runs borgmatic (the manager's own toolchain, or a host
-   install) per group:
+3. **Backup** — runs borgmatic (the manager's own pinned toolchain) per
+   group:
    `create prune compact check`; database dumps run in short-lived helper
    containers joined to the database's network namespace
 4. **Snapshots** — on btrfs/zfs/LVM hosts, borgmatic's built-in hooks snapshot
@@ -27,7 +27,7 @@ snapshot-consistent backups — no per-service config files.
    │  scheduler ──► discover ──► generate ──► run  │
    └──────────────────────────────────────────┼────┘
                                               ▼
-                              borgmatic (toolchain or host)
+                              borgmatic (managed toolchain)
                                     ├─ btrfs/zfs/lvm snapshots
                                     ├─ borg create/prune/check
                                     └─ database dumps
@@ -42,16 +42,15 @@ reimplements.
 
 | Dependency | Minimum | Notes |
 |---|---|---|
-| borgmatic | **2.1.0** | optional to preinstall: the manager provisions its own if the host has none (see below) |
+| borgmatic | — | **not needed on the host**: the manager owns its own pinned install (see below); `manager.borgmatic_path` is the only way to use another |
 | borg | **1.4** | **required on the host**; the manager refuses to start without it. Deliberately never provisioned: its repository format and CLI must match what you use by hand against the same repositories |
 | Docker or Podman | — | socket access; rootless Podman supported with [limitations](#rootless-podman) |
 | `sqlite3` | — | on the host, only if you back up sqlite databases (postgres/mysql/mariadb dumps run inside helper containers — no host clients needed) |
 
 ### The borgmatic toolchain
 
-At launch the manager checks for a usable borgmatic and, if the host has none —
-not installed, a broken shim (a pipx upgrade that rebuilt its environments), or
-one below the version floor — it provisions its own: a pinned
+The manager owns its borgmatic. On first use — daemon launch, a restore, a
+passthrough command — it provisions a pinned toolchain: a pinned
 [uv](https://docs.astral.sh/uv/) (checksum-verified static binary) installs a
 pinned borgmatic with a uv-managed Python under `<state-dir>/toolchain/`
 (`/var/lib/borgmatic-manager/toolchain/` for the system unit,
@@ -59,12 +58,16 @@ pinned borgmatic with a uv-managed Python under `<state-dir>/toolchain/`
 Nothing there touches the host's Python, so no host package upgrade can break
 the manager's backups.
 
-- A healthy host install is respected: nothing is downloaded behind its back.
-  Once a toolchain exists it is preferred, so the borgmatic in use stays stable.
+- A host-installed borgmatic is **ignored by design**, however healthy: a host
+  install that works today is one host package upgrade away from broken, which
+  is exactly the failure the toolchain ends. It is never probed and never a
+  fallback; if provisioning fails (say, offline on first launch) the command
+  fails and the next attempt retries.
 - Version bumps ship as manager releases: a new release reprovisions on next
   launch, atomically — a failed download leaves the previous toolchain working.
-- `manager.borgmatic_path` / `BORGMATIC_PATH` overrides everything and disables
-  provisioning entirely.
+- `manager.borgmatic_path` / `BORGMATIC_PATH` is the single exception: it
+  overrides the toolchain and disables provisioning entirely. Setting it means
+  keeping that install working is on you.
 - The **borg binary is global-only**: `borg` on PATH, or `local_path` in
   `manager.yaml`'s borgmatic defaults. A `local_path` in a group override or a
   container label is ignored with a warning; from a label it would hand root
@@ -93,8 +96,8 @@ mise run install      # builds and installs binary, unit, default config (sudo i
 
 Only [borg](https://borgbackup.readthedocs.io/) >= 1.4 needs to be on the
 host. borgmatic does not: the manager provisions its own isolated
-[toolchain](#the-borgmatic-toolchain) on first launch (a healthy host
-borgmatic >= 2.1 is used instead if you already have one).
+[toolchain](#the-borgmatic-toolchain) on first use, and a host-installed
+borgmatic is ignored unless you point `manager.borgmatic_path` at it.
 
 **2. Label your containers** — labels live on the *service*, not the volume,
 so a normal `docker compose up` after editing applies them:
