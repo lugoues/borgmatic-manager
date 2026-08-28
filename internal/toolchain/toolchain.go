@@ -84,6 +84,12 @@ const probeTimeout = time.Minute
 // reject an oversized body anyway; this stops the disk filling first.
 const maxDownloadBytes = 512 << 20
 
+// Root is the toolchain's root directory as normalized by New. Callers
+// comparing selected binary paths against the toolchain (doctor) must use
+// this, not their own spelling of the root: Ensure returns paths under the
+// normalized root, and a relative comparison would never match.
+func (t *Toolchain) Root() string { return t.root }
+
 // Toolchain manages the pinned borgmatic install under one root directory:
 //
 //	root/
@@ -732,6 +738,13 @@ func (t *Toolchain) cleanOldVersions(keep ...string) {
 // treated as not using the directory, and the scan only runs when a deletion
 // is already due.
 func generationInUse(dir string) bool {
+	// /proc records fully resolved paths: a symlinked ancestor (a linked
+	// STATE_DIR, /var/lib on a merged-usr distro) in dir would never match.
+	// The directory exists here (a deletion is being weighed), so resolution
+	// cannot fail for the interesting cases; on error the raw path stands.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	prefix := dir + string(os.PathSeparator)
 	procs, err := os.ReadDir("/proc")
 	if err != nil {

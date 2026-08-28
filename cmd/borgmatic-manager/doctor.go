@@ -168,7 +168,10 @@ func runDoctor(ctx context.Context) error {
 	// the explicit override the toolchain is the only possible selection, so
 	// anything else here means the selection above already failed.
 	tc := toolchain.New(e.toolchainDir(), slog.New(slog.DiscardHandler))
-	selectedToolchain := borgmaticPath != "" && strings.HasPrefix(borgmaticPath, e.toolchainDir()+string(filepath.Separator))
+	// Compared against the toolchain's own normalized root: resolveBorgmatic
+	// returns paths under it, and a relative STATE_DIR spelling here would
+	// misreport a healthy selected toolchain as not in use.
+	selectedToolchain := borgmaticPath != "" && strings.HasPrefix(borgmaticPath, tc.Root()+string(filepath.Separator))
 	switch {
 	case explicitBorgmaticPath(e.cfg) != "":
 		r.pass("toolchain", "not in use: manager.borgmatic_path / BORGMATIC_PATH overrides it")
