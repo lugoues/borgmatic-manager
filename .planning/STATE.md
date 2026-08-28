@@ -65,12 +65,6 @@ Logged in PROJECT.md Key Decisions. Highlights for future sessions:
 - .planning/todos/pending/2026-07-27-tie-the-extract-session-to-the-manager-lifetime.md
   — restore: an extract orphaned by a killed manager is detected but not
   prevented; needs a supervisor process, deferred from PR #17 review
-- .planning/todos/pending/2026-08-28-collapse-the-toolchain-generation-machinery-to-single-dir-provisioning.md
-  (toolchain): delete the generation-history defenses (repair suffixes,
-  grace markers, /proc scan) for temp-dir + atomic-rename provisioning;
-  ~20 of the PR #27/#29 review findings were defects in these layers.
-  Two design questions for the owner are listed in the todo; probe them
-  before implementing.
 
 ### Blockers/Concerns
 
