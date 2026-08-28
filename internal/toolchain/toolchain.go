@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -116,6 +117,12 @@ type Toolchain struct {
 // <state-dir>/toolchain). The logger receives provisioning progress and
 // degradation warnings.
 func New(root string, logger *slog.Logger) *Toolchain {
+	// The in-use guard matches directory prefixes against /proc/<pid>/maps,
+	// which records absolute paths; a relative root would never match and
+	// the guard would silently pass everything.
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
 	return &Toolchain{
 		root:             root,
 		logger:           logger,
@@ -230,8 +237,12 @@ func (t *Toolchain) BorgmaticPath() (string, bool) {
 // finished install, and a directory name proves nothing a manifest can't.
 func (t *Toolchain) Fresh() bool {
 	m, err := t.currentManifest()
-	return err == nil &&
-		m.UVVersion == uvVersion &&
+	return err == nil && manifestFresh(m)
+}
+
+// manifestFresh reports whether m matches the compiled-in pins.
+func manifestFresh(m Manifest) bool {
+	return m.UVVersion == uvVersion &&
 		m.PythonVersion == pythonVersion &&
 		m.BorgmaticVersion == BorgmaticVersion
 }
@@ -273,7 +284,10 @@ func (t *Toolchain) Info() (Manifest, bool, error) {
 	if err != nil {
 		return m, false, err
 	}
-	return m, t.Fresh(), nil
+	// Judged from this one read: re-reading through "current" could race a
+	// concurrent flip and pair one generation's manifest with another's
+	// freshness.
+	return m, manifestFresh(m), nil
 }
 
 // healthy reports whether the toolchain borgmatic at p actually runs and
@@ -462,7 +476,8 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 	// out. provision.lock is held, so nothing here is another live
 	// provisioner's build; the in-use guard skips anything a running
 	// borgmatic still maps.
-	t.cleanOldVersions(t.currentTargetBase())
+	prev := t.currentTargetBase()
+	t.cleanOldVersions(prev)
 
 	versions := filepath.Join(t.root, "versions")
 	if mkErr := os.MkdirAll(versions, 0o700); mkErr != nil {
@@ -548,7 +563,11 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 		return fmt.Errorf("switching current toolchain: %w", err)
 	}
 
-	t.cleanOldVersions(name)
+	// The directory that was current until this flip is spared until the
+	// next pass: a borgmatic exec'd through the symlink just before the flip
+	// may not be visible in /proc yet, so the in-use guard alone cannot
+	// clear it this close to the switch. Any later Ensure removes it.
+	t.cleanOldVersions(name, prev)
 	return nil
 }
 
@@ -678,20 +697,20 @@ func (t *Toolchain) tryCleanOldVersions() {
 	t.cleanOldVersions(t.currentTargetBase())
 }
 
-// cleanOldVersions removes every version directory except keep: retired
-// installs and crash debris alike. Callers hold provision.lock, so nothing
-// here is another live provisioner's unflipped build. The one thing the lock
-// cannot see is a borgmatic still RUNNING from a retired directory (Python
-// imports lazily, so deleting its environment breaks it mid-run); such a
-// directory is skipped and removed by a later pass once the run has ended.
-// Best effort throughout: a leftover costs disk, not correctness.
-func (t *Toolchain) cleanOldVersions(keep string) {
+// cleanOldVersions removes every version directory not named in keep:
+// retired installs and crash debris alike. Callers hold provision.lock, so
+// nothing here is another live provisioner's unflipped build. The one thing
+// the lock cannot see is a borgmatic still RUNNING from a retired directory
+// (Python imports lazily, so deleting its environment breaks it mid-run);
+// such a directory is skipped and removed by a later pass once the run has
+// ended. Best effort throughout: a leftover costs disk, not correctness.
+func (t *Toolchain) cleanOldVersions(keep ...string) {
 	entries, err := os.ReadDir(filepath.Join(t.root, "versions"))
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if e.Name() == keep {
+		if slices.Contains(keep, e.Name()) {
 			continue
 		}
 		dir := filepath.Join(t.root, "versions", e.Name())

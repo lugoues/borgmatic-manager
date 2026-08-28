@@ -149,10 +149,16 @@ func TestStaleToolchainIsReprovisionedAndOldRemoved(t *testing.T) {
 	assert.Equal(t, filepath.Join(root, "current", "bin", "borgmatic"), p)
 	assert.True(t, tc.Fresh())
 
-	// The retired directory goes with the flip: nothing maps it, so the
-	// in-use guard lets the cleanup remove it immediately.
+	// The just-retired directory is spared on the flip itself: a borgmatic
+	// exec'd through the symlink moments earlier may not be visible in /proc
+	// yet. The next Ensure's cleanup pass removes it.
 	_, statErr := os.Stat(old)
-	assert.True(t, os.IsNotExist(statErr), "nothing runs from the old version, so it is removed on the flip")
+	require.NoError(t, statErr, "the just-retired version survives the flip for one pass")
+
+	_, err = tc.Ensure(context.Background())
+	require.NoError(t, err)
+	_, statErr = os.Stat(old)
+	assert.True(t, os.IsNotExist(statErr), "the next pass removes the retired version; nothing runs from it")
 }
 
 // Freshness is only a manifest. A toolchain whose environment was deleted
@@ -223,7 +229,11 @@ func TestSameVersionRepairStagesBesideTheLiveDirectory(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, string(out), BorgmaticVersion)
 		_, statErr := os.Stat(live)
-		assert.True(t, os.IsNotExist(statErr), "nothing runs from the broken directory, so the flip removes it")
+		require.NoError(t, statErr, "the just-retired directory survives the flip for one pass")
+		_, err = tc.Ensure(context.Background())
+		require.NoError(t, err)
+		_, statErr = os.Stat(live)
+		assert.True(t, os.IsNotExist(statErr), "the next pass removes the broken directory")
 	})
 }
 
