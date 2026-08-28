@@ -605,3 +605,23 @@ func TestMalformedCurrentDirectoryIsReplaced(t *testing.T) {
 	require.NoError(t, rerr)
 	assert.Contains(t, string(out), BorgmaticVersion)
 }
+
+// The in-use guard matches /proc maps prefixes, which are absolute paths; a
+// relative STATE_DIR would otherwise never match and the guard would pass
+// everything straight to deletion.
+func TestNewNormalizesARelativeRoot(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	tc := New("state/toolchain", slog.New(slog.DiscardHandler))
+	assert.True(t, filepath.IsAbs(tc.root), "a relative root must become absolute (got %s)", tc.root)
+	assert.Equal(t, filepath.Join(dir, "state", "toolchain"), evalSymlinksOr(tc.root))
+}
+
+// evalSymlinksOr resolves p for comparison on hosts where TempDir sits behind
+// a symlink (macOS /var -> /private/var); the raw path is kept on error.
+func evalSymlinksOr(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
