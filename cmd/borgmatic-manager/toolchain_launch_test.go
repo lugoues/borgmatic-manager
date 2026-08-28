@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +25,9 @@ func seedToolchain(t *testing.T, stateDir string) string {
 	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
 		[]byte("#!/bin/sh\necho "+toolchain.BorgmaticVersion+"\n"), 0o755))
+	manifest, err := json.Marshal(toolchain.PinnedManifest())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), manifest, 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", name),
 		filepath.Join(stateDir, "toolchain", "current")))
 	return filepath.Join(stateDir, "toolchain", "current", "bin", "borgmatic")

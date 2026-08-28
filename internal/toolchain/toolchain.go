@@ -177,24 +177,31 @@ func New(root string, logger *slog.Logger) *Toolchain {
 	}
 }
 
-// CurrentBorgmatic reports the borgmatic of an already-provisioned toolchain
-// under root, without provisioning anything. For callers (restore, config
-// rendering) that must not start downloads but should prefer the toolchain
-// when one exists.
-func CurrentBorgmatic(root string) (string, bool) {
-	return New(root, slog.New(slog.DiscardHandler)).BorgmaticPath()
-}
-
 // versionDirName identifies one exact toolchain composition. Human-readable
 // on purpose: an operator listing the directory should see what is installed.
+// It is a prefix, not an identity: each build appends a random suffix because
+// the launchers embed absolute paths, so a directory can never be renamed and
+// a rebuild of the same pins still needs a name of its own. Freshness is
+// judged by the manifest, never the name.
 func versionDirName() string {
 	return fmt.Sprintf("uv%s-py%s-borgmatic%s", uvVersion, pythonVersion, BorgmaticVersion)
 }
 
-// PinnedVersionDirName is the directory name the current pins provision into.
-// Exported for tests that seed a provisioned-looking toolchain and need it to
-// read as fresh, so nothing tries to provision over it.
+// PinnedVersionDirName is a directory name matching the current pins.
+// Exported for tests that seed a provisioned-looking toolchain; pair it with
+// PinnedManifest, which is what freshness is actually judged by.
 func PinnedVersionDirName() string { return versionDirName() }
+
+// PinnedManifest is the manifest a provisioning run under the current pins
+// writes. Exported for tests seeding a toolchain that must read as fresh.
+func PinnedManifest() Manifest {
+	return Manifest{
+		UVVersion:        uvVersion,
+		PythonVersion:    pythonVersion,
+		BorgmaticVersion: BorgmaticVersion,
+		ProvisionedAt:    time.Now().UTC(),
+	}
+}
 
 // Exists reports whether a toolchain was ever provisioned here, judged by the
 // "current" symlink alone (even dangling). A toolchain whose launcher or whole
@@ -217,16 +224,29 @@ func (t *Toolchain) BorgmaticPath() (string, bool) {
 	return p, true
 }
 
-// Fresh reports whether the current toolchain matches the compiled-in pins.
-// Repair generations of the same pins ("<name>-r2", built when a broken
-// current had to be replaced in place) are the same composition and count.
+// Fresh reports whether the current toolchain matches the compiled-in pins,
+// judged by the manifest "current" points at. The manifest is written only
+// after the smoke test, so a directory without one is by definition not a
+// finished install, and a directory name proves nothing a manifest can't.
 func (t *Toolchain) Fresh() bool {
-	return freshDirName(t.currentTargetBase())
+	m, err := t.currentManifest()
+	return err == nil &&
+		m.UVVersion == uvVersion &&
+		m.PythonVersion == pythonVersion &&
+		m.BorgmaticVersion == BorgmaticVersion
 }
 
-func freshDirName(base string) bool {
-	name := versionDirName()
-	return base == name || strings.HasPrefix(base, name+"-r")
+// currentManifest reads the manifest of whatever "current" points at.
+func (t *Toolchain) currentManifest() (Manifest, error) {
+	var m Manifest
+	raw, err := os.ReadFile(filepath.Join(t.root, "current", "manifest.json"))
+	if err != nil {
+		return m, err
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return m, err
+	}
+	return m, nil
 }
 
 // currentTargetBase is the directory name "current" points at, or "".
@@ -249,12 +269,8 @@ type Manifest struct {
 // Info describes the current toolchain for doctor: the manifest of whatever
 // "current" points at, and whether it matches the pins.
 func (t *Toolchain) Info() (Manifest, bool, error) {
-	var m Manifest
-	raw, err := os.ReadFile(filepath.Join(t.root, "current", "manifest.json"))
+	m, err := t.currentManifest()
 	if err != nil {
-		return m, false, err
-	}
-	if err := json.Unmarshal(raw, &m); err != nil {
 		return m, false, err
 	}
 	return m, t.Fresh(), nil
@@ -438,31 +454,38 @@ func (t *Toolchain) acquireProvisionLock(ctx context.Context) (*lockfile.Lock, e
 	}
 }
 
-// provision builds the pinned version directory and flips "current" to it.
+// provision builds a new version directory and flips "current" to it.
 func (t *Toolchain) provision(ctx context.Context) (err error) {
-	// Reap unfinished directories first: no manifest means no provisioner
-	// completed them, and holding provision.lock means no live provisioner
-	// owns them either. Under Restart=on-failure a transient outage retries
-	// here every few seconds, and without this each attempt would abandon
-	// another partial Python environment until the disk or the generation
-	// namespace ran out.
-	t.reapUnfinished()
+	// Clear retired directories and crash debris first: under
+	// Restart=on-failure a transient outage retries here every few seconds,
+	// and each abandoned attempt would otherwise pile up until the disk ran
+	// out. provision.lock is held, so nothing here is another live
+	// provisioner's build; the in-use guard skips anything a running
+	// borgmatic still maps.
+	t.cleanOldVersions(t.currentTargetBase())
 
-	name, nameErr := t.buildDirName()
-	if nameErr != nil {
-		return nameErr
+	versions := filepath.Join(t.root, "versions")
+	if mkErr := os.MkdirAll(versions, 0o700); mkErr != nil {
+		return fmt.Errorf("creating toolchain versions directory: %w", mkErr)
 	}
-	vdir := filepath.Join(t.root, "versions", name)
-	if mkErr := os.MkdirAll(filepath.Join(vdir, "bin"), 0o700); mkErr != nil {
+	// A fresh random-suffixed directory every build: the launchers embed
+	// absolute paths, so a directory is never renamed or reused once built,
+	// rebuilds of the same pins included.
+	vdir, mkErr := os.MkdirTemp(versions, versionDirName()+"-")
+	if mkErr != nil {
 		return fmt.Errorf("creating toolchain version directory: %w", mkErr)
 	}
+	name := filepath.Base(vdir)
 	// This attempt's directory is nothing anyone uses until the flip; on any
-	// failure it is removed rather than left to block its generation name.
+	// failure it is removed rather than left as debris.
 	defer func() {
 		if err != nil {
 			_ = os.RemoveAll(vdir)
 		}
 	}()
+	if mkErr := os.Mkdir(filepath.Join(vdir, "bin"), 0o700); mkErr != nil {
+		return fmt.Errorf("creating toolchain version directory: %w", mkErr)
+	}
 
 	uvPath := filepath.Join(vdir, "uv")
 	if dlErr := t.downloadUV(ctx, uvPath); dlErr != nil {
@@ -493,12 +516,7 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 	// anyway; drop it rather than carry megabytes per version.
 	_ = os.RemoveAll(filepath.Join(vdir, "cache"))
 
-	manifest, err := json.Marshal(Manifest{
-		UVVersion:        uvVersion,
-		PythonVersion:    pythonVersion,
-		BorgmaticVersion: BorgmaticVersion,
-		ProvisionedAt:    time.Now().UTC(),
-	})
+	manifest, err := json.Marshal(PinnedManifest())
 	if err != nil {
 		return fmt.Errorf("encoding toolchain manifest: %w", err)
 	}
@@ -529,64 +547,9 @@ func (t *Toolchain) provision(ctx context.Context) (err error) {
 	if err := os.Rename(tmp, currentPath); err != nil {
 		return fmt.Errorf("switching current toolchain: %w", err)
 	}
-	// The new current must not carry a retirement clock from any past life or
-	// race; its grace period starts fresh when it is really superseded.
-	_ = os.Remove(filepath.Join(vdir, ".superseded"))
 
 	t.cleanOldVersions(name)
 	return nil
-}
-
-// reapUnfinished removes version directories no completed provisioning ever
-// produced: not the current target, and no manifest (the manifest is written
-// only after the smoke test). Callers hold provision.lock, so such a
-// directory can only be a crashed provisioner's leftover, never live work.
-// Finished-but-superseded directories keep their grace period; this touches
-// only the never-finished.
-func (t *Toolchain) reapUnfinished() {
-	entries, err := os.ReadDir(filepath.Join(t.root, "versions"))
-	if err != nil {
-		return
-	}
-	current := t.currentTargetBase()
-	for _, e := range entries {
-		if e.Name() == current {
-			continue
-		}
-		dir := filepath.Join(t.root, "versions", e.Name())
-		if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err == nil {
-			continue
-		}
-		if err := os.RemoveAll(dir); err == nil {
-			t.logger.Info("removed unfinished toolchain directory left by a crashed provisioning attempt", "version", e.Name())
-		}
-	}
-}
-
-// buildDirName picks the directory this provisioning run builds into: the
-// pinned name, or the first unused repair generation when a same-composition
-// repair is needed. Never a directory that already exists: a retired
-// generation may be inside its grace period with a borgmatic still running
-// from it, the live "current" target must never be cleared before its
-// replacement exists, and a crashed provisioner's leftover is cheaper to
-// abandon to the grace cleanup than to reuse.
-func (t *Toolchain) buildDirName() (string, error) {
-	name := versionDirName()
-	current := t.currentTargetBase()
-	for r := 1; r <= 100; r++ {
-		candidate := name
-		if r > 1 {
-			candidate = fmt.Sprintf("%s-r%d", name, r)
-		}
-		if candidate == current {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(t.root, "versions", candidate)); err == nil {
-			continue
-		}
-		return candidate, nil
-	}
-	return "", errors.New("no free toolchain generation name; remove old directories under the toolchain's versions/ manually")
 }
 
 // downloadUV fetches the pinned uv release tarball, refuses it unless its
@@ -697,12 +660,12 @@ func uvEnv(vdir string) []string {
 	return env
 }
 
-// tryCleanOldVersions retires old versions only when the provisioning lock is
-// free. A provisioner past its manifest write but before its flip looks
-// finished to the lock-free fast path, which would mark the staged generation
-// superseded; the marker would ride into its life as current and age into an
-// immediate deletion at its real retirement. No lock, no cleanup: whoever
-// holds it cleans up afterwards anyway.
+// tryCleanOldVersions retires old version directories only when the
+// provisioning lock is free. Without the lock, a provisioner mid-build has an
+// unflipped directory that would look deletable, and a keep target read here
+// could predate another process's flip and delete the newly current
+// directory. No lock, no cleanup: whoever holds it cleans up afterwards
+// anyway.
 func (t *Toolchain) tryCleanOldVersions() {
 	lock, acquired, err := lockfile.TryExclusive(filepath.Join(t.root, "provision.lock"))
 	if err != nil || !acquired {
@@ -715,18 +678,13 @@ func (t *Toolchain) tryCleanOldVersions() {
 	t.cleanOldVersions(t.currentTargetBase())
 }
 
-// supersededGrace is how long a superseded toolchain version survives before
-// deletion. A borgmatic started from it (a scheduled run, a restore, or a
-// passthrough that holds none of the manager's locks) keeps importing modules
-// from its environment for as long as it runs; deleting on the flip would
-// pull the interpreter's files out from under it mid-backup. A day outlives
-// any sane run, and the cost of waiting is one ~150MB directory.
-const supersededGrace = 24 * time.Hour
-
-// cleanOldVersions retires every version directory except keep, in two
-// stages: a directory is first marked superseded, and only removed by a later
-// pass once the mark has aged past supersededGrace. Best effort throughout: a
-// leftover costs disk, not correctness.
+// cleanOldVersions removes every version directory except keep: retired
+// installs and crash debris alike. Callers hold provision.lock, so nothing
+// here is another live provisioner's unflipped build. The one thing the lock
+// cannot see is a borgmatic still RUNNING from a retired directory (Python
+// imports lazily, so deleting its environment breaks it mid-run); such a
+// directory is skipped and removed by a later pass once the run has ended.
+// Best effort throughout: a leftover costs disk, not correctness.
 func (t *Toolchain) cleanOldVersions(keep string) {
 	entries, err := os.ReadDir(filepath.Join(t.root, "versions"))
 	if err != nil {
@@ -737,37 +695,14 @@ func (t *Toolchain) cleanOldVersions(keep string) {
 			continue
 		}
 		dir := filepath.Join(t.root, "versions", e.Name())
-		// A directory without a manifest was never finished: either another
-		// process is provisioning it right now (this fast-path cleanup does
-		// not hold provision.lock) or it is crash debris, which reapUnfinished
-		// removes under the lock. Marking it here would leave a stale
-		// retirement clock inside a directory that may yet become current.
-		if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
-			continue
-		}
-		marker := filepath.Join(dir, ".superseded")
-		info, err := os.Stat(marker)
-		if err != nil {
-			if err := os.WriteFile(marker, nil, 0o600); err == nil {
-				t.logger.Info("toolchain version superseded; removed after a grace period in case a running borgmatic still uses it",
-					"version", e.Name(), "grace", supersededGrace)
-			}
-			continue
-		}
-		if time.Since(info.ModTime()) < supersededGrace {
-			continue
-		}
-		// The grace period covers ordinary runs; a passthrough or an
-		// unlimited-timeout backup can legitimately outlive it. A generation
-		// some live process still maps stays until it lets go.
 		if generationInUse(dir) {
-			t.logger.Info("superseded toolchain version is still in use; keeping it", "version", e.Name())
+			t.logger.Info("retired toolchain directory is still in use by a running borgmatic; keeping it for a later pass", "version", e.Name())
 			continue
 		}
 		if err := os.RemoveAll(dir); err != nil {
-			t.logger.Warn("could not remove old toolchain version", "version", e.Name(), "error", err)
+			t.logger.Warn("could not remove old toolchain directory", "version", e.Name(), "error", err)
 		} else {
-			t.logger.Info("removed old toolchain version", "version", e.Name())
+			t.logger.Info("removed old toolchain directory", "version", e.Name())
 		}
 	}
 }

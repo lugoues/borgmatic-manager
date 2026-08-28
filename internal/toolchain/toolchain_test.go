@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,15 @@ import (
 
 	"github.com/lugoues/borgmatic-manager/internal/lockfile"
 )
+
+// pinnedManifestJSON is what a finished install under the current pins
+// holds; freshness is judged by it, never by directory names.
+func pinnedManifestJSON(t *testing.T) []byte {
+	t.Helper()
+	raw, err := json.Marshal(PinnedManifest())
+	require.NoError(t, err)
+	return raw
+}
 
 // uvTarball builds a release-shaped tar.gz holding one uv "binary" (a shell
 // script) and returns it with its checksum.
@@ -87,9 +97,14 @@ func TestEnsureProvisionsAndFlipsCurrent(t *testing.T) {
 
 	// uv ran fully contained: managed python only, everything under the
 	// version directory, nothing pointed at the host's uv or python state.
+	// The directory carries the pinned prefix plus a random build suffix:
+	// launchers embed absolute paths, so no build may reuse a name.
 	require.Len(t, *envs, 1)
 	env := strings.Join((*envs)[0], "\n")
-	vdir := filepath.Join(root, "versions", versionDirName())
+	base := tc.currentTargetBase()
+	require.True(t, strings.HasPrefix(base, versionDirName()+"-"),
+		"version dirs carry the pinned prefix and a build suffix (got %s)", base)
+	vdir := filepath.Join(root, "versions", base)
 	assert.Contains(t, env, "UV_PYTHON_PREFERENCE=only-managed")
 	assert.Contains(t, env, "UV_NO_CONFIG=1")
 	assert.Contains(t, env, "UV_TOOL_DIR="+filepath.Join(vdir, "tools"))
@@ -122,8 +137,6 @@ func TestStaleToolchainIsReprovisionedAndOldRemoved(t *testing.T) {
 	old := filepath.Join(root, "versions", "uv0.0.1-py3.12-borgmatic2.0.0")
 	require.NoError(t, os.MkdirAll(filepath.Join(old, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(old, "bin", "borgmatic"), []byte("#!/bin/sh\necho borgmatic 2.0.0\n"), 0o755))
-	// A manifest marks it finished: retirement only ever touches completed
-	// toolchains, never a directory another process may still be building.
 	require.NoError(t, os.WriteFile(filepath.Join(old, "manifest.json"), []byte("{}"), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", "uv0.0.1-py3.12-borgmatic2.0.0"), filepath.Join(root, "current")))
 
@@ -136,24 +149,14 @@ func TestStaleToolchainIsReprovisionedAndOldRemoved(t *testing.T) {
 	assert.Equal(t, filepath.Join(root, "current", "bin", "borgmatic"), p)
 	assert.True(t, tc.Fresh())
 
-	// The superseded directory is not removed on the flip: a borgmatic
-	// started from it (a passthrough holds none of the manager's locks) may
-	// still be importing from its environment. It is marked, and removed only
-	// once the mark has aged past the grace period.
-	marker := filepath.Join(old, ".superseded")
-	_, statErr := os.Stat(marker)
-	require.NoError(t, statErr, "the old version is marked, not deleted")
-
-	aged := time.Now().Add(-supersededGrace - time.Hour)
-	require.NoError(t, os.Chtimes(marker, aged, aged))
-	_, err = tc.Ensure(context.Background())
-	require.NoError(t, err)
-	_, statErr = os.Stat(old)
-	assert.True(t, os.IsNotExist(statErr), "aged past the grace period, the old version is removed")
+	// The retired directory goes with the flip: nothing maps it, so the
+	// in-use guard lets the cleanup remove it immediately.
+	_, statErr := os.Stat(old)
+	assert.True(t, os.IsNotExist(statErr), "nothing runs from the old version, so it is removed on the flip")
 }
 
-// Freshness is only a symlink name. A toolchain whose environment was deleted
-// or corrupted keeps its launcher and its name, and returning it on that
+// Freshness is only a manifest. A toolchain whose environment was deleted
+// or corrupted keeps its launcher and its manifest, and returning it on that
 // evidence would fail every launch without ever self-healing.
 func TestBrokenFreshToolchainIsReprovisioned(t *testing.T) {
 	root := t.TempDir()
@@ -161,11 +164,12 @@ func TestBrokenFreshToolchainIsReprovisioned(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
 		[]byte("#!/bin/sh\necho 'ModuleNotFoundError: borgmatic' >&2\nexit 1\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), pinnedManifestJSON(t), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
 
 	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
 	tc, envs := newTestToolchain(t, root, tarball, sum)
-	require.True(t, tc.Fresh(), "the name says fresh; only the health check knows better")
+	require.True(t, tc.Fresh(), "the manifest says fresh; only the health check knows better")
 
 	p, err := tc.Ensure(context.Background())
 	require.NoError(t, err)
@@ -188,6 +192,7 @@ func TestSameVersionRepairStagesBesideTheLiveDirectory(t *testing.T) {
 		[]byte("#!/bin/sh\necho 0.0.0\n"), 0o755))
 	sentinel := filepath.Join(live, "keepsake")
 	require.NoError(t, os.WriteFile(sentinel, []byte("x"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(live, "manifest.json"), pinnedManifestJSON(t), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", name), filepath.Join(root, "current")))
 
 	t.Run("a failed rebuild leaves the live directory untouched", func(t *testing.T) {
@@ -205,19 +210,20 @@ func TestSameVersionRepairStagesBesideTheLiveDirectory(t *testing.T) {
 		require.NoError(t, statErr, "the live directory must not be cleared for a repair that never completed")
 	})
 
-	t.Run("a successful rebuild flips to a generation sibling", func(t *testing.T) {
+	t.Run("a successful rebuild flips to a fresh sibling and retires the broken one", func(t *testing.T) {
 		tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
 		tc, _ := newTestToolchain(t, root, tarball, sum)
 		p, err := tc.Ensure(context.Background())
 		require.NoError(t, err)
-		assert.True(t, tc.Fresh(), "a repair generation still counts as the pinned composition")
-		assert.True(t, strings.HasPrefix(tc.currentTargetBase(), name+"-r"),
-			"the rebuild lands in an unused generation sibling, never the live directory (got %s)", tc.currentTargetBase())
+		assert.True(t, tc.Fresh())
+		got := tc.currentTargetBase()
+		assert.NotEqual(t, name, got, "the rebuild must never land in the live directory")
+		assert.True(t, strings.HasPrefix(got, name+"-"), "the rebuild is a sibling of the same pins (got %s)", got)
 		out, err := os.ReadFile(p)
 		require.NoError(t, err)
 		assert.Contains(t, string(out), BorgmaticVersion)
-		_, statErr := os.Stat(sentinel)
-		require.NoError(t, statErr, "the old directory survives into the grace period")
+		_, statErr := os.Stat(live)
+		assert.True(t, os.IsNotExist(statErr), "nothing runs from the broken directory, so the flip removes it")
 	})
 }
 
@@ -317,21 +323,6 @@ func TestSmokeTestFailureDoesNotFlipCurrent(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestCurrentBorgmaticWithoutProvisioning(t *testing.T) {
-	root := t.TempDir()
-	_, ok := CurrentBorgmatic(root)
-	assert.False(t, ok, "no toolchain, no path; and nothing may be downloaded to make one")
-
-	vdir := filepath.Join(root, "versions", versionDirName())
-	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"), []byte("#!/bin/sh\n"), 0o755))
-	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
-
-	p, ok := CurrentBorgmatic(root)
-	require.True(t, ok)
-	assert.Equal(t, filepath.Join(root, "current", "bin", "borgmatic"), p)
-}
-
 func TestDownloadedUVIsInvokedFromItsVersionDir(t *testing.T) {
 	// The real runUV execs the downloaded file; prove the plumbing holds by
 	// letting the fake uv script do the install itself.
@@ -377,30 +368,6 @@ func TestExtractUVTakesOnlyTheUVMember(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
 }
 
-// A generation is never reused: a retired directory inside its grace period
-// may still back a running borgmatic, and rebuilding into it would delete
-// that process's files. The allocator skips anything on disk.
-func TestBuildDirNameNeverReusesExistingDirectories(t *testing.T) {
-	root := t.TempDir()
-	tc := New(root, slog.New(slog.DiscardHandler))
-	name := versionDirName()
-
-	first, err := tc.buildDirName()
-	require.NoError(t, err)
-	assert.Equal(t, name, first, "an empty root builds the pinned name")
-
-	// Current on -r3, with the base and -r2 retired but still on disk (grace).
-	for _, d := range []string{name, name + "-r2", name + "-r3"} {
-		require.NoError(t, os.MkdirAll(filepath.Join(root, "versions", d), 0o755))
-	}
-	require.NoError(t, os.Symlink(filepath.Join("versions", name+"-r3"), filepath.Join(root, "current")))
-
-	next, err := tc.buildDirName()
-	require.NoError(t, err)
-	assert.Equal(t, name+"-r4", next,
-		"cycling back onto a retired directory would delete files a running borgmatic may still need")
-}
-
 // Waiting for another process's provisioning lock must observe cancellation:
 // SIGTERM during someone else's stalled download stops the waiter now.
 func TestProvisionLockWaitObservesCancellation(t *testing.T) {
@@ -431,6 +398,7 @@ func TestHungProbeIsUnhealthyAndReprovisions(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
 		[]byte("#!/bin/sh\nsleep 60\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), pinnedManifestJSON(t), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
 
 	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
@@ -468,18 +436,19 @@ func TestFailedProvisioningLeavesNoDebris(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries, "every failed attempt removes its own directory")
 
-	// A crash leftover (directory without a manifest, from a provisioner that
-	// died before its own cleanup) is reaped by the next attempt, which then
-	// builds under the ordinary pinned name.
-	crashed := filepath.Join(root, "versions", versionDirName())
+	// A crash leftover (a provisioner that died before its own cleanup) is
+	// removed by the next attempt's opening sweep; the build itself always
+	// takes a fresh random-suffixed directory.
+	crashed := filepath.Join(root, "versions", versionDirName()+"-crashed")
 	require.NoError(t, os.MkdirAll(filepath.Join(crashed, "bin"), 0o755))
 
 	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
 	tc2, _ := newTestToolchain(t, root, tarball, sum)
 	_, err = tc2.Ensure(context.Background())
 	require.NoError(t, err)
-	assert.Equal(t, versionDirName(), tc2.currentTargetBase(),
-		"the reaped leftover frees the pinned name instead of forcing a generation")
+	_, statErr := os.Stat(crashed)
+	assert.True(t, os.IsNotExist(statErr), "the crash leftover is swept before the build")
+	assert.True(t, strings.HasPrefix(tc2.currentTargetBase(), versionDirName()+"-"))
 }
 
 // A toolchain whose launcher or whole target directory vanished is repair
@@ -511,6 +480,7 @@ func TestWrongVersionByPrefixIsReprovisioned(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
 		[]byte("#!/bin/sh\necho "+BorgmaticVersion+"0\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), pinnedManifestJSON(t), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
 
 	tarball, sum := uvTarball(t, "#!/bin/sh\nexit 0\n")
@@ -531,7 +501,7 @@ func TestProbesIgnoreHostPythonEnv(t *testing.T) {
 	// Fails when PYTHONHOME leaks through, healthy otherwise.
 	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
 		[]byte("#!/bin/sh\n[ -n \"$PYTHONHOME\" ] && exit 1\necho "+BorgmaticVersion+"\n"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), pinnedManifestJSON(t), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
 
 	tc := New(root, slog.New(slog.DiscardHandler))
@@ -541,14 +511,15 @@ func TestProbesIgnoreHostPythonEnv(t *testing.T) {
 }
 
 // While a provisioner holds the lock, the fast path must not retire anything:
-// a staged generation past its manifest write would be marked superseded and
-// carry that clock into its life as current.
+// its unflipped build would look deletable, and a keep target read here could
+// predate its flip and delete the newly current directory.
 func TestFastPathCleanupSkipsWhileProvisionLockHeld(t *testing.T) {
 	root := t.TempDir()
 	vdir := filepath.Join(root, "versions", versionDirName())
 	require.NoError(t, os.MkdirAll(filepath.Join(vdir, "bin"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(vdir, "bin", "borgmatic"),
 		[]byte("#!/bin/sh\necho "+BorgmaticVersion+"\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(vdir, "manifest.json"), pinnedManifestJSON(t), 0o644))
 	require.NoError(t, os.Symlink(filepath.Join("versions", versionDirName()), filepath.Join(root, "current")))
 
 	// A finished-looking old version that WOULD be retired.
@@ -564,8 +535,8 @@ func TestFastPathCleanupSkipsWhileProvisionLockHeld(t *testing.T) {
 	tc := New(root, slog.New(slog.DiscardHandler))
 	_, err = tc.Ensure(context.Background())
 	require.NoError(t, err, "the fresh fast path does not wait on the lock")
-	_, statErr := os.Stat(filepath.Join(old, ".superseded"))
-	assert.True(t, os.IsNotExist(statErr), "no retirement while another process provisions")
+	_, statErr := os.Stat(old)
+	require.NoError(t, statErr, "no retirement while another process provisions")
 }
 
 // A launcher truncated into a zero-exit no-op must not degrade-pass: it would
