@@ -252,6 +252,7 @@ func TestPlanVolumeRestoreSourceAndInto(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/var/lib/docker/volumes", p.volumesRoot)
 	assert.Equal(t, "myvol/_data", p.archivePath)
+	assert.Equal(t, "var/lib/docker/volumes/myvol/_data", p.hostArchivePath)
 	assert.Equal(t, "myvol", p.targetVolume)
 	assert.Equal(t, "/var/lib/docker/volumes/myvol/_data", p.targetData)
 
@@ -267,6 +268,32 @@ func TestPlanVolumeRestoreSourceAndInto(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "/home/u/.local/share/containers/storage/volumes", p.volumesRoot)
 	assert.Equal(t, "systemd-app/_data", p.archivePath)
+}
+
+// Groups with snapshot hooks archive the full host path rather than
+// "<volume>/_data", so the restore has to find whichever layout is there.
+func TestResolveArchiveLayoutFallsBackToHostPath(t *testing.T) {
+	plan, err := planVolumeRestore("/var/lib/docker/volumes/myvol/_data", "")
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "borgmatic")
+	script := "#!/bin/sh\ncase \"$*\" in\n*'--path var/lib/docker/volumes/myvol/_data'*) cat <<'EOF'\n" +
+		strings.ReplaceAll(listStdoutPathPresent, "myvol/_data", "var/lib/docker/volumes/myvol/_data") +
+		"EOF\n;;\n*) cat <<'EOF'\n" + listStdoutPathAbsent + "EOF\n;;\nesac\n"
+	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
+
+	path, found, hasChildren, rootIsDir, err := resolveArchiveLayout(context.Background(), stub, "cfg.yaml", "host-1", plan)
+	require.NoError(t, err)
+	assert.Equal(t, "var/lib/docker/volumes/myvol/_data", path)
+	assert.True(t, found && hasChildren && rootIsDir)
+
+	// Neither layout present: not found, and the default path is reported.
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathAbsent+"EOF\n"), 0o700))
+	path, found, _, _, err = resolveArchiveLayout(context.Background(), stub, "cfg.yaml", "host-1", plan)
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Equal(t, "myvol/_data", path)
 }
 
 func TestPlanVolumeRestoreRefusesIntoPaths(t *testing.T) {

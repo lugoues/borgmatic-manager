@@ -1246,10 +1246,11 @@ func lockVolumeRestore(locksDir, targetData string) (*lockfile.Lock, error) {
 const latestArchive = "latest"
 
 type volumeRestorePlan struct {
-	volumesRoot  string // e.g. /var/lib/docker/volumes
-	archivePath  string // path prefix in the archive: <sourceVolume>/_data
-	targetVolume string // volume being written to (source, or --into)
-	targetData   string // <volumesRoot>/<targetVolume>/_data
+	volumesRoot     string // e.g. /var/lib/docker/volumes
+	archivePath     string // path prefix in the archive: <sourceVolume>/_data
+	hostArchivePath string // full host path, as archived without the "/./" marker
+	targetVolume    string // volume being written to (source, or --into)
+	targetData      string // <volumesRoot>/<targetVolume>/_data
 }
 
 // planVolumeRestore derives the archive path and target from the source
@@ -1273,7 +1274,13 @@ func planVolumeRestore(sourceHostPath, into string) (volumeRestorePlan, error) {
 		targetVolume = into
 		targetData = filepath.Join(volumesRoot, into, "_data")
 	}
-	return volumeRestorePlan{volumesRoot: volumesRoot, archivePath: archivePath, targetVolume: targetVolume, targetData: targetData}, nil
+	return volumeRestorePlan{
+		volumesRoot:     volumesRoot,
+		archivePath:     archivePath,
+		hostArchivePath: strings.TrimPrefix(sourceHostPath, string(filepath.Separator)),
+		targetVolume:    targetVolume,
+		targetData:      targetData,
+	}, nil
 }
 
 // runRestoreVolume extracts a single volume back into its data directory (or an
@@ -1461,9 +1468,21 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// passphrase, or an archive predating the volume all leave an operator with
 	// an empty volume and no restore. Merge mode adds files without removing
 	// any, so it has nothing to lose and skips the probe.
+	//
+	// Merge probes too, but only to learn which path layout the archive uses:
+	// groups with snapshot hooks archive the full host path, and extracting the
+	// wrong one matches nothing.
+	archivePath, found, hasChildren, rootIsDir, probeErr := resolveArchiveLayout(ctx, borgmaticPath, configPath, archive, plan)
+	if probeErr != nil {
+		return fmt.Errorf("cannot verify archive %q before restoring into %s (nothing was changed): %w", archive, plan.targetData, probeErr)
+	}
+	if !found {
+		return fmt.Errorf("archive %q contains nothing under %q or %q, so there is nothing to restore into %s (nothing was changed); "+
+			"check the archive name with: borgmatic-manager borgmatic %s list", archive, plan.archivePath, plan.hostArchivePath, plan.targetData, group)
+	}
+	plan.archivePath = archivePath
 	archivedEmpty := false
 	if !merge {
-		found, hasChildren, rootIsDir, probeErr := archivePathPopulated(ctx, borgmaticPath, configPath, archive, plan.archivePath)
 		// Only when the operator named the archive. "latest" is not a name: borg
 		// resolves it per invocation, so the archive this probe examined and the
 		// one the extract restores are two separate answers to the same
@@ -1471,26 +1490,19 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// other disagreement is caught downstream by the empty-extract refusal;
 		// this one would license it instead, and erase a volume the archive it
 		// actually extracted never claimed was empty.
-		archivedEmpty = found && rootIsDir && !hasChildren && archive != latestArchive
-		if probeErr != nil {
-			return fmt.Errorf("cannot verify archive %q before emptying %s (nothing was changed): %w", archive, plan.targetData, probeErr)
-		}
-		if !found {
-			return fmt.Errorf("archive %q contains nothing under %q, so a mirror restore would empty %s and put nothing back (nothing was changed); "+
-				"check the archive name with: borgmatic-manager borgmatic %s list", archive, plan.archivePath, plan.targetData, group)
-		}
+		archivedEmpty = rootIsDir && !hasChildren && archive != latestArchive
 		// Say so here rather than letting the extract produce an empty directory
 		// and fail with "borgmatic reported success but extracted nothing",
 		// which describes a symptom and not the reason.
 		// Not a directory in the archive, so there is nothing to rebuild the
 		// volume from. Without this it lists exactly like an empty directory and
 		// would license swapping an empty one over the live data.
-		if found && !rootIsDir {
+		if !rootIsDir {
 			return fmt.Errorf("archive %q holds %q but it is not a directory, so a mirror restore has nothing to "+
 				"rebuild %s from (nothing was changed); check the archive with: borgmatic-manager borgmatic %s list",
 				archive, plan.archivePath, plan.targetData, group)
 		}
-		if found && rootIsDir && !hasChildren && archive == latestArchive {
+		if rootIsDir && !hasChildren && archive == latestArchive {
 			return fmt.Errorf("the newest archive holds %q with nothing in it, so this restore would empty %s (nothing was changed); "+
 				"%q is resolved again when the extract runs and may not be this archive by then, so name the one you mean: "+
 				"borgmatic-manager borgmatic %s list", plan.archivePath, plan.targetData, latestArchive, group)
@@ -1556,9 +1568,9 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		logger.Warn("snapshotted the volume before restore; remove it once you have verified the restore", "snapshot", snap)
 	}
 
-	// extract runs borgmatic against a chosen destination. Strip
-	// "<sourceVolume>/_data" so files land directly in it, which is also what
-	// lets --into retarget a differently-named volume.
+	// extract runs borgmatic against a chosen destination. Strip the whole
+	// archive path so files land directly in it, which is also what lets --into
+	// retarget a differently-named volume.
 	extract := func(destination string) error {
 		return runBorgmaticExtract(ctx, borgmaticPath, configPath, archive, plan.archivePath, destination,
 			e.locksDir(), logger)
@@ -1709,6 +1721,7 @@ const extractKillGrace = 10 * time.Second
 // forwarded explicitly. The child gets its own process group because borgmatic
 // spawns borg, and only a group signal reaches both.
 func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive, archivePath, destination, locksDir string, logger *slog.Logger) error {
+	strip := strconv.Itoa(len(strings.Split(strings.Trim(archivePath, "/"), "/")))
 	// Pdeathsig below is delivered when the *thread* that started the child
 	// exits, not the process, so the goroutine has to keep one for the duration
 	// or the signal can arrive early on a perfectly healthy restore.
@@ -1718,7 +1731,7 @@ func runBorgmaticExtract(ctx context.Context, borgmaticPath, configPath, archive
 	// #nosec G204 -- resolved borgmatic binary with computed extract arguments
 	cmd := exec.Command(borgmaticPath,
 		"--config", configPath, "extract", "--archive", archive,
-		"--path", archivePath, "--strip-components", "2", "--destination", destination)
+		"--path", archivePath, "--strip-components", strip, "--destination", destination)
 	// No stdin. borg asks for a passphrase with getpass, which opens /dev/tty
 	// directly; the new session below leaves it nothing to open, so it falls
 	// back to stdin, and /dev/null makes that an immediate EOF and a clear
@@ -1975,6 +1988,21 @@ const (
 	// is ever surfaced.
 	maxProbeStderrBytes = 64 << 10
 )
+
+// resolveArchiveLayout reports which of the plan's two archive paths this
+// archive uses, with the probe's answer for it. Volume-named paths are the
+// default; groups with snapshot hooks (and archives predating the "/./"
+// marker) hold the full host path instead. When neither is present it returns
+// found=false.
+func resolveArchiveLayout(ctx context.Context, borgmaticPath, configPath, archive string, plan volumeRestorePlan) (path string, found, hasChildren, rootIsDir bool, err error) {
+	for _, candidate := range []string{plan.archivePath, plan.hostArchivePath} {
+		found, hasChildren, rootIsDir, err = archivePathPopulated(ctx, borgmaticPath, configPath, archive, candidate)
+		if err != nil || found {
+			return candidate, found, hasChildren, rootIsDir, err
+		}
+	}
+	return plan.archivePath, false, false, false, nil
+}
 
 // archivePathPopulated reports whether archive holds at least one entry under
 // archivePath, the question a mirror restore must answer before it empties

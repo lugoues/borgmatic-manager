@@ -2913,3 +2913,18 @@ func TestRunRestoreVolumeGuardsRunInOrder(t *testing.T) {
 	assert.Less(t, at("resolveInPlaceReason"), at("snapshotVolume"),
 		"a restore that will be refused must be refused before a snapshot is taken")
 }
+
+// Full host-path archives are deeper than "<volume>/_data", and stripping only
+// two components would land the files under var/lib/... inside the volume.
+func TestExtractStripsTheWholeArchivePath(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "borgmatic")
+	argsFile := filepath.Join(dir, "args")
+	require.NoError(t, os.WriteFile(fake, []byte("#!/bin/sh\necho \"$*\" > "+argsFile+"\n"), 0o755))
+
+	require.NoError(t, runBorgmaticExtract(context.Background(), fake, "config.yaml", "archive",
+		"var/lib/containers/storage/volumes/vol/_data", filepath.Join(dir, "dest"), dir, quietLogger()))
+	args, err := os.ReadFile(argsFile)
+	require.NoError(t, err)
+	assert.Contains(t, string(args), "--strip-components 7")
+}
