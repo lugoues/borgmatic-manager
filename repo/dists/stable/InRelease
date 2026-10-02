@@ -2,35 +2,35 @@
 Hash: SHA256
 
 Codename: stable
-Date: Fri, 02 Oct 2026 01:20:53 UTC
+Date: Fri, 02 Oct 2026 01:51:34 UTC
 Architectures: amd64 arm64
 Components: main
 Description: lugoues/borgmatic-manager
 MD5Sum:
- 7d75f8590df4b0b5db9f69c81b91e7b3 570 main/binary-amd64/Packages
- 27b2ac2a023580622a612527ae929c34 383 main/binary-amd64/Packages.gz
+ 68c5d974958f833a9325268f6a7b4b6a 570 main/binary-amd64/Packages
+ 6400605658e47f41473eb9791881df86 383 main/binary-amd64/Packages.gz
  c1e7cd8d67fd6bf072f425182cdbd27a 75 main/binary-amd64/Release
- b7c3f5ab3173a95e426a952fe495fe06 570 main/binary-arm64/Packages
- 59083857929a810f99a972c3dd387943 386 main/binary-arm64/Packages.gz
+ 4fa094c615c15ad1399c18d3e88d5ddc 570 main/binary-arm64/Packages
+ 0fe20cf75343c42eabfcefb0baadbcff 385 main/binary-arm64/Packages.gz
  975d1915e16a2b58c961fb5a5f2aa214 75 main/binary-arm64/Release
 SHA1:
- e959363ffce958213efe531256275cb2825f8e28 570 main/binary-amd64/Packages
- 62bbd9f34c60d697dd5ee12722d6ab5081604084 383 main/binary-amd64/Packages.gz
+ ad25b0dd0bc4f3b3baa5bb11b3bdd139ae82a8ec 570 main/binary-amd64/Packages
+ 871ee16c4964d22c978c8e962b705413d4d71acd 383 main/binary-amd64/Packages.gz
  7c0f284dfc36824baabfa81ee88957e451a45637 75 main/binary-amd64/Release
- 7e628d5e0230faa71097d5e48767f73934ec8c4a 570 main/binary-arm64/Packages
- 41e79840f6058008723879b0128f978920e061a4 386 main/binary-arm64/Packages.gz
+ 7dd1e349fda954a0ddaf67d9f8f7a3d8dd54f302 570 main/binary-arm64/Packages
+ d7e78c0d61b77cbef7ce03dd46789b99edc2e0ee 385 main/binary-arm64/Packages.gz
  c334bcd8aa7c870d21b02e8bb380d61c20e24a11 75 main/binary-arm64/Release
 SHA256:
- 48efb4c884b96fee7b39959a184d13cc7aafe0808196c39d1028ffefa4574ca2 570 main/binary-amd64/Packages
- f64386cfa74b6561ed7709175d8a264c117d61ddbf1462bfad0df60d3862a6d0 383 main/binary-amd64/Packages.gz
+ b1d4418b9f6ea08bf6d9cdb2cee45ffa4a61f818fa5db8d2bf16f05e55b2cf61 570 main/binary-amd64/Packages
+ 91920c5a33a72a595900ae870184a00005f83e6ad7f7ae049b9f866077afb5d1 383 main/binary-amd64/Packages.gz
  2671982281214753acd37e395d76342980d0bb8b1f6067dc9a449f574646f5ba 75 main/binary-amd64/Release
- c8d3a0c73323512298d086c16c896f591bf73be741bea6200b9505bc8bb9e706 570 main/binary-arm64/Packages
- 6712085da53eb54f1ba71ab2cd310e3a8ae5e9867d97548f9e19954a3828d0e6 386 main/binary-arm64/Packages.gz
+ 501736d41cd4dd9a631d97f5f662ff21c5479eab2ecfcd589b134a91c3e8427d 570 main/binary-arm64/Packages
+ 99ba8958ab99d235c94d59b9ebf551a0584685436bb8ed7802ebce35d2f594cb 385 main/binary-arm64/Packages.gz
  8137a5686425c2e2d8883e250e5ea69bc8eea14329ff9181dab3f1218237c30c 75 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYIAB0WIQQQ/+JA72RZH05BlUFrp91JO8LjjgUCar8G9QAKCRBrp91JO8Lj
-joCEAP49GNBqBUSvsqI0rY3O+hpEMYuViiRK6Ux6etvhOBtvbAEAjUAlsbNuvs3u
-rYaQwN2DAGy3yPI8wVBPYW/kWLoZjwc=
-=nVP1
+iHUEARYIAB0WIQQQ/+JA72RZH05BlUFrp91JO8LjjgUCar8OJwAKCRBrp91JO8Lj
+ji+NAQD00Al78SuIeIKPNMERnxhJ93koPFm1u6iyfpY4zZfulwEA41BS0NkwBRVE
+OkJ19/T1zEplUGlx/kAWUNDOSwd/Cg4=
+=W68n
 -----END PGP SIGNATURE-----
