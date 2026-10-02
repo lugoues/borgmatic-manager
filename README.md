@@ -325,6 +325,15 @@ sudo borgmatic-manager borgmatic myapp extract --archive latest
 sudo borgmatic-manager borgmatic myapp restore --archive latest   # databases
 ```
 
+To restore one volume by name, list what the archive holds, then restore it.
+The archive decides what is restorable, so a volume whose container is gone
+still restores (the target volume must exist):
+
+```bash
+sudo borgmatic-manager list-volumes myapp --archive myapp-2026-09-30_23:21
+sudo borgmatic-manager restore-volume myapp myvol --archive myapp-2026-09-30_23:21
+```
+
 Database restores run through the same generated helper containers as dumps
 (the target container must be running). Configs change safely while backups
 run: files are replaced atomically and borgmatic reads its config once at

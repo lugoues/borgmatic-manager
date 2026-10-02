@@ -13,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"regexp"
 	goruntime "runtime"
 	"sort"
 	"strconv"
@@ -51,7 +53,7 @@ func main() {
 borgmatic configurations, and runs periodic, snapshot-consistent backups.`,
 	}
 
-	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), inspectCmd(), logsCmd(), doctorCmd(), restoreVolumeCmd(), borgmaticCmd(), versionCmd())
+	root.AddCommand(runCmd(), discoverCmd(), generateCmd(), statusCmd(), inspectCmd(), logsCmd(), doctorCmd(), restoreVolumeCmd(), listVolumesCmd(), borgmaticCmd(), versionCmd())
 
 	if err := fang.Execute(context.Background(), root, fang.WithVersion(version)); err != nil {
 		os.Exit(1)
@@ -1048,9 +1050,10 @@ func restoreVolumeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "restore-volume <group> <volume>",
 		Short: "Extract one volume from an archive back into place",
-		Long: `Restores a named volume. The manager resolves the volume's host path, so
-there is no --destination to get wrong: it extracts straight into the volume's
-own data directory.
+		Long: `Restores a named volume. The archive decides which volumes can be
+restored (see list-volumes), not the group's current members, so a volume
+whose container is gone still restores. The target must exist; the manager
+asks the runtime for its host path, so there is no --destination to get wrong.
 
 By default it mirrors: the target is emptied first for an exact
 point-in-time restore. --merge keeps files added since the backup (archived
@@ -1079,8 +1082,73 @@ refuses unless the container is stopped or --force.`,
 	return cmd
 }
 
-// volumeRestorePlan is the resolved borg geometry for a restore: what to pull
-// from the archive and where to land it.
+func listVolumesCmd() *cobra.Command {
+	var archive string
+	cmd := &cobra.Command{
+		Use:   "list-volumes <group>",
+		Short: "List the volumes an archive holds, by name",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cmd.SilenceUsage = true
+			return runListVolumes(cmd.Context(), args[0], archive)
+		},
+	}
+	cmd.Flags().StringVar(&archive, "archive", latestArchive, "archive to list")
+	return cmd
+}
+
+// runListVolumes prints the volumes in one of group's archives: the names
+// restore-volume accepts.
+func runListVolumes(ctx context.Context, group, archive string) error {
+	logger := interactiveLogger()
+
+	e, err := loadEnv()
+	if err != nil {
+		return err
+	}
+	backupState, _, err := e.discoverMerged(ctx, logger)
+	if err != nil {
+		return err
+	}
+	if _, ok := backupState.Groups[group]; !ok {
+		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(backupState))
+	}
+
+	configsDir, err := e.privateConfigDir("list")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(configsDir) }()
+	if _, err = e.renderGroupConfigs(backupState, group, configsDir, logger); err != nil {
+		return err
+	}
+	borgmaticPath, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir())
+	if err != nil {
+		return err
+	}
+
+	archived, err := listArchivedVolumes(ctx, borgmaticPath, filepath.Join(configsDir, group+".yaml"), archive)
+	if err != nil {
+		return fmt.Errorf("listing archive %q: %w", archive, err)
+	}
+	if len(archived) == 0 {
+		fmt.Printf("archive %s holds no volumes\n", archive)
+		return nil
+	}
+	width := 0
+	for _, v := range archived {
+		width = max(width, len(v.Name))
+	}
+	for _, v := range archived {
+		note := ""
+		if !v.HasChildren {
+			note = "  (empty)"
+		}
+		fmt.Printf("%-*s  %s%s\n", width, v.Name, v.Path, note)
+	}
+	return nil
+}
+
 // checkVolumeDataDir rejects a target that cannot be restored into.
 //
 // Existing is not the same as usable. Both swap paths replace whatever node is
@@ -1245,47 +1313,72 @@ func lockVolumeRestore(locksDir, targetData string) (*lockfile.Lock, error) {
 // before and after a backup completes.
 const latestArchive = "latest"
 
+// volumeRestorePlan is the resolved borg geometry for a restore: what to pull
+// from the archive and where to land it.
 type volumeRestorePlan struct {
-	volumesRoot     string // e.g. /var/lib/docker/volumes
-	archivePath     string // path prefix in the archive: <sourceVolume>/_data
-	hostArchivePath string // full host path, as archived without the "/./" marker
-	targetVolume    string // volume being written to (source, or --into)
-	targetData      string // <volumesRoot>/<targetVolume>/_data
+	archivePath  string // the volume's root in the archive, set once the archive is listed
+	targetVolume string // volume being written to (source, or --into)
+	targetData   string // the target volume's host mountpoint
 }
 
-// planVolumeRestore derives the archive path and target from the source
-// volume's host path. into names an alternate target volume in the same
-// volumes root; empty means restore into the source volume.
-func planVolumeRestore(sourceHostPath, into string) (volumeRestorePlan, error) {
-	volumesRoot := config.VolumesRoot(sourceHostPath)
-	archivePath := strings.TrimPrefix(sourceHostPath, volumesRoot+string(filepath.Separator))
-	if archivePath == "" || archivePath == sourceHostPath {
-		return volumeRestorePlan{}, fmt.Errorf("cannot derive the archive path for %s; restore manually with the borgmatic passthrough", sourceHostPath)
-	}
-	targetVolume := filepath.Base(filepath.Dir(sourceHostPath))
-	targetData := sourceHostPath
+// planVolumeRestore picks the target from the runtime's volumes: the named
+// volume itself, or into when set. Where the volume sits in the archive is
+// decided later, by listing the archive.
+func planVolumeRestore(volumes []runtime.VolumeInfo, volume, into string) (volumeRestorePlan, error) {
+	target := volume
 	if into != "" {
-		// A bare volume name only. Anything with a separator or a ".." escapes
-		// the volumes root once joined, and emptyVolumeData's guard is a
-		// substring test that ".../mnt/volumes/x" would sail straight through.
-		if into != filepath.Clean(into) || strings.ContainsRune(into, filepath.Separator) || into == ".." || into == "." {
-			return volumeRestorePlan{}, fmt.Errorf("--into %q must be a bare volume name, not a path", into)
-		}
-		targetVolume = into
-		targetData = filepath.Join(volumesRoot, into, "_data")
+		target = into
 	}
-	return volumeRestorePlan{
-		volumesRoot:     volumesRoot,
-		archivePath:     archivePath,
-		hostArchivePath: strings.TrimPrefix(sourceHostPath, string(filepath.Separator)),
-		targetVolume:    targetVolume,
-		targetData:      targetData,
-	}, nil
+	for _, v := range volumes {
+		if v.Name != target {
+			continue
+		}
+		if v.Mountpoint == "" {
+			return volumeRestorePlan{}, fmt.Errorf("volume %q reports no host mountpoint, so there is nowhere to restore into", target)
+		}
+		return volumeRestorePlan{targetVolume: target, targetData: v.Mountpoint}, nil
+	}
+	return volumeRestorePlan{}, fmt.Errorf("volume %q does not exist; create the volume first (docker/podman volume create %s)", target, target)
+}
+
+// renderGroupConfigs writes the borgmatic configs needed to read group's
+// archives into configsDir and returns their run metadata.
+func (e *env) renderGroupConfigs(backupState *models.BackupState, group, configsDir string, logger *slog.Logger) (map[string]config.GroupRunMeta, error) {
+	meta, _, genErr := e.newGenerator(configsDir, logger).Generate(backupState)
+	if genErr != nil {
+		return nil, genErr
+	}
+	// A group refused only for archive-pattern overlap can still restore: an
+	// extract of an explicitly named archive neither prunes nor creates, so
+	// the overlap that stops its scheduled backups does not make its archives
+	// unrestorable, and demanding a rename before disaster recovery could
+	// change which archives its pattern selects. Its config is rendered here,
+	// into this restore's private dir only; the daemon's configs are untouched
+	// and its backups stay refused. Every other refusal still stands.
+	if _, ok := meta[group]; !ok {
+		yamlStr, gm, reason, rErr := e.newGenerator(configsDir, logger).RenderGroupForRestore(backupState, group)
+		if rErr != nil {
+			return nil, rErr
+		}
+		if yamlStr == "" {
+			if reason != "" {
+				return nil, fmt.Errorf("group %q was refused during generation: %s; fix its configuration before restoring", group, reason)
+			}
+			return nil, fmt.Errorf("group %q was refused during generation (see the warnings above); fix its configuration before restoring", group)
+		}
+		logger.Warn("group is refused for scheduled backups (archive pattern overlap); rendering a restore-only config, an extract of a named archive neither prunes nor creates",
+			"group", group)
+		if wErr := os.WriteFile(filepath.Join(configsDir, group+".yaml"), []byte(yamlStr), 0o600); wErr != nil {
+			return nil, fmt.Errorf("writing restore-only config for group %s: %w", group, wErr)
+		}
+		meta[group] = gm
+	}
+	return meta, nil
 }
 
 // runRestoreVolume extracts a single volume back into its data directory (or an
-// --into target), computing borg's --path/--destination from the volume's known
-// location so the operator never has to.
+// --into target). borg's --path comes from the archive and --destination from
+// the runtime, so the operator never has to work out either.
 func runRestoreVolume(ctx context.Context, group, volume, archive, into string, force, merge, snapshot bool) error {
 	logger := interactiveLogger()
 
@@ -1298,24 +1391,17 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	if err != nil {
 		return err
 	}
-	g, ok := backupState.Groups[group]
-	if !ok {
+	// The group supplies the repository and credentials. Which volumes it can
+	// restore is the archive's to say, not current membership: a volume whose
+	// container is gone is exactly the one being restored.
+	if _, ok := backupState.Groups[group]; !ok {
 		return fmt.Errorf("unknown group %q; %s", group, discoveredGroupList(backupState))
 	}
-
-	var hostPath string
-	names := make([]string, 0, len(g.Volumes))
-	for _, v := range g.Volumes {
-		names = append(names, v.Name)
-		if v.Name == volume {
-			hostPath = v.HostPath
-		}
+	runtimeVolumes, err := e.rt.ListVolumes(ctx)
+	if err != nil {
+		return fmt.Errorf("listing volumes: %w", err)
 	}
-	if hostPath == "" {
-		return fmt.Errorf("group %q has no volume %q; volumes: %s", group, volume, strings.Join(names, ", "))
-	}
-
-	plan, err := planVolumeRestore(hostPath, into)
+	plan, err := planVolumeRestore(runtimeVolumes, volume, into)
 	if err != nil {
 		return err
 	}
@@ -1366,34 +1452,9 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// over rather than leaving it for a later dead-PID sweep. The extract runs
 	// as a supervised child (not an exec), so this defer actually runs.
 	defer func() { _ = os.RemoveAll(configsDir) }()
-	meta, _, genErr := e.newGenerator(configsDir, logger).Generate(backupState)
-	if genErr != nil {
-		return genErr
-	}
-	// A group refused only for archive-pattern overlap can still restore: an
-	// extract of an explicitly named archive neither prunes nor creates, so
-	// the overlap that stops its scheduled backups does not make its archives
-	// unrestorable, and demanding a rename before disaster recovery could
-	// change which archives its pattern selects. Its config is rendered here,
-	// into this restore's private dir only; the daemon's configs are untouched
-	// and its backups stay refused. Every other refusal still stands.
-	if _, ok := meta[group]; !ok {
-		yamlStr, gm, reason, rErr := e.newGenerator(configsDir, logger).RenderGroupForRestore(backupState, group)
-		if rErr != nil {
-			return rErr
-		}
-		if yamlStr == "" {
-			if reason != "" {
-				return fmt.Errorf("group %q was refused during generation: %s; fix its configuration before restoring", group, reason)
-			}
-			return fmt.Errorf("group %q was refused during generation (see the warnings above); fix its configuration before restoring", group)
-		}
-		logger.Warn("group is refused for scheduled backups (archive pattern overlap); rendering a restore-only config, an extract of a named archive neither prunes nor creates",
-			"group", group)
-		if wErr := os.WriteFile(filepath.Join(configsDir, group+".yaml"), []byte(yamlStr), 0o600); wErr != nil {
-			return fmt.Errorf("writing restore-only config for group %s: %w", group, wErr)
-		}
-		meta[group] = gm
+	meta, err := e.renderGroupConfigs(backupState, group, configsDir, logger)
+	if err != nil {
+		return err
 	}
 
 	borgmaticPath, err := resolveBorgmatic(ctx, e.cfg, e.toolchainDir())
@@ -1469,18 +1530,17 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 	// an empty volume and no restore. Merge mode adds files without removing
 	// any, so it has nothing to lose and skips the probe.
 	//
-	// Merge probes too, but only to learn which path layout the archive uses:
-	// groups with snapshot hooks archive the full host path, and extracting the
-	// wrong one matches nothing.
-	archivePath, found, hasChildren, rootIsDir, probeErr := resolveArchiveLayout(ctx, borgmaticPath, configPath, archive, plan)
-	if probeErr != nil {
-		return fmt.Errorf("cannot verify archive %q before restoring into %s (nothing was changed): %w", archive, plan.targetData, probeErr)
+	// Merge lists too: the listing is also what says where the volume sits in
+	// the archive, and that differs between path layouts.
+	archived, listErr := listArchivedVolumes(ctx, borgmaticPath, configPath, archive)
+	if listErr != nil {
+		return fmt.Errorf("cannot verify archive %q before restoring into %s (nothing was changed): %w", archive, plan.targetData, listErr)
 	}
-	if !found {
-		return fmt.Errorf("archive %q contains nothing under %q or %q, so there is nothing to restore into %s (nothing was changed); "+
-			"check the archive name with: borgmatic-manager borgmatic %s list", archive, plan.archivePath, plan.hostArchivePath, plan.targetData, group)
+	src, pickErr := pickArchivedVolume(archived, volume, archive, group)
+	if pickErr != nil {
+		return pickErr
 	}
-	plan.archivePath = archivePath
+	plan.archivePath = src.Path
 	archivedEmpty := false
 	if !merge {
 		// Only when the operator named the archive. "latest" is not a name: borg
@@ -1490,19 +1550,19 @@ func runRestoreVolume(ctx context.Context, group, volume, archive, into string, 
 		// other disagreement is caught downstream by the empty-extract refusal;
 		// this one would license it instead, and erase a volume the archive it
 		// actually extracted never claimed was empty.
-		archivedEmpty = rootIsDir && !hasChildren && archive != latestArchive
+		archivedEmpty = src.RootIsDir && !src.HasChildren && archive != latestArchive
 		// Say so here rather than letting the extract produce an empty directory
 		// and fail with "borgmatic reported success but extracted nothing",
 		// which describes a symptom and not the reason.
 		// Not a directory in the archive, so there is nothing to rebuild the
 		// volume from. Without this it lists exactly like an empty directory and
 		// would license swapping an empty one over the live data.
-		if !rootIsDir {
+		if !src.RootIsDir {
 			return fmt.Errorf("archive %q holds %q but it is not a directory, so a mirror restore has nothing to "+
 				"rebuild %s from (nothing was changed); check the archive with: borgmatic-manager borgmatic %s list",
 				archive, plan.archivePath, plan.targetData, group)
 		}
-		if rootIsDir && !hasChildren && archive == latestArchive {
+		if src.RootIsDir && !src.HasChildren && archive == latestArchive {
 			return fmt.Errorf("the newest archive holds %q with nothing in it, so this restore would empty %s (nothing was changed); "+
 				"%q is resolved again when the extract runs and may not be this archive by then, so name the one you mean: "+
 				"borgmatic-manager borgmatic %s list", plan.archivePath, plan.targetData, latestArchive, group)
@@ -1989,43 +2049,107 @@ const (
 	maxProbeStderrBytes = 64 << 10
 )
 
-// resolveArchiveLayout reports which of the plan's two archive paths this
-// archive uses, with the probe's answer for it. Volume-named paths are the
-// default; groups with snapshot hooks (and archives predating the "/./"
-// marker) hold the full host path instead. When neither is present it returns
-// found=false.
-func resolveArchiveLayout(ctx context.Context, borgmaticPath, configPath, archive string, plan volumeRestorePlan) (path string, found, hasChildren, rootIsDir bool, err error) {
-	for _, candidate := range []string{plan.archivePath, plan.hostArchivePath} {
-		found, hasChildren, rootIsDir, err = archivePathPopulated(ctx, borgmaticPath, configPath, archive, candidate)
-		if err != nil || found {
-			return candidate, found, hasChildren, rootIsDir, err
-		}
-	}
-	return plan.archivePath, false, false, false, nil
+// archivedVolumeExpr matches a volume's root in an archive under either path
+// layout, "<volume>/_data" (borg's "/./" marker) or the full host path
+// ".../volumes/<volume>/_data" (snapshot hooks, older archives), plus one level
+// of children so the same listing says whether the root holds anything. The
+// syntax is shared by Go and Python, so borg filters with the same expression.
+const archivedVolumeExpr = `^((?:[^/]+|.*/volumes/[^/]+)/_data)(?:/[^/]+)?$`
+
+var archivedVolumeRe = regexp.MustCompile(archivedVolumeExpr)
+
+// archivedVolume is one volume found in an archive.
+type archivedVolume struct {
+	Name        string
+	Path        string // root in the archive, the extract's --path
+	RootIsDir   bool
+	HasChildren bool
 }
 
-// archivePathPopulated reports whether archive holds at least one entry under
-// archivePath, the question a mirror restore must answer before it empties
-// anything. It deliberately uses the same --archive/--path pair the extract
-// will, so a true answer means that extract has something to write.
+// listArchivedVolumes lists the volumes archive holds, sorted by name. The
+// archive is the authority here: a volume is restorable because it was backed
+// up, whether or not anything still claims it.
 //
 // A non-zero exit (unknown archive, unreachable repository, bad passphrase) is
-// an error, not a false: the caller must refuse to wipe rather than treat "we
-// could not tell" as "nothing there".
-// It reports whether the path is in the archive at all, and separately whether
-// it has children. A volume that was empty when it was backed up is in the
-// archive as a bare directory, and restoring it back to empty is correct, so
-// the caller needs to tell that apart from an extract that matched nothing.
-func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archive, archivePath string) (found, hasChildren, rootIsDir bool, err error) {
-	// borg's --json-lines emits one object per file, so a volume with millions
-	// of them would be a multi-gigabyte buffer. Stream it instead: memory stays
-	// flat regardless of archive size.
+// an error, not an empty list: the caller must refuse to wipe rather than
+// treat "we could not tell" as "nothing there".
+func listArchivedVolumes(ctx context.Context, borgmaticPath, configPath, archive string) ([]archivedVolume, error) {
+	byPath := map[string]*archivedVolume{}
+	err := streamArchiveListing(ctx, borgmaticPath, configPath, archive, "re:"+archivedVolumeExpr, func(entry archiveEntry) {
+		m := archivedVolumeRe.FindStringSubmatch(entry.Path)
+		if m == nil {
+			return
+		}
+		root := m[1]
+		v, ok := byPath[root]
+		if !ok {
+			v = &archivedVolume{Name: path.Base(path.Dir(root)), Path: root}
+			byPath[root] = v
+		}
+		if entry.Path == root {
+			v.RootIsDir = entry.Type == archiveEntryDir
+		} else {
+			v.HasChildren = true
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]archivedVolume, 0, len(byPath))
+	for _, v := range byPath {
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].Name != out[b].Name {
+			return out[a].Name < out[b].Name
+		}
+		return out[a].Path < out[b].Path
+	})
+	return out, nil
+}
+
+// pickArchivedVolume finds volume among an archive's volumes, refusing when it
+// is absent or archived at more than one path.
+func pickArchivedVolume(archived []archivedVolume, volume, archive, group string) (archivedVolume, error) {
+	var matches []archivedVolume
+	names := make([]string, 0, len(archived))
+	for _, v := range archived {
+		names = append(names, v.Name)
+		if v.Name == volume {
+			matches = append(matches, v)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		held := "none"
+		if len(names) > 0 {
+			held = strings.Join(names, ", ")
+		}
+		return archivedVolume{}, fmt.Errorf("archive %q has no volume %q (nothing was changed); volumes in it: %s. "+
+			"Check the archive name with: borgmatic-manager borgmatic %s list", archive, volume, held, group)
+	default:
+		paths := make([]string, 0, len(matches))
+		for _, m := range matches {
+			paths = append(paths, m.Path)
+		}
+		return archivedVolume{}, fmt.Errorf("archive %q holds volume %q at more than one path (%s), so which to restore is ambiguous (nothing was changed); "+
+			"extract the one you mean with: borgmatic-manager borgmatic %s extract", archive, volume, strings.Join(paths, ", "), group)
+	}
+}
+
+// streamArchiveListing runs borgmatic's JSON listing of archive restricted to
+// pathArg (a path or borg pattern) and calls each for every entry. borg's
+// --json-lines emits one object per file, so a volume with millions of them
+// would be a multi-gigabyte buffer; streaming keeps memory flat.
+func streamArchiveListing(ctx context.Context, borgmaticPath, configPath, archive, pathArg string, each func(archiveEntry)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// #nosec G204 -- resolved borgmatic binary, read-only list over computed args
 	cmd := exec.CommandContext(ctx, borgmaticPath,
-		"--config", configPath, "list", "--archive", archive, "--path", archivePath, "--json")
+		"--config", configPath, "list", "--archive", archive, "--path", pathArg, "--json")
 	// Own process group, and cancel kills the group rather than just the leader:
 	// borgmatic spawns borg, which inherits these pipes. Wait does not return
 	// until every writer has closed them, so killing only borgmatic would hang
@@ -2039,41 +2163,23 @@ func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archiv
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return false, false, false, err
+		return err
 	}
 	stderr := &headWriter{maxBytes: maxProbeStderrBytes}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
-		return false, false, false, err
+		return err
 	}
 
-	// Read to the end even once an entry is found. The scanner discards each
-	// line as it goes, so memory stays flat either way, and draining is what
-	// makes borgmatic's exit status meaningful: a listing that dies partway
-	// through (archive corruption, a dropped connection, a later repository
-	// failing) must not be read as a clean confirmation, or the caller empties
-	// the volume and then hits the same failure during the extract.
+	// Read to the end: a listing that dies partway through (archive corruption,
+	// a dropped connection, a later repository failing) must not be read as a
+	// clean answer, and only a drained stream makes the exit status meaningful.
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxListLineBytes)
 	for scanner.Scan() {
-		// Both questions are answered by the first child entry, and an archive
-		// can hold millions more. Keep draining so the exit status stays
-		// meaningful, but stop parsing.
-		if found && hasChildren {
-			continue
+		if entry, ok := archiveEntryOf(scanner.Bytes()); ok {
+			each(entry)
 		}
-		entry, ok := archiveEntryOf(scanner.Bytes())
-		if !ok {
-			continue
-		}
-		found = true
-		// The directory itself lists as its own entry; anything below it is a
-		// child, and one child is enough to know the archive is not empty here.
-		if entry.Path != archivePath && entry.Path != strings.TrimSuffix(archivePath, "/") {
-			hasChildren = true
-			continue
-		}
-		rootIsDir = entry.Type == archiveEntryDir
 	}
 	scanErr := scanner.Err()
 
@@ -2084,18 +2190,17 @@ func archivePathPopulated(ctx context.Context, borgmaticPath, configPath, archiv
 	}
 	waitErr := cmd.Wait()
 
-	// A truncated or unreadable stream is "cannot tell", never "nothing there":
-	// the caller must refuse to wipe rather than act on a half-read listing.
+	// A truncated or unreadable stream is "cannot tell", never "nothing there".
 	if scanErr != nil {
-		return false, false, false, fmt.Errorf("reading the archive listing: %w", scanErr)
+		return fmt.Errorf("reading the archive listing: %w", scanErr)
 	}
 	if waitErr != nil {
 		if msg := firstNonEmptyLine(stderr.String()); msg != "" {
-			return false, false, false, fmt.Errorf("%w: %s", waitErr, msg)
+			return fmt.Errorf("%w: %s", waitErr, msg)
 		}
-		return false, false, false, waitErr
+		return waitErr
 	}
-	return found, hasChildren, rootIsDir, nil
+	return nil
 }
 
 // archiveEntryPath returns the path from one of borg's --json-lines entries.

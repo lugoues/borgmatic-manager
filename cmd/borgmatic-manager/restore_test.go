@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lugoues/borgmatic-manager/internal/config"
+	bmruntime "github.com/lugoues/borgmatic-manager/internal/runtime"
 )
 
 // Fixtures captured from borgmatic 2.1.6 over borg 1.4.0. borgmatic prints a
@@ -93,28 +94,31 @@ func TestFirstNonEmptyLinePicksTheCause(t *testing.T) {
 
 // The probe must treat a failed borgmatic as "cannot tell", never as "nothing
 // there": returning false with no error would let the caller wipe the target.
-func TestArchivePathPopulatedErrorsWhenBorgmaticFails(t *testing.T) {
-	found, _, _, err := archivePathPopulated(context.Background(), "/bin/false", "cfg.yaml", "latest", "myvol/_data")
+func TestListArchivedVolumesErrorsWhenBorgmaticFails(t *testing.T) {
+	vols, err := listArchivedVolumes(context.Background(), "/bin/false", "cfg.yaml", "latest")
+	found, _, _ := archivedState(vols, "myvol")
 	require.Error(t, err, "a non-zero exit is an error, not an empty result")
 	assert.False(t, found)
 }
 
-func TestArchivePathPopulatedReadsEntriesFromStdout(t *testing.T) {
+func TestListArchivedVolumesReadsEntriesFromStdout(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathPresent+"EOF\n"), 0o700))
 
-	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "latest")
+	found, _, _ := archivedState(vols, "myvol")
 	require.NoError(t, err)
 	assert.True(t, found, "entries under the path mean the extract has something to write")
 }
 
-func TestArchivePathPopulatedReportsBannerOnlyAsEmpty(t *testing.T) {
+func TestListArchivedVolumesReportsBannerOnlyAsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathAbsent+"EOF\n"), 0o700))
 
-	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "latest")
+	found, _, _ := archivedState(vols, "myvol")
 	require.NoError(t, err, "borgmatic exited 0: this is a real answer, not a probe failure")
 	assert.False(t, found, "an archive predating the volume must not be mirrored over live data")
 }
@@ -122,7 +126,7 @@ func TestArchivePathPopulatedReportsBannerOnlyAsEmpty(t *testing.T) {
 // borg emits one JSON line per file, so an archive holding millions of them
 // would be gigabytes if buffered. Streaming keeps memory flat: this listing is
 // far larger than any buffer the probe is allowed to hold.
-func TestArchivePathPopulatedStreamsALargeListing(t *testing.T) {
+func TestListArchivedVolumesStreamsALargeListing(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	// ~200k entries, several tens of MB, emitted without ever being retained.
@@ -130,7 +134,7 @@ func TestArchivePathPopulatedStreamsALargeListing(t *testing.T) {
 		"echo '/srv/repo: Listing archive host-1'\n" +
 		"i=0\n" +
 		"while [ $i -lt 200000 ]; do\n" +
-		"  echo '{\"type\": \"-\", \"path\": \"myvol/_data/some/reasonably/long/file/name\"}'\n" +
+		"  echo '{\"type\": \"-\", \"path\": \"myvol/_data/some-reasonably-long-file-name\"}'\n" +
 		"  i=$((i+1))\n" +
 		"done\n"
 	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
@@ -141,7 +145,8 @@ func TestArchivePathPopulatedStreamsALargeListing(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "latest")
+	found, _, _ := archivedState(vols, "myvol")
 	runtime.GC()
 	runtime.ReadMemStats(&after)
 
@@ -155,7 +160,7 @@ func TestArchivePathPopulatedStreamsALargeListing(t *testing.T) {
 // An entry proves the path is there, but a listing that dies partway through
 // proves nothing about the extract that follows. Draining to the end is what
 // makes the exit status meaningful, so a late failure still refuses the wipe.
-func TestArchivePathPopulatedFailsWhenListingDiesAfterAnEntry(t *testing.T) {
+func TestListArchivedVolumesFailsWhenListingDiesAfterAnEntry(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	script := "#!/bin/sh\n" +
@@ -165,7 +170,8 @@ func TestArchivePathPopulatedFailsWhenListingDiesAfterAnEntry(t *testing.T) {
 		"exit 2\n"
 	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
 
-	found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "latest")
+	found, _, _ := archivedState(vols, "myvol")
 	require.Error(t, err, "an entry seen before a failure is not a confirmation")
 	assert.False(t, found)
 	assert.Contains(t, err.Error(), "chunk id mismatch", "the cause reaches the operator")
@@ -175,7 +181,7 @@ func TestArchivePathPopulatedFailsWhenListingDiesAfterAnEntry(t *testing.T) {
 // reporting absent would let the caller empty the volume. It must also not hang:
 // once the scanner stops reading, a still-writing borgmatic would block on a
 // full pipe and take Wait down with it.
-func TestArchivePathPopulatedErrorsOnUnreadableStreamWithoutHanging(t *testing.T) {
+func TestListArchivedVolumesErrorsOnUnreadableStreamWithoutHanging(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	// An over-long line the scanner must reject, followed by far more output
@@ -191,7 +197,8 @@ func TestArchivePathPopulatedErrorsOnUnreadableStreamWithoutHanging(t *testing.T
 	}
 	done := make(chan result, 1)
 	go func() {
-		found, _, _, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+		vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "latest")
+		found, _, _ := archivedState(vols, "myvol")
 		done <- result{found, err}
 	}()
 
@@ -204,19 +211,19 @@ func TestArchivePathPopulatedErrorsOnUnreadableStreamWithoutHanging(t *testing.T
 	}
 }
 
-// The probe passes the extract's own --archive/--path pair, so a true answer
-// means that exact extract has something to write.
-func TestArchivePathPopulatedPassesExtractArguments(t *testing.T) {
+// The listing is filtered by borg, with the same expression the entries are
+// classified by.
+func TestListArchivedVolumesPassesExtractArguments(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	argsFile := filepath.Join(dir, "args")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\necho \"$@\" > "+argsFile+"\n"), 0o700))
 
-	_, _, _, err := archivePathPopulated(context.Background(), stub, "/tmp/cfg.yaml", "weekly-1", "myvol/_data")
+	_, err := listArchivedVolumes(context.Background(), stub, "/tmp/cfg.yaml", "weekly-1")
 	require.NoError(t, err)
 	recorded, err := os.ReadFile(argsFile)
 	require.NoError(t, err)
-	assert.Equal(t, "--config /tmp/cfg.yaml list --archive weekly-1 --path myvol/_data --json", strings.TrimSpace(string(recorded)))
+	assert.Equal(t, "--config /tmp/cfg.yaml list --archive weekly-1 --path re:"+archivedVolumeExpr+" --json", strings.TrimSpace(string(recorded)))
 }
 
 func TestEmptyVolumeDataRefusesNonVolumePaths(t *testing.T) {
@@ -246,77 +253,82 @@ func TestEmptyVolumeDataClearsContentsKeepsDir(t *testing.T) {
 	assert.NoError(t, err, "but the _data directory itself is kept")
 }
 
-func TestPlanVolumeRestoreSourceAndInto(t *testing.T) {
-	// docker source volume, restore into itself
-	p, err := planVolumeRestore("/var/lib/docker/volumes/myvol/_data", "")
+// archivedState reports what a listing said about volume name.
+func archivedState(vols []archivedVolume, name string) (found, hasChildren, rootIsDir bool) {
+	for _, v := range vols {
+		if v.Name == name {
+			return true, v.HasChildren, v.RootIsDir
+		}
+	}
+	return false, false, false
+}
+
+func TestPlanVolumeRestoreTargetsTheRuntimeMountpoint(t *testing.T) {
+	vols := []bmruntime.VolumeInfo{
+		{Name: "myvol", Mountpoint: "/var/lib/docker/volumes/myvol/_data"},
+		{Name: "spare", Mountpoint: "/srv/elsewhere/spare/_data"},
+	}
+
+	p, err := planVolumeRestore(vols, "myvol", "")
 	require.NoError(t, err)
-	assert.Equal(t, "/var/lib/docker/volumes", p.volumesRoot)
-	assert.Equal(t, "myvol/_data", p.archivePath)
-	assert.Equal(t, "var/lib/docker/volumes/myvol/_data", p.hostArchivePath)
 	assert.Equal(t, "myvol", p.targetVolume)
 	assert.Equal(t, "/var/lib/docker/volumes/myvol/_data", p.targetData)
 
-	// --into a spare volume: same root, retargeted data dir, archive path unchanged
-	p, err = planVolumeRestore("/var/lib/docker/volumes/myvol/_data", "myvol-restore")
+	p, err = planVolumeRestore(vols, "myvol", "spare")
 	require.NoError(t, err)
-	assert.Equal(t, "myvol/_data", p.archivePath, "still pulls the source volume's path from the archive")
-	assert.Equal(t, "myvol-restore", p.targetVolume)
-	assert.Equal(t, "/var/lib/docker/volumes/myvol-restore/_data", p.targetData)
+	assert.Equal(t, "spare", p.targetVolume)
+	assert.Equal(t, "/srv/elsewhere/spare/_data", p.targetData)
 
-	// rootless podman path
-	p, err = planVolumeRestore("/home/u/.local/share/containers/storage/volumes/systemd-app/_data", "")
+	// The source need not exist on this host, only the target.
+	_, err = planVolumeRestore(vols, "gone", "spare")
 	require.NoError(t, err)
-	assert.Equal(t, "/home/u/.local/share/containers/storage/volumes", p.volumesRoot)
-	assert.Equal(t, "systemd-app/_data", p.archivePath)
+	_, err = planVolumeRestore(vols, "gone", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create the volume first")
 }
 
-// Groups with snapshot hooks archive the full host path rather than
-// "<volume>/_data", so the restore has to find whichever layout is there.
-func TestResolveArchiveLayoutFallsBackToHostPath(t *testing.T) {
-	plan, err := planVolumeRestore("/var/lib/docker/volumes/myvol/_data", "")
-	require.NoError(t, err)
-
+// Both path layouts list by volume name, and nothing that is not a volume
+// root (dumps, deeper directories) is mistaken for one.
+func TestListArchivedVolumesFindsBothLayouts(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
-	script := "#!/bin/sh\ncase \"$*\" in\n*'--path var/lib/docker/volumes/myvol/_data'*) cat <<'EOF'\n" +
-		strings.ReplaceAll(listStdoutPathPresent, "myvol/_data", "var/lib/docker/volumes/myvol/_data") +
-		"EOF\n;;\n*) cat <<'EOF'\n" + listStdoutPathAbsent + "EOF\n;;\nesac\n"
-	require.NoError(t, os.WriteFile(stub, []byte(script), 0o700))
+	out := `/srv/repo: Listing archive host-1
+{"type": "d", "path": "app/_data"}
+{"type": "-", "path": "app/_data/config.yml"}
+{"type": "d", "path": "var/lib/containers/storage/volumes/systemd-pg/_data"}
+{"type": "-", "path": "var/lib/containers/storage/volumes/systemd-pg/_data/PG_VERSION"}
+{"type": "d", "path": "var/lib/containers/storage/volumes/blank/_data"}
+{"type": "-", "path": "borgmatic/postgresql_databases/db/dump"}
+`
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+out+"EOF\n"), 0o700))
 
-	path, found, hasChildren, rootIsDir, err := resolveArchiveLayout(context.Background(), stub, "cfg.yaml", "host-1", plan)
+	vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "host-1")
 	require.NoError(t, err)
-	assert.Equal(t, "var/lib/docker/volumes/myvol/_data", path)
-	assert.True(t, found && hasChildren && rootIsDir)
-
-	// Neither layout present: not found, and the default path is reported.
-	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathAbsent+"EOF\n"), 0o700))
-	path, found, _, _, err = resolveArchiveLayout(context.Background(), stub, "cfg.yaml", "host-1", plan)
-	require.NoError(t, err)
-	assert.False(t, found)
-	assert.Equal(t, "myvol/_data", path)
+	assert.Equal(t, []archivedVolume{
+		{Name: "app", Path: "app/_data", RootIsDir: true, HasChildren: true},
+		{Name: "blank", Path: "var/lib/containers/storage/volumes/blank/_data", RootIsDir: true},
+		{Name: "systemd-pg", Path: "var/lib/containers/storage/volumes/systemd-pg/_data", RootIsDir: true, HasChildren: true},
+	}, vols)
 }
 
-func TestPlanVolumeRestoreRefusesIntoPaths(t *testing.T) {
-	// --merge skips emptyVolumeData entirely, and that guard is only a substring
-	// test for "/volumes/" anyway, so the escape has to be refused here.
-	for _, into := range []string{
-		"../../../srv/x",
-		"../sibling",
-		"sub/vol",
-		"/absolute/vol",
-		"..",
-		".",
-	} {
-		_, err := planVolumeRestore("/var/lib/docker/volumes/myvol/_data", into)
-		require.Error(t, err, "--into %q escapes the volumes root", into)
-		assert.Contains(t, err.Error(), "bare volume name")
+func TestPickArchivedVolumeRefusesMissingAndAmbiguous(t *testing.T) {
+	vols := []archivedVolume{
+		{Name: "app", Path: "app/_data"},
+		{Name: "pg", Path: "pg/_data"},
+		{Name: "pg", Path: "var/lib/docker/volumes/pg/_data"},
 	}
 
-	// Names that merely look path-adjacent are still valid volume names.
-	for _, into := range []string{"myvol-restore", "my.vol", "..vol", "vol.."} {
-		_, err := planVolumeRestore("/var/lib/docker/volumes/myvol/_data", into)
-		assert.NoError(t, err, "--into %q is a legal volume name", into)
-	}
+	got, err := pickArchivedVolume(vols, "app", "host-1", "grp")
+	require.NoError(t, err)
+	assert.Equal(t, "app/_data", got.Path)
+
+	_, err = pickArchivedVolume(vols, "nope", "host-1", "grp")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "volumes in it: app, pg, pg", "the operator sees what is restorable")
+
+	_, err = pickArchivedVolume(vols, "pg", "host-1", "grp")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "more than one path")
 }
 
 func TestSnapshotVolumeRefusesNonBtrfs(t *testing.T) {
@@ -371,7 +383,7 @@ func TestSnapshotVolumeOnBtrfs(t *testing.T) {
 // it have children. A volume archived while empty is present as a bare
 // directory, and only the second question tells that apart from a path that
 // matched nothing.
-func TestArchivePathPopulatedDistinguishesAnEmptyArchivedDirectory(t *testing.T) {
+func TestListArchivedVolumesDistinguishesAnEmptyArchivedDirectory(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	onlyTheDirectory := `/srv/repo: Listing archive host-1
@@ -379,19 +391,21 @@ func TestArchivePathPopulatedDistinguishesAnEmptyArchivedDirectory(t *testing.T)
 `
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+onlyTheDirectory+"EOF\n"), 0o700))
 
-	found, hasChildren, rootIsDir, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "latest")
+	found, hasChildren, rootIsDir := archivedState(vols, "myvol")
 	require.NoError(t, err)
 	assert.True(t, found, "the path is in the archive")
 	assert.False(t, hasChildren, "but it held nothing")
 	assert.True(t, rootIsDir, "and it really is a directory, which is what licenses restoring to empty")
 }
 
-func TestArchivePathPopulatedReportsChildren(t *testing.T) {
+func TestListArchivedVolumesReportsChildren(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+listStdoutPathPresent+"EOF\n"), 0o700))
 
-	found, hasChildren, rootIsDir, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "latest", "myvol/_data")
+	vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "latest")
+	found, hasChildren, rootIsDir := archivedState(vols, "myvol")
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.True(t, hasChildren, "the archive holds files under the path")
@@ -402,7 +416,7 @@ func TestArchivePathPopulatedReportsChildren(t *testing.T) {
 // should be lists exactly like a directory with nothing in it. Only the type
 // separates them, and mistaking one for the other licenses swapping an empty
 // directory over a volume that has data in it.
-func TestArchivePathPopulatedDoesNotMistakeANonDirectoryForAnEmptyOne(t *testing.T) {
+func TestListArchivedVolumesDoesNotMistakeANonDirectoryForAnEmptyOne(t *testing.T) {
 	for name, line := range map[string]string{
 		"a symlink":      `{"type": "l", "mode": "lrwxrwxrwx", "path": "myvol/_data", "linktarget": "/elsewhere", "size": 0}`,
 		"a regular file": `{"type": "-", "mode": "-rw-r--r--", "path": "myvol/_data", "size": 12}`,
@@ -413,7 +427,8 @@ func TestArchivePathPopulatedDoesNotMistakeANonDirectoryForAnEmptyOne(t *testing
 			out := "/srv/repo: Listing archive host-1\n" + line + "\n"
 			require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'EOF'\n"+out+"EOF\n"), 0o700))
 
-			found, hasChildren, rootIsDir, err := archivePathPopulated(context.Background(), stub, "cfg.yaml", "host-1", "myvol/_data")
+			vols, err := listArchivedVolumes(context.Background(), stub, "cfg.yaml", "host-1")
+			found, hasChildren, rootIsDir := archivedState(vols, "myvol")
 			require.NoError(t, err)
 			assert.True(t, found, "it is in the archive")
 			assert.False(t, hasChildren)
