@@ -288,13 +288,16 @@ func TestPlanVolumeRestoreTargetsTheRuntimeMountpoint(t *testing.T) {
 }
 
 // Both path layouts list by volume name, and nothing that is not a volume
-// root (dumps, deeper directories) is mistaken for one.
+// root (dumps, deeper directories, a container store inside a volume) is
+// mistaken for one.
 func TestListArchivedVolumesFindsBothLayouts(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "borgmatic")
 	out := `/srv/repo: Listing archive host-1
 {"type": "d", "path": "app/_data"}
 {"type": "-", "path": "app/_data/config.yml"}
+{"type": "d", "path": "app/_data/storage/volumes/inner/_data"}
+{"type": "-", "path": "app/_data/storage/volumes/inner/_data/x"}
 {"type": "d", "path": "var/lib/containers/storage/volumes/systemd-pg/_data"}
 {"type": "-", "path": "var/lib/containers/storage/volumes/systemd-pg/_data/PG_VERSION"}
 {"type": "d", "path": "var/lib/containers/storage/volumes/blank/_data"}

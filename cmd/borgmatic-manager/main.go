@@ -2097,7 +2097,9 @@ func listArchivedVolumes(ctx context.Context, borgmaticPath, configPath, archive
 	}
 	out := make([]archivedVolume, 0, len(byPath))
 	for _, v := range byPath {
-		out = append(out, *v)
+		if !nestedInVolume(v.Path, byPath) {
+			out = append(out, *v)
+		}
 	}
 	sort.Slice(out, func(a, b int) bool {
 		if out[a].Name != out[b].Name {
@@ -2106,6 +2108,18 @@ func listArchivedVolumes(ctx context.Context, borgmaticPath, configPath, archive
 		return out[a].Path < out[b].Path
 	})
 	return out, nil
+}
+
+// nestedInVolume reports whether p sits inside another volume root: a volume
+// holding a container store (".../volumes/<x>/_data" inside its own data) must
+// not have that subtree offered as volume x.
+func nestedInVolume(p string, roots map[string]*archivedVolume) bool {
+	for dir := path.Dir(p); dir != "." && dir != "/"; dir = path.Dir(dir) {
+		if _, ok := roots[dir]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // pickArchivedVolume finds volume among an archive's volumes, refusing when it
