@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,9 +16,13 @@ import (
 // CachedGroup is a group's accumulated membership, persisted so a member
 // survives its container being stopped or (with quadlets) removed. Members are
 // unioned across cycles, never overwritten: a multi-container group whose app
-// container stops must not lose the volumes that container contributed.
+// container stops must not lose the volumes that container contributed. The
+// exception is a volume whose claiming containers are all still present but
+// no longer claim it: that is a deliberate removal, so it is dropped.
 type CachedGroup struct {
-	Volumes      []models.VolumeInfo      `json:"volumes,omitempty"`
+	Volumes []models.VolumeInfo `json:"volumes,omitempty"`
+	// VolumeClaims maps a volume to the containers that last claimed it.
+	VolumeClaims map[string][]string      `json:"volume_claims,omitempty"`
 	Databases    []models.DatabaseConfig  `json:"databases,omitempty"`
 	LabelConfigs []map[string]interface{} `json:"label_configs,omitempty"`
 	Period       time.Duration            `json:"period,omitempty"`
@@ -190,7 +195,23 @@ func (c *GroupCache) Reconcile(live *models.BackupState, now time.Time) (*models
 		liveGroup := live.Groups[name]
 		cached := f.Groups[name]
 
-		vols, offVols := mergeVolumes(liveVolumes(liveGroup), cached.Volumes, c.pathExists)
+		claims := mergeClaims(live.Claims[name], cached.VolumeClaims, live.Containers)
+		// Nothing claims it now, and every container that did last cycle is
+		// still here. Judged on last cycle's claimers: the refreshed list has
+		// already shed the present containers that let go.
+		deselected := func(volume string) bool {
+			return len(live.Claims[name][volume]) == 0 && claimersAllPresent(cached.VolumeClaims[volume], live.Containers)
+		}
+		vols, offVols := mergeVolumes(liveVolumes(liveGroup), cached.Volumes, c.pathExists, deselected)
+		for _, v := range cached.Volumes {
+			if !containsVolume(vols, v.Name) {
+				delete(claims, v.Name)
+				if c.pathExists(v.HostPath) {
+					c.logger.Info("volume is no longer claimed by any of its containers; removing it from the group",
+						"group", name, "volume", v.Name)
+				}
+			}
+		}
 		dbs, offDBs := mergeDatabases(liveDatabases(liveGroup), cached.Databases)
 
 		if len(vols) == 0 && len(dbs) == 0 {
@@ -211,7 +232,7 @@ func (c *GroupCache) Reconcile(live *models.BackupState, now time.Time) (*models
 			lastSeen, labelConfigs, period = now, liveGroup.LabelConfigs, liveGroup.Period
 		}
 
-		f.Groups[name] = CachedGroup{Volumes: vols, Databases: dbs, LabelConfigs: labelConfigs, Period: period, LastSeen: lastSeen}
+		f.Groups[name] = CachedGroup{Volumes: vols, VolumeClaims: claims, Databases: dbs, LabelConfigs: labelConfigs, Period: period, LastSeen: lastSeen}
 		merged.Groups[name] = &models.VolumeGroup{Volumes: vols, Databases: dbs, LabelConfigs: labelConfigs, Period: period}
 		if len(offVols) > 0 {
 			off.Volumes[name] = offVols
@@ -242,8 +263,8 @@ func liveDatabases(g *models.VolumeGroup) []models.DatabaseConfig {
 
 // mergeVolumes unions live and cached volumes by name (live wins). A cached-only
 // volume is kept and marked offline while its path exists; a path-gone volume is
-// dropped as truly deleted.
-func mergeVolumes(liveVols, cachedVols []models.VolumeInfo, pathExists func(string) bool) ([]models.VolumeInfo, map[string]bool) {
+// dropped as truly deleted, and a deselected one as no longer wanted.
+func mergeVolumes(liveVols, cachedVols []models.VolumeInfo, pathExists, deselected func(string) bool) ([]models.VolumeInfo, map[string]bool) {
 	out := make([]models.VolumeInfo, 0, len(liveVols)+len(cachedVols))
 	offline := map[string]bool{}
 	liveByName := map[string]bool{}
@@ -253,13 +274,61 @@ func mergeVolumes(liveVols, cachedVols []models.VolumeInfo, pathExists func(stri
 		liveByName[v.Name] = true
 	}
 	for _, v := range cachedVols {
-		if liveByName[v.Name] || !pathExists(v.HostPath) {
+		if liveByName[v.Name] || !pathExists(v.HostPath) || deselected(v.Name) {
 			continue
 		}
 		out = append(out, v)
 		offline[v.Name] = true
 	}
 	return out, offline
+}
+
+// mergeClaims refreshes each volume's claimers: live claimers, plus cached
+// ones that are absent (removed containers whose claim still stands). A
+// present container that no longer claims a volume is dropped from its list.
+func mergeClaims(live, cached map[string][]string, present map[string]bool) map[string][]string {
+	out := make(map[string][]string, len(live)+len(cached))
+	for vol, cs := range cached {
+		for _, c := range cs {
+			if present == nil || !present[c] {
+				out[vol] = append(out[vol], c)
+			}
+		}
+	}
+	for vol, cs := range live {
+		for _, c := range cs {
+			if !slices.Contains(out[vol], c) {
+				out[vol] = append(out[vol], c)
+			}
+		}
+	}
+	return out
+}
+
+// claimersAllPresent reports whether every container that claimed a volume is
+// still present. A cached volume none of them claims any more was deselected
+// (a volumes filter, a dropped enable or group label), not left behind by a
+// removed container. Unknown claimers or an unknown container list answer no,
+// keeping the volume: dropping one still in use loses backups silently.
+func claimersAllPresent(claimers []string, present map[string]bool) bool {
+	if len(claimers) == 0 || present == nil {
+		return false
+	}
+	for _, c := range claimers {
+		if !present[c] {
+			return false
+		}
+	}
+	return true
+}
+
+func containsVolume(vols []models.VolumeInfo, name string) bool {
+	for _, v := range vols {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeDatabases unions live and cached databases by type+name. A cached-only

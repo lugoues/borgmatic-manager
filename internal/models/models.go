@@ -14,6 +14,12 @@ const (
 // BackupState is the discovered backup configuration, keyed by group name.
 type BackupState struct {
 	Groups map[string]*VolumeGroup
+	// Containers names every container the runtime listed, labeled or not; nil
+	// when unknown. With Claims it lets cache reconciliation tell a container
+	// that is gone from one that is present but no longer claims a volume.
+	Containers map[string]bool
+	// Claims maps group -> volume -> the containers that claimed it.
+	Claims map[string]map[string][]string
 }
 
 // NewBackupState creates a new BackupState with an initialized (non-nil) Groups map.
@@ -36,6 +42,17 @@ func (bs *BackupState) getOrCreateGroup(name string) *VolumeGroup {
 func (bs *BackupState) AddVolume(group string, vol VolumeInfo) {
 	g := bs.getOrCreateGroup(group)
 	g.Volumes = append(g.Volumes, vol)
+}
+
+// AddClaim records that container claimed volume for group.
+func (bs *BackupState) AddClaim(group, volume, container string) {
+	if bs.Claims == nil {
+		bs.Claims = map[string]map[string][]string{}
+	}
+	if bs.Claims[group] == nil {
+		bs.Claims[group] = map[string][]string{}
+	}
+	bs.Claims[group][volume] = append(bs.Claims[group][volume], container)
 }
 
 // AddDatabases appends database configs to the named group, creating it if needed.

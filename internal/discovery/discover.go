@@ -52,6 +52,10 @@ func Discover(ctx context.Context, rt runtime.ContainerRuntime, logger *slog.Log
 
 	// Deterministic processing order for stable dedupe and config merging.
 	sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
+	state.Containers = make(map[string]bool, len(containers))
+	for _, c := range containers {
+		state.Containers[c.Name] = true
+	}
 
 	// Dedupe per group: two containers sharing a volume must not back it up twice.
 	seenVolumes := make(map[string]map[string]bool)
@@ -284,7 +288,14 @@ func discoverContainerVolumes(state *models.BackupState, c runtime.ContainerInfo
 		} else if anonymousVolumeName.MatchString(m.Name) {
 			continue
 		}
-		if !included || seenVolumes[group][m.Name] {
+		if !included {
+			continue
+		}
+		// Claimed by the labels, whatever the checks below decide: a volume
+		// skipped this cycle (unlisted, unreadable, lazily unmounted) is still
+		// wanted, and the cache must not read its absence as a deselection.
+		state.AddClaim(group, m.Name, c.Name)
+		if seenVolumes[group][m.Name] {
 			continue
 		}
 

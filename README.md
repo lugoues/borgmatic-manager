@@ -153,7 +153,7 @@ immutable after creation, which made them a trap).
 |-------|-------------|
 | `borgmatic-manager.group` | Backup group. Required for a container to participate at all; containers sharing a group back up together. |
 | `borgmatic-manager.enable` | `"true"` to back up this container's named volumes. |
-| `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Omitted or empty: all named volumes (anonymous volumes excluded). |
+| `borgmatic-manager.volumes` | Optional comma-separated filter: volume names or in-container mount paths (e.g. `app-data,/uploads`). Omitted or empty: all named volumes (anonymous volumes excluded). Dropping a volume from the filter (or the container's `enable`/`group` label) removes it from the group; a removed container's volumes stay backed up while they exist. |
 | `borgmatic-manager.db.{n}.*` | Database dump definitions (below). |
 | `borgmatic-manager.config.<option>` | Any borgmatic option for this group (below). |
 | `borgmatic-manager.spec` | The whole configuration as one JSON blob (below), an alternative to all of the above. |

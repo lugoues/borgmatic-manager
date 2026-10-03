@@ -165,6 +165,8 @@ func TestDiscoverSharedVolumeDeduped(t *testing.T) {
 	state, err := discovery.Discover(context.Background(), rt, discardLogger())
 	require.NoError(t, err)
 	assert.Len(t, state.Groups["myapp"].Volumes, 1, "a volume shared by two group members backs up once")
+	assert.Equal(t, []string{"app-a", "app-b"}, state.Claims["myapp"]["shared"], "but both claim it")
+	assert.Equal(t, map[string]bool{"app-a": true, "app-b": true}, state.Containers)
 }
 
 func TestDiscoverEnableWithoutTrueDoesNothing(t *testing.T) {
