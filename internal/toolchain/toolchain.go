@@ -47,7 +47,7 @@ const (
 	pythonVersion = "3.13"
 	// BorgmaticVersion is exported for doctor and log output.
 	// renovate: datasource=pypi depName=borgmatic
-	BorgmaticVersion = "2.1.7"
+	BorgmaticVersion = "2.1.10"
 )
 
 // uvSHA256 holds the published checksum of uv's release tarball per GOARCH.
